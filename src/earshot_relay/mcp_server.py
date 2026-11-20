@@ -1,0 +1,208 @@
+"""The MCP server: say, alarm (only when the relay allows it), receipt, recent and status.
+
+Both transports use the same REST API: the `/mcp` route calls the app in-process (httpx ASGITransport), and the
+stdio server (`earshot-relay mcp`) calls a relay over HTTP with EARSHOT_API_URL and EARSHOT_API_TOKEN. There is
+deliberately no file or audio tool: a prompt-injected agent must not be able to read local files into the bucket.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import httpx
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
+from mcp.server.transport_security import TransportSecuritySettings
+from mcp.types import ToolAnnotations
+
+from . import RECEIPT_WORDING, __version__
+
+INSTRUCTIONS = (
+    "Earshot reads text aloud on the user's Android phone: the relay stores a message in the user's own bucket and the "
+    "Earshot app plays it. Keep spoken text short and plain: one or two sentences, no markdown, code, URLs or long "
+    "lists. Never put secrets, passwords, tokens or private data in spoken text: it is stored in the bucket and spoken "
+    "out loud. Use alarm (when present) only for urgency the user asked for. " + RECEIPT_WORDING
+)
+
+SAY_DESCRIPTION = (
+    "Speak a short message aloud on the user's phone through Earshot. The text is stored in the user's bucket and the "
+    "Earshot app speaks it (Android text-to-speech by default). Keep it to one or two plain sentences. Returns the "
+    "message id; call receipt with it to learn whether the phone played it. Not for the alarm channel: urgent alerts "
+    "use the alarm tool, which exists only when the user enabled it."
+)
+
+ALARM_DESCRIPTION = (
+    "LOUD urgent alert on the user's phone. It plays on the phone's alarm stream at maximum volume, gets through Do Not "
+    "Disturb's alarm exception, and plays even during a phone call, where the other party may hear it. Use it only for "
+    "deliberate urgency the user asked to be woken or interrupted for (a production outage, a failed deploy they are "
+    "waiting on). Never for routine status: use say. Rate limited by the relay."
+)
+
+RECEIPT_DESCRIPTION = (
+    "Did the phone play it? Returns the device-playback receipt of a message (id from say or alarm, or 'latest'): "
+    "stored, detected, started, finished, skipped (the user skipped it), failed, missed (too old when it arrived) or "
+    "unconfirmed (no device report yet). wait_seconds (0-60) waits for a final status. A finished receipt means the "
+    "phone finished playing it, not that a person heard it."
+)
+
+SUMMARIES = {
+    "stored": "Stored in the bucket; no device has reported it yet.",
+    "detected": "The phone saw the message and queued it.",
+    "started": "The phone started playing it.",
+    "finished": "The phone finished playing it (device playback; not proof a person heard it).",
+    "skipped": "The phone started it but the user skipped it.",
+    "failed": "The phone could not play it.",
+    "missed": "The phone saw it too late and did not play it (stale).",
+    "unconfirmed": "No device has reported this message within the wait window; it may still report later.",
+}
+
+
+class Backend:
+    """REST client used by the tools. Errors become ToolError with the relay's error code and message."""
+
+    def __init__(self, client: httpx.AsyncClient):
+        self.client = client
+
+    async def _call(self, method: str, path: str, **kwargs) -> dict:
+        try:
+            resp = await self.client.request(method, path, **kwargs)
+        except httpx.TimeoutException:
+            raise ToolError("the relay did not answer in time") from None
+        except httpx.HTTPError as exc:
+            raise ToolError(f"the relay could not be reached ({type(exc).__name__})") from None
+        try:
+            data = resp.json()
+        except ValueError:
+            data = None
+        if resp.status_code >= 400:
+            err = (data or {}).get("error", {}) if isinstance(data, dict) else {}
+            code = err.get("code", f"http_{resp.status_code}")
+            message = err.get("message", "request refused")
+            raise ToolError(f"{code}: {message}")
+        if not isinstance(data, dict):
+            raise ToolError("the relay returned an unexpected response")
+        return data
+
+    async def send(self, body: dict) -> dict:
+        return await self._call("POST", "/v1/messages", json={k: v for k, v in body.items() if v is not None})
+
+    async def receipt(self, message_id: str, wait: int) -> dict:
+        params = {"wait": wait} if wait else None
+        return await self._call("GET", f"/v1/messages/{message_id}", params=params, timeout=wait + 15)
+
+    async def recent(self, limit: int, channel: str | None) -> dict:
+        params: dict[str, Any] = {"limit": limit}
+        if channel:
+            params["channel"] = channel
+        return await self._call("GET", "/v1/messages", params=params)
+
+    async def status(self) -> dict:
+        return await self._call("GET", "/v1/status")
+
+
+def _sent(result: dict) -> dict[str, Any]:
+    return {
+        "id": result["id"],
+        "status": result["status"],
+        "channel": result["channel"],
+        "speech": result.get("speech"),
+        "next": f"call receipt with id {result['id']} (wait_seconds up to 60) to see whether the phone played it",
+    }
+
+
+def build_mcp(backend: Backend, *, alarm_allowed: bool) -> MCPServer:
+    mcp = MCPServer(name="earshot", title="Earshot", instructions=INSTRUCTIONS, version=__version__, log_level="WARNING",
+                    website_url="https://store.automaticai.io/earshot/")
+
+    @mcp.tool(description=SAY_DESCRIPTION,
+              annotations=ToolAnnotations(title="Say on phone", readOnlyHint=False, destructiveHint=False,
+                                          idempotentHint=False, openWorldHint=True))
+    async def say(text: str, channel: str | None = None, speech: str | None = None, voice: str | None = None) -> dict[str, Any]:
+        """text: what to speak. channel: optional, default the relay's default. speech: device or server. voice: server only."""
+        if channel == "alarm":
+            hint = "use the alarm tool" if alarm_allowed else "alarm is not enabled on this relay"
+            raise ToolError(f"say does not send to the alarm channel; {hint}")
+        return _sent(await backend.send({"text": text, "channel": channel, "speech": speech, "voice": voice}))
+
+    if alarm_allowed:
+        @mcp.tool(description=ALARM_DESCRIPTION,
+                  annotations=ToolAnnotations(title="LOUD alarm on phone", readOnlyHint=False, destructiveHint=False,
+                                              idempotentHint=False, openWorldHint=True))
+        async def alarm(text: str) -> dict[str, Any]:
+            """text: the short urgent message to speak after the siren."""
+            return _sent(await backend.send({"text": text, "channel": "alarm"}))
+
+    @mcp.tool(description=RECEIPT_DESCRIPTION,
+              annotations=ToolAnnotations(title="Playback receipt", readOnlyHint=True, openWorldHint=False))
+    async def receipt(id: str = "latest", wait_seconds: int = 0) -> dict[str, Any]:
+        """id: message id or 'latest'. wait_seconds: 0-60."""
+        wait = max(0, min(60, int(wait_seconds)))
+        r = await backend.receipt(id, wait)
+        return {
+            "id": r["id"],
+            "status": r["status"],
+            "summary": SUMMARIES.get(r["status"], r["status"]),
+            "channel": r["channel"],
+            "created_at": r["created_at"],
+            "status_at": r.get("status_at"),
+            "hops": [{"phase": h["phase"], "device": h["device"], "at_server": h["at_server"],
+                      "since_upload_ms": h["since_upload_ms"], "error": h["error"]} for h in r.get("hops", [])],
+            "hint": r.get("hint"),
+            "note": RECEIPT_WORDING,
+        }
+
+    @mcp.tool(description="List recent messages sent through this relay with their playback status (newest first).",
+              annotations=ToolAnnotations(title="Recent messages", readOnlyHint=True, openWorldHint=False))
+    async def recent(limit: int = 10, channel: str | None = None) -> dict[str, Any]:
+        """limit: 1-50. channel: optional filter."""
+        data = await backend.recent(max(1, min(50, int(limit))), channel)
+        return {"items": [{"id": i["id"], "type": i["type"], "channel": i["channel"], "created_at": i["created_at"],
+                           "status": i["status"]} for i in data["items"]], "note": RECEIPT_WORDING}
+
+    @mcp.tool(description="Relay status: sendable channels, speech modes, and the last beacon from each phone.",
+              annotations=ToolAnnotations(title="Relay status", readOnlyHint=True, openWorldHint=False))
+    async def status() -> dict[str, Any]:
+        s = await backend.status()
+        receipts = dict(s["receipts"])
+        receipts.pop("beacon_url", None)  # contains the beacon token; an agent has no use for it
+        receipts.pop("beacon_path", None)
+        return {"relay": s["relay"], "channels": s["channels"], "default_channel": s.get("default_channel"),
+                "speech": s["speech"], "receipts": receipts}
+
+    return mcp
+
+
+def build_http_mcp(app, relay) -> tuple[MCPServer, list]:
+    """The `/mcp` route for the main app. Tools call the same app in-process with the relay's own token."""
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://earshot-relay.internal",
+        headers={"Authorization": f"Bearer {relay.settings.token}"},
+        timeout=httpx.Timeout(120),
+    )
+    mcp = build_mcp(Backend(client), alarm_allowed=relay.settings.alarm_allowed)
+    # Bearer auth on every request already blocks DNS-rebinding style access, and the Host header is whatever the
+    # user's tunnel or proxy sends, so the SDK's localhost-only Host check is off.
+    starlette_app = mcp.streamable_http_app(
+        streamable_http_path="/mcp",
+        json_response=True,
+        stateless_http=True,
+        transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+    )
+    return mcp, list(starlette_app.routes)
+
+
+def run_stdio(api_url: str, token: str) -> None:
+    """`earshot-relay mcp`: a stdio MCP server backed by a relay's HTTP API."""
+    headers = {"Authorization": f"Bearer {token}", "User-Agent": f"earshot-relay-mcp/{__version__}"}
+    alarm_allowed = False
+    try:
+        with httpx.Client(base_url=api_url, headers=headers, timeout=10) as c:
+            resp = c.get("/v1/status")
+            if resp.status_code == 200:
+                alarm_allowed = "alarm" in resp.json().get("channels", [])
+    except (httpx.HTTPError, ValueError):
+        pass  # tools still register; each call reports the connection problem
+    client = httpx.AsyncClient(base_url=api_url, headers=headers, timeout=httpx.Timeout(120))
+    mcp = build_mcp(Backend(client), alarm_allowed=alarm_allowed)
+    mcp.run(transport="stdio")
