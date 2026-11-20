@@ -203,7 +203,8 @@ def test_config_reports_every_problem_at_once(tmp_path):
 
 def test_config_ffmpeg_missing_with_leadin(tmp_path, monkeypatch):
     monkeypatch.setattr("earshot_relay.config.shutil.which", lambda _name: None)
-    extra = {"EARSHOT_RELAY_TTS_URL": "http://kokoro:8880/v1", "EARSHOT_RELAY_TTS_MODEL": "kokoro"}
+    extra = {"EARSHOT_RELAY_TTS_URL": "http://kokoro:8880/v1", "EARSHOT_RELAY_TTS_MODEL": "kokoro",
+             "EARSHOT_RELAY_TTS_VOICE": "af_heart"}
     with pytest.raises(ConfigError) as e:
         load_settings(env(tmp_path, **extra))
     assert "ffmpeg is not installed" in str(e.value)

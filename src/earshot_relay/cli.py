@@ -7,15 +7,29 @@ import asyncio
 import contextlib
 import json
 import logging
+import re
 import secrets
 import signal
 import sys
 import time
 
 from . import RECEIPT_WORDING, __version__
+from .beacons import receipt_is_final
 from .config import ConfigError
 
 EXIT_OK, EXIT_ERROR, EXIT_NOT_PLAYED, EXIT_TIMEOUT = 0, 1, 3, 4
+UNPRINTABLE_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+ALARM_HELP = (
+    "LOUD: a siren, then the text on the phone's alarm stream at high volume (the alarm channel must be enabled on "
+    "the relay). It plays during a call unless the app's 'Alarms can interrupt calls' is off, and the other party may "
+    "hear it. Total-silence Do Not Disturb, an Android refusal, a stopped service, a powered-off phone or no network "
+    "can still silence it. Not an emergency or life-safety service."
+)
+
+
+def safe(value: object) -> str:
+    """Text from beacons reaches the terminal: show control characters as \\xNN instead of letting them act."""
+    return UNPRINTABLE_RE.sub(lambda m: f"\\x{ord(m.group()):02x}", str(value))
 
 
 # ---- logging ---------------------------------------------------------------------------------------------------
@@ -145,19 +159,19 @@ def cmd_token(_args) -> int:
 
 def cmd_say(args) -> int:
     with _client() as c:
-        _print_sent(c.say(_read_text(args.text), args.channel, args.speech, args.voice), args)
+        _print_sent(c.say(_read_text(args.text), args.channel, args.speech, args.voice, args.idempotency_key), args)
     return EXIT_OK
 
 
 def cmd_alarm(args) -> int:
     with _client() as c:
-        _print_sent(c.say(_read_text(args.text), "alarm", args.speech, args.voice), args)
+        _print_sent(c.say(_read_text(args.text), "alarm", args.speech, args.voice, args.idempotency_key), args)
     return EXIT_OK
 
 
 def cmd_drop(args) -> int:
     with _client() as c:
-        _print_sent(c.drop(args.file, args.channel), args)
+        _print_sent(c.drop(args.file, args.channel, args.idempotency_key), args)
     return EXIT_OK
 
 
@@ -183,7 +197,7 @@ def format_receipt(r: dict) -> str:
     if r.get("hint"):
         lines.append(f"hint: {r['hint']}")
     lines.append("receipt = device playback, not proof a person heard it")
-    return "\n".join(lines)
+    return "\n".join(safe(line) for line in lines)
 
 
 def cmd_receipt(args) -> int:
@@ -194,7 +208,7 @@ def cmd_receipt(args) -> int:
         return EXIT_OK
     if r["status"] == "finished":
         return EXIT_OK
-    if r["status"] in ("skipped", "failed", "missed"):
+    if receipt_is_final(r):
         return EXIT_NOT_PLAYED
     return EXIT_TIMEOUT
 
@@ -234,7 +248,8 @@ def cmd_status(args) -> int:
         print(f"           last beacon: {r['last_beacon_at'] or 'never'}")
         for d in r["devices"]:
             skew = f", skew {d['clock_skew_ms']}ms" if d.get("clock_skew_ms") is not None else ""
-            print(f"           device {d['device']}  app {d['app_version']}  last {d['last_phase']} at {d['last_seen']}{skew}")
+            print(safe(f"           device {d['device']}  app {d['app_version']}  last {d['last_phase']} at "
+                       f"{d['last_seen']}{skew}"))
     print(f"note       {RECEIPT_WORDING}")
     return EXIT_OK
 
@@ -291,31 +306,41 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--json", action="store_true", help="print the full JSON response")
         sp.add_argument("--quiet", "-q", action="store_true", help="print nothing on success")
 
-    sp = sub.add_parser("say", help="speak text on the phone ('-' reads stdin)")
+    def idem_flag(sp):
+        sp.add_argument("--idempotency-key", default=None, metavar="KEY",
+                        help="send this Idempotency-Key: a retry with the same key within 24 h returns the first "
+                             "result instead of playing twice")
+
+    sp = sub.add_parser("say", help="store text for the phone to speak ('-' reads stdin)")
     sp.add_argument("text", nargs="+")
     sp.add_argument("-c", "--channel", default=None, help="channel (default: the relay's default)")
     sp.add_argument("--speech", choices=["device", "server"], default=None)
     sp.add_argument("--voice", default=None, help="server TTS voice")
+    idem_flag(sp)
     out_flags(sp)
     sp.set_defaults(fn=cmd_say)
 
-    sp = sub.add_parser("alarm", help="LOUD: speak on the alarm channel (must be enabled on the relay)")
+    sp = sub.add_parser("alarm", help="LOUD: speak on the alarm channel (must be enabled on the relay)",
+                        description=ALARM_HELP)
     sp.add_argument("text", nargs="+")
     sp.add_argument("--speech", choices=["device", "server"], default=None)
     sp.add_argument("--voice", default=None)
+    idem_flag(sp)
     out_flags(sp)
     sp.set_defaults(fn=cmd_alarm)
 
     sp = sub.add_parser("drop", help="send an audio file")
     sp.add_argument("file")
     sp.add_argument("-c", "--channel", default=None)
+    idem_flag(sp)
     out_flags(sp)
     sp.set_defaults(fn=cmd_drop)
 
     sp = sub.add_parser("receipt", help="show what the phone did with a message (id or 'latest')")
     sp.add_argument("id", nargs="?", default="latest")
     sp.add_argument("--wait", type=int, default=0, metavar="SECONDS",
-                    help="wait up to 60 s for a final status; exit 0 finished, 3 skipped/failed/missed, 4 timeout")
+                    help="wait up to 60 s for a final status; exit 0 finished, 3 skipped/failed/missed on every "
+                         "device that reported, 4 timeout or still playing somewhere")
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(fn=cmd_receipt)
 

@@ -19,7 +19,8 @@ CREATE TABLE IF NOT EXISTS messages(
   speech TEXT,
   key TEXT UNIQUE NOT NULL,
   bytes INTEGER NOT NULL,
-  text_chars INTEGER
+  text_chars INTEGER,
+  idem_key TEXT
 );
 CREATE TABLE IF NOT EXISTS beacons(
   id INTEGER PRIMARY KEY,
@@ -39,6 +40,9 @@ CREATE INDEX IF NOT EXISTS beacons_key ON beacons(key);
 CREATE INDEX IF NOT EXISTS beacons_received ON beacons(received_at);
 CREATE INDEX IF NOT EXISTS messages_created ON messages(created_at);
 """
+# idem_key holds sha256(Idempotency-Key header), never the raw header. Added in schema version 2.
+IDEM_INDEX = "CREATE UNIQUE INDEX IF NOT EXISTS messages_idem ON messages(idem_key)"
+SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -68,6 +72,10 @@ class BeaconRow:
     received_at: str
 
 
+class TooManyDevices(Exception):
+    """A beacon from yet another device for a key that already has the most devices the relay accepts."""
+
+
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -85,7 +93,11 @@ class Store:
             self._db.execute("PRAGMA synchronous=NORMAL")
             self._db.execute("PRAGMA busy_timeout=5000")
             self._db.executescript(SCHEMA)
-            self._db.execute("PRAGMA user_version=1")
+            columns = {r["name"] for r in self._db.execute("PRAGMA table_info(messages)")}
+            if "idem_key" not in columns:  # a version 1 database
+                self._db.execute("ALTER TABLE messages ADD COLUMN idem_key TEXT")
+            self._db.execute(IDEM_INDEX)
+            self._db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
     def close(self) -> None:
         with self._lock:
@@ -94,12 +106,22 @@ class Store:
     # messages -----------------------------------------------------------------------------------------------
 
     def add_message(self, *, id: str, created_at: str, channel: str, type: str, speech: str | None, key: str,
-                    bytes: int, text_chars: int | None) -> None:
+                    bytes: int, text_chars: int | None, idem_key: str | None = None) -> None:
         with self._lock:
+            if idem_key is not None:  # an expired use of the same key gives way to this one
+                self._db.execute("UPDATE messages SET idem_key=NULL WHERE idem_key=?", (idem_key,))
             self._db.execute(
-                "INSERT INTO messages(id, created_at, channel, type, speech, key, bytes, text_chars) VALUES(?,?,?,?,?,?,?,?)",
-                (id, created_at, channel, type, speech, key, bytes, text_chars),
+                "INSERT INTO messages(id, created_at, channel, type, speech, key, bytes, text_chars, idem_key)"
+                " VALUES(?,?,?,?,?,?,?,?,?)",
+                (id, created_at, channel, type, speech, key, bytes, text_chars, idem_key),
             )
+
+    def get_by_idem(self, idem_key: str, not_before: str) -> MessageRow | None:
+        """The message first sent with this Idempotency-Key hash, if it was created at or after `not_before`."""
+        with self._lock:
+            row = self._db.execute("SELECT rowid, * FROM messages WHERE idem_key=? AND created_at >= ?",
+                                   (idem_key, not_before)).fetchone()
+        return self._message(row)
 
     def _message(self, row: sqlite3.Row | None) -> MessageRow | None:
         if row is None:
@@ -148,13 +170,26 @@ class Store:
 
     # beacons ------------------------------------------------------------------------------------------------
 
-    def add_beacon(self, beacon: dict, received_at: str) -> bool:
-        """Insert one validated beacon. False when it is a duplicate (a retried POST): still a success."""
+    def add_beacon(self, beacon: dict, received_at: str, max_devices_per_key: int | None = None) -> bool:
+        """Insert one validated beacon. False when it is a duplicate (a retried POST): still a success.
+
+        Raises TooManyDevices when the key already has `max_devices_per_key` other devices: real phones on one
+        bucket are a handful, so more is a forged flood from a leaked beacon URL.
+        """
+        key = beacon.get("key", "")
         with self._lock:
+            if max_devices_per_key is not None and key:
+                known = self._db.execute("SELECT 1 FROM beacons WHERE key=? AND device=? LIMIT 1",
+                                         (key, beacon["device"])).fetchone()
+                if known is None:
+                    (count,) = self._db.execute("SELECT COUNT(DISTINCT device) FROM beacons WHERE key=?",
+                                                (key,)).fetchone()
+                    if count >= max_devices_per_key:
+                        raise TooManyDevices(max_devices_per_key)
             cur = self._db.execute(
                 "INSERT OR IGNORE INTO beacons(key, channel, phase, device, app_version, at, last_modified, clock_skew_ms,"
                 " error, received_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                (beacon.get("key", ""), beacon["channel"], beacon["phase"], beacon["device"], beacon["app_version"],
+                (key, beacon["channel"], beacon["phase"], beacon["device"], beacon["app_version"],
                  beacon["at"], beacon.get("last_modified"), beacon.get("clock_skew_ms"), beacon.get("error"), received_at),
             )
             return cur.rowcount == 1
@@ -185,12 +220,12 @@ class Store:
             row = self._db.execute("SELECT MAX(received_at) AS t FROM beacons").fetchone()
         return row["t"] if row else None
 
-    def devices(self) -> list[BeaconRow]:
-        """The most recently received beacon of each device."""
+    def devices(self, limit: int = 20) -> list[BeaconRow]:
+        """The most recently received beacon of each device, newest first, at most `limit` devices."""
         with self._lock:
             rows = self._db.execute(
                 "SELECT b.* FROM beacons b JOIN (SELECT device, MAX(id) AS id FROM beacons GROUP BY device) m ON b.id = m.id"
-                " ORDER BY b.received_at DESC"
+                " ORDER BY b.id DESC LIMIT ?", (limit,)
             ).fetchall()
         return [self._beacon(r) for r in rows]
 

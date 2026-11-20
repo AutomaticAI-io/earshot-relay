@@ -9,6 +9,8 @@ services:
     ports:
       # Loopback only. Put a tunnel (Tailscale, Cloudflare Tunnel) in front; never publish this to the internet raw.
       - "127.0.0.1:8080:8080"
+      # Uncomment with EARSHOT_RELAY_BEACON_PORT=8081 (beacon-only listener for the phone; see docs/tunnels.md).
+      # - "127.0.0.1:8081:8081"
     volumes:
       - relay-data:/data
 

@@ -22,6 +22,11 @@ RATE_UNITS = {"s": 1, "sec": 1, "second": 1, "m": 60, "min": 60, "minute": 60, "
               "d": 86400, "day": 86400}
 REGION_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 BUCKET_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{1,254}$")
+# Words that only appear in a value copied unchanged from .env.example or the docs. A real random token
+# (`earshot-relay token`) never contains them, so a value that does was never filled in.
+PLACEHOLDER_RE = re.compile(r"replace|changeme|change-me|your-token|placeholder", re.IGNORECASE)
+SECRET_VARS = ("EARSHOT_RELAY_TOKEN", "EARSHOT_RELAY_BEACON_TOKEN", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
+               "EARSHOT_RELAY_TTS_API_KEY")
 
 
 class ConfigError(Exception):
@@ -117,6 +122,7 @@ class Settings:
     max_audio_bytes: int = 26_214_400
     rate_limit: RateLimit | None = RateLimit(60, 60)
     alarm_rate_limit: RateLimit | None = RateLimit(6, 3600)
+    beacon_rate_limit: RateLimit | None = RateLimit(600, 60)
     default_speech: str = "device"
     tts: TtsSettings | None = None
     allow_http_s3: bool = False
@@ -172,6 +178,11 @@ def load_settings(environ: dict[str, str] | None = None, *, check_ffmpeg: bool =
         problems.append("EARSHOT_REGION must be a signing region such as us-east-1 or auto")
     key_id = take(_require, "AWS_ACCESS_KEY_ID", e)
     secret = take(_require, "AWS_SECRET_ACCESS_KEY", e)
+    for var in SECRET_VARS:
+        value = take(env, var, e)
+        if value and PLACEHOLDER_RE.search(value):
+            hint = " (generate one with: earshot-relay token)" if var.endswith("TOKEN") else ""
+            problems.append(f"{var} still holds a placeholder from .env.example; set a real value{hint}")
 
     token = take(_require, "EARSHOT_RELAY_TOKEN", e)
     if token and not API_TOKEN_RE.fullmatch(token):
@@ -197,8 +208,17 @@ def load_settings(environ: dict[str, str] | None = None, *, check_ffmpeg: bool =
             channels.append(name)
     if not channels and not problems:
         problems.append("EARSHOT_RELAY_CHANNELS lists no channel")
-    default_channel = take(env, "EARSHOT_RELAY_DEFAULT_CHANNEL", e) or "phone"
-    if channels and default_channel not in channels:
+    # The default channel is what every send without an explicit channel uses (CLI say, MCP say, hooks), so it can
+    # never be the loud alarm channel: alarm is reachable only by naming it.
+    quiet = [c for c in channels if c != "alarm"]
+    default_channel = take(env, "EARSHOT_RELAY_DEFAULT_CHANNEL", e)
+    if default_channel == "alarm":
+        problems.append("EARSHOT_RELAY_DEFAULT_CHANNEL cannot be alarm (alarm is loud; send to it only by naming it)")
+    elif default_channel is None:
+        default_channel = "phone" if "phone" in quiet else (quiet[0] if quiet else None)
+        if channels and default_channel is None:
+            problems.append("EARSHOT_RELAY_CHANNELS needs at least one channel besides alarm (the default channel)")
+    elif channels and default_channel not in channels:
         problems.append("EARSHOT_RELAY_DEFAULT_CHANNEL must be one of EARSHOT_RELAY_CHANNELS")
 
     public_url = take(env, "EARSHOT_RELAY_PUBLIC_URL", e)
@@ -225,6 +245,8 @@ def load_settings(environ: dict[str, str] | None = None, *, check_ffmpeg: bool =
     rate = take(parse_rate, "EARSHOT_RELAY_RATE_LIMIT", take(env, "EARSHOT_RELAY_RATE_LIMIT", e), "60/min")
     alarm_rate = take(parse_rate, "EARSHOT_RELAY_ALARM_RATE_LIMIT", take(env, "EARSHOT_RELAY_ALARM_RATE_LIMIT", e),
                       "6/hour")
+    beacon_rate = take(parse_rate, "EARSHOT_RELAY_BEACON_RATE_LIMIT", take(env, "EARSHOT_RELAY_BEACON_RATE_LIMIT", e),
+                       "600/min")
 
     default_speech = (take(env, "EARSHOT_RELAY_DEFAULT_SPEECH", e) or "device").lower()
     if default_speech not in ("device", "server"):
@@ -237,11 +259,16 @@ def load_settings(environ: dict[str, str] | None = None, *, check_ffmpeg: bool =
         tu = urlsplit(tts_url)
         if tu.scheme not in ("http", "https") or not tu.netloc or tu.query or tu.fragment:
             problems.append("EARSHOT_RELAY_TTS_URL must be an http(s) base URL ending in /v1")
+        elif tu.username or tu.password:
+            problems.append("EARSHOT_RELAY_TTS_URL must not carry credentials (use EARSHOT_RELAY_TTS_API_KEY)")
         model = take(env, "EARSHOT_RELAY_TTS_MODEL", e)
         if not model:
             problems.append("EARSHOT_RELAY_TTS_MODEL is required when EARSHOT_RELAY_TTS_URL is set")
         voice = take(env, "EARSHOT_RELAY_TTS_VOICE", e)
-        if voice and not VOICE_RE.fullmatch(voice):
+        if not voice:
+            problems.append("EARSHOT_RELAY_TTS_VOICE is required when EARSHOT_RELAY_TTS_URL is set "
+                            "(the OpenAI speech API requires a voice; a request can still override it)")
+        elif not VOICE_RE.fullmatch(voice):
             problems.append("EARSHOT_RELAY_TTS_VOICE must match ^[A-Za-z0-9_+().: -]{1,100}$")
         fmt = (take(env, "EARSHOT_RELAY_TTS_FORMAT", e) or "mp3").lower()
         if fmt not in ("mp3", "wav"):
@@ -252,7 +279,7 @@ def load_settings(environ: dict[str, str] | None = None, *, check_ffmpeg: bool =
             problems.append("EARSHOT_RELAY_TTS_LEADIN_MS is above 0 but ffmpeg is not installed "
                             "(install ffmpeg or set EARSHOT_RELAY_TTS_LEADIN_MS=0)")
         if model:
-            tts =TtsSettings(url=tts_url, model=model or "", voice=voice, api_key=take(env, "EARSHOT_RELAY_TTS_API_KEY", e),
+            tts = TtsSettings(url=tts_url, model=model or "", voice=voice, api_key=take(env, "EARSHOT_RELAY_TTS_API_KEY", e),
                               response_format=fmt, timeout_s=float(timeout or 60), leadin_ms=leadin or 0)
     else:
         for orphan in ("EARSHOT_RELAY_TTS_MODEL", "EARSHOT_RELAY_TTS_VOICE", "EARSHOT_RELAY_TTS_API_KEY"):
@@ -268,5 +295,6 @@ def load_settings(environ: dict[str, str] | None = None, *, check_ffmpeg: bool =
         token=token, beacon_token=beacon_token, channels=tuple(channels), default_channel=default_channel,
         public_url=public_url, data_dir=data_dir, host=host, port=port, beacon_port=beacon_port,
         retention_days=retention, receipt_wait_min=wait_min, max_audio_bytes=max_audio, rate_limit=rate,
-        alarm_rate_limit=alarm_rate, default_speech=default_speech, tts=tts, allow_http_s3=allow_http,
+        alarm_rate_limit=alarm_rate, beacon_rate_limit=beacon_rate, default_speech=default_speech, tts=tts,
+        allow_http_s3=allow_http,
     )

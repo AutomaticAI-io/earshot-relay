@@ -22,7 +22,7 @@ def generate() -> dict:
     with tempfile.TemporaryDirectory() as tmp:
         settings = load_settings({
             "EARSHOT_S3_ENDPOINT": "https://s3.example.com", "EARSHOT_BUCKET": "earshot", "EARSHOT_REGION": "us-east-1",
-            "AWS_ACCESS_KEY_ID": "placeholder", "AWS_SECRET_ACCESS_KEY": "placeholder",
+            "AWS_ACCESS_KEY_ID": "openapi-generator", "AWS_SECRET_ACCESS_KEY": "openapi-generator",
             "EARSHOT_RELAY_TOKEN": "x" * 40, "EARSHOT_RELAY_DATA_DIR": tmp,
         }, check_ffmpeg=False)
         store = Store(settings.db_path)

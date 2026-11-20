@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import shutil
 import time
 from collections import deque
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import IO
@@ -13,7 +16,7 @@ from typing import IO
 from starlette.concurrency import run_in_threadpool
 
 from . import RECEIPT_WORDING, __version__
-from .beacons import HEARTBEAT, PHASE_ORDER, iso_ms, parse_rfc3339
+from .beacons import HEARTBEAT, PHASE_ORDER, TERMINAL, iso_ms, parse_rfc3339, receipt_is_final
 from .config import RateLimit, Settings
 from .keys import (
     ApiError,
@@ -25,10 +28,20 @@ from .keys import (
     utf16_units,
 )
 from .storage import S3Writer, StorageError
-from .store import BeaconRow, MessageRow, Store, now_utc
+from .store import BeaconRow, MessageRow, Store, TooManyDevices, now_utc
 from .tts import TtsClient
 
-TERMINAL = ("finished", "skipped", "failed", "missed")
+__all__ = ["TERMINAL", "Relay", "derive_receipt", "receipt_is_final"]
+
+IDEMPOTENCY_WINDOW = timedelta(hours=24)
+MAX_DEVICES_PER_KEY = 16  # distinct devices one message can collect beacons from
+STATUS_MAX_DEVICES = 20  # devices listed in GET /v1/status
+ALARM_CAVEAT = (
+    "alarm plays a siren, then the message on the phone's alarm stream at high volume, ahead of normal items. It "
+    "plays during a phone call (unless the app's 'Alarms can interrupt calls' is off) and the other party may hear "
+    "it. Do Not Disturb set to 'Total silence', an Android refusal, a stopped service, a powered-off phone, battery "
+    "restrictions or no network can still silence it. It is not an emergency or life-safety service."
+)
 # Rank of a device status: furthest phase first, then for terminal ties finished > skipped > failed > missed.
 TERMINAL_PREFERENCE = {"finished": 4, "skipped": 3, "failed": 2, "missed": 1}
 NO_BEACON_HINT = "no beacon has reached this relay; set the phone's beacon endpoint (see GET /v1/status)"
@@ -55,8 +68,19 @@ class SlidingWindow:
             return None
         return max(1, int(self.events[0] + self.limit.per_seconds - now + 0.999))
 
-    def hit(self) -> None:
-        self.events.append(self.clock())
+    def take(self) -> float | None:
+        """Record one event and return its stamp (for refund), or None when over the limit (nothing recorded)."""
+        if self.retry_after() is not None:
+            return None
+        stamp = self.clock()
+        self.events.append(stamp)
+        return stamp
+
+    def refund(self, stamp: float) -> None:
+        try:
+            self.events.remove(stamp)
+        except ValueError:
+            pass  # already slid out of the window
 
 
 class RateLimiter:
@@ -64,8 +88,8 @@ class RateLimiter:
         self.global_window = SlidingWindow(settings.rate_limit, clock) if settings.rate_limit else None
         self.alarm_window = SlidingWindow(settings.alarm_rate_limit, clock) if settings.alarm_rate_limit else None
 
-    def take(self, channel: str) -> None:
-        """Consume one send, or raise 429 without consuming anything."""
+    def take(self, channel: str) -> list[tuple[SlidingWindow, float]]:
+        """Reserve one send, or raise 429 without reserving anything. Refund the reservation if the send fails."""
         windows = [w for w in (self.global_window, self.alarm_window if channel == "alarm" else None) if w]
         for w in windows:
             wait = w.retry_after()
@@ -73,8 +97,41 @@ class RateLimiter:
                 what = "alarm sends" if w is self.alarm_window else "sends"
                 raise ApiError(429, "rate_limited", f"too many {what} (limit {w.limit.describe()}); retry in {wait} s",
                                retry_after=wait)
-        for w in windows:
-            w.hit()
+        return [(w, w.take()) for w in windows]
+
+    @staticmethod
+    def refund(reservation: list[tuple[SlidingWindow, float]]) -> None:
+        """Give back a reserved send whose TTS or PutObject failed: nothing reached the bucket, so nothing counts."""
+        for w, stamp in reservation:
+            if stamp is not None:
+                w.refund(stamp)
+
+
+class KeyedLocks:
+    """One asyncio lock per key, dropped when nobody holds or waits on it."""
+
+    def __init__(self) -> None:
+        self._locks: dict[str, list] = {}
+
+    @asynccontextmanager
+    async def hold(self, key: str) -> AsyncIterator[None]:
+        entry = self._locks.setdefault(key, [asyncio.Lock(), 0])
+        entry[1] += 1
+        try:
+            async with entry[0]:
+                yield
+        finally:
+            entry[1] -= 1
+            if entry[1] == 0:
+                self._locks.pop(key, None)
+
+
+@dataclass(frozen=True)
+class Idempotency:
+    """`digest` is sha256 of the Idempotency-Key header (None without one); `replay` is the original 202 body."""
+
+    digest: str | None
+    replay: dict | None
 
 
 # ---- receipt derivation (pure functions, unit-tested) ----------------------------------------------------------
@@ -129,7 +186,10 @@ def build_hops(beacons: list[BeaconRow]) -> list[Hop]:
         at = parse_rfc3339(b.at)
         if at is None:
             continue
-        at_server = server_time(at, b.clock_skew_ms)
+        try:  # validation bounds `at`, but one odd stored row must never fail a whole receipt or list
+            at_server = server_time(at, b.clock_skew_ms)
+        except OverflowError:
+            continue
         lm = parse_rfc3339(b.last_modified) if b.last_modified else None
         since = round((at_server - lm).total_seconds() * 1000) if lm else None
         hop = Hop(b.phase, b.device, b.app_version, b.at, at_server, b.received_at, b.clock_skew_ms, since, b.error, lm, seq)
@@ -238,8 +298,10 @@ class Relay:
         self.tts = tts
         self.clock = clock
         self.limiter = RateLimiter(settings, monotonic)
+        self.beacon_window = SlidingWindow(settings.beacon_rate_limit, monotonic) if settings.beacon_rate_limit else None
         self.signal = BeaconSignal()
         self.last_write_ok_at: str | None = None
+        self._idem_locks = KeyedLocks()
 
     # sending ----------------------------------------------------------------------------------------------------
 
@@ -276,6 +338,22 @@ class Relay:
             raise ApiError(502, "storage_error", f"PutObject failed: {exc.code}: {exc.hint}") from None
         self.last_write_ok_at = iso_ms(self.clock())
 
+    @asynccontextmanager
+    async def idempotency(self, header: str | None) -> AsyncIterator[Idempotency]:
+        """Hold the Idempotency-Key for the whole send, so a concurrent retry waits and then gets the first 202 body.
+
+        The same key within 24 hours returns the original body without writing anything or counting toward the
+        rate limit. The relay keeps only a hash of the key.
+        """
+        if header is None:
+            yield Idempotency(None, None)
+            return
+        digest = hashlib.sha256(header.encode("utf-8")).hexdigest()
+        async with self._idem_locks.hold(digest):
+            row = self.store.get_by_idem(digest, iso_ms(self.clock() - IDEMPOTENCY_WINDOW))
+            replay = self._accepted(row.id, row.type, row.speech, row.channel, row.key, row.created_at) if row else None
+            yield Idempotency(digest, replay)
+
     def _accepted(self, msg_id: str, kind: str, speech: str | None, channel: str, key: str, created_at: str) -> dict:
         return {
             "id": msg_id,
@@ -288,46 +366,70 @@ class Relay:
             "receipt_url": f"/v1/messages/{msg_id}",
         }
 
-    async def send_text(self, *, text: object, channel: object = None, speech: object = None, voice: object = None) -> dict:
+    async def send_text(self, *, text: object, channel: object = None, speech: object = None, voice: object = None,
+                        idem_key: str | None = None) -> dict:
         clean = clean_text(text)
         chan = self.resolve_channel(channel)
         chosen_voice = check_voice(voice)
         mode = self.resolve_speech(speech, chosen_voice)
-        self.limiter.take(chan)
-        if mode == "device":
-            body = clean.encode("utf-8")
-            ext, ctype = "say", content_type_for("say")
-        else:
-            assert self.tts is not None
-            result = await self.tts.render(clean, chosen_voice)
-            body, ext, ctype = result.data, result.ext, result.content_type
-        nk = new_key(chan, ext)
-        await self._put(nk.key, body, ctype)
+        reservation = self.limiter.take(chan)
+        try:
+            if mode == "device":
+                body = clean.encode("utf-8")
+                ext, ctype = "say", content_type_for("say")
+            else:
+                assert self.tts is not None
+                result = await self.tts.render(clean, chosen_voice)
+                body, ext, ctype = result.data, result.ext, result.content_type
+            nk = new_key(chan, ext)
+            await self._put(nk.key, body, ctype)
+        except BaseException:
+            self.limiter.refund(reservation)
+            raise
         created = iso_ms(self.clock())
         self.store.add_message(id=nk.message_id, created_at=created, channel=chan, type="text", speech=mode,
-                               key=nk.key, bytes=len(body), text_chars=utf16_units(clean))
+                               key=nk.key, bytes=len(body), text_chars=utf16_units(clean), idem_key=idem_key)
         return self._accepted(nk.message_id, "text", mode, chan, nk.key, created)
 
-    async def send_audio(self, *, fileobj: IO[bytes], size: int, ext: str, channel: object = None) -> dict:
+    async def send_audio(self, *, fileobj: IO[bytes], size: int, ext: str, channel: object = None,
+                         idem_key: str | None = None) -> dict:
         chan = self.resolve_channel(channel)
         if size <= 0:
             raise ApiError(422, "empty_file", "the uploaded file is empty", "file")
         if size > self.settings.max_audio_bytes:
             raise ApiError(413, "too_large", f"the file is over EARSHOT_RELAY_MAX_AUDIO_BYTES ({self.settings.max_audio_bytes})",
                            "file")
-        self.limiter.take(chan)
-        nk = new_key(chan, ext)
-        fileobj.seek(0)
-        await self._put(nk.key, fileobj, content_type_for(ext))
+        reservation = self.limiter.take(chan)
+        try:
+            nk = new_key(chan, ext)
+            fileobj.seek(0)
+            await self._put(nk.key, fileobj, content_type_for(ext))
+        except BaseException:
+            self.limiter.refund(reservation)
+            raise
         created = iso_ms(self.clock())
         self.store.add_message(id=nk.message_id, created_at=created, channel=chan, type="audio", speech=None,
-                               key=nk.key, bytes=size, text_chars=None)
+                               key=nk.key, bytes=size, text_chars=None, idem_key=idem_key)
         return self._accepted(nk.message_id, "audio", None, chan, nk.key, created)
 
     # receipts ---------------------------------------------------------------------------------------------------
 
+    def beacon_admit(self) -> None:
+        """Count one beacon request against EARSHOT_RELAY_BEACON_RATE_LIMIT, or raise 429 (the phone retries 429)."""
+        if self.beacon_window is None:
+            return
+        if self.beacon_window.take() is None:
+            wait = self.beacon_window.retry_after() or 1
+            raise ApiError(429, "rate_limited",
+                           f"too many beacons (limit {self.beacon_window.limit.describe()}); retry in {wait} s",
+                           retry_after=wait)
+
     def ingest_beacon(self, clean: dict) -> bool:
-        inserted = self.store.add_beacon(clean, iso_ms(self.clock()))
+        try:
+            inserted = self.store.add_beacon(clean, iso_ms(self.clock()), max_devices_per_key=MAX_DEVICES_PER_KEY)
+        except TooManyDevices:
+            raise ApiError(400, "invalid_beacon",
+                           f"this key already has beacons from {MAX_DEVICES_PER_KEY} devices") from None
         if inserted:
             self.signal.notify()
         return inserted
@@ -351,7 +453,7 @@ class Relay:
         while True:
             receipt = self._receipt_for(msg)
             left = deadline - time.monotonic()
-            if receipt["status"] in TERMINAL or left <= 0:
+            if receipt_is_final(receipt) or left <= 0:
                 return receipt
             await self.signal.wait(min(left, 1.0))
 
@@ -397,7 +499,7 @@ class Relay:
         devices = [
             {"device": b.device, "last_seen": b.received_at, "app_version": b.app_version, "last_phase": b.phase,
              "clock_skew_ms": b.clock_skew_ms}
-            for b in self.store.devices()
+            for b in self.store.devices(STATUS_MAX_DEVICES)
         ]
         last_write = max(filter(None, [self.last_write_ok_at, self.store.last_message_at()]), default=None)
         return {
@@ -434,7 +536,7 @@ class Relay:
 
         check("channels", True, f"sendable: {', '.join(s.channels)}; default: {s.default_channel}")
         if s.alarm_allowed:
-            check("alarm", True, "alarm is enabled: it plays loudly on the phone's alarm stream, also during calls")
+            check("alarm", True, "alarm is enabled. " + ALARM_CAVEAT[0].upper() + ALARM_CAVEAT[1:])
         check("s3_endpoint", s.s3_endpoint.startswith("https://"),
               "https" if s.s3_endpoint.startswith("https://") else "plain http (EARSHOT_RELAY_ALLOW_HTTP_S3): disposable tests only")
         if s.beacon_token:

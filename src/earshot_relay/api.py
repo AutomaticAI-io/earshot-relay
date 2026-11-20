@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 from typing import Any, Literal
 
 import anyio
-from fastapi import FastAPI, Query, Request, Response
+from fastapi import FastAPI, Header, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
@@ -30,6 +30,24 @@ MAX_JSON_BYTES = 256 * 1024
 MULTIPART_OVERHEAD = 64 * 1024
 BEACON_PATH_RE = re.compile(r"^/v1/beacons/[^/]+$")
 TEXT_FIELDS = {"text", "channel", "speech", "voice"}
+IDEMPOTENCY_KEY_RE = re.compile(r"^[\x20-\x7e]{1,255}$")
+# JSON parse failures: RecursionError is what json.loads raises on very deep nesting.
+JSON_ERRORS = (ValueError, UnicodeDecodeError, RecursionError)
+
+# Every documented status gets an explicit description, so the generated OpenAPI does not depend on the Python
+# version's http.HTTPStatus phrases (3.13 renamed 413 and 422).
+ERROR_DESCRIPTIONS = {
+    400: "Malformed request",
+    401: "Missing or invalid bearer token",
+    403: "Channel not allowed",
+    404: "Not found",
+    413: "Body too large",
+    415: "Unsupported media type",
+    422: "Invalid field",
+    429: "Rate limited (see Retry-After)",
+    502: "Storage or TTS failure",
+    504: "TTS timeout",
+}
 
 RECEIPT_STATUS_DOC = (
     "stored | detected | started | finished | skipped | failed | missed | unconfirmed. "
@@ -217,7 +235,7 @@ class BeaconRequest(BaseModel):
 
 
 def _errors(*codes: int) -> dict[int | str, dict[str, Any]]:
-    return {c: {"model": ErrorResponse} for c in codes}
+    return {c: {"model": ErrorResponse, "description": ERROR_DESCRIPTIONS[c]} for c in codes}
 
 
 # ---- middleware ------------------------------------------------------------------------------------------------
@@ -232,11 +250,22 @@ def error_json(status: int, code: str, message: str, field: str | None = None,
 
 
 class BearerAuth:
-    """Every route except /healthz and the beacon route needs `Authorization: Bearer <EARSHOT_RELAY_TOKEN>`."""
+    """Every route except /healthz and the beacon route needs `Authorization: Bearer <EARSHOT_RELAY_TOKEN>`.
+
+    The scheme is case-insensitive and any run of spaces or tabs may separate it from the token (RFC 7235), so
+    low-code tools that send `bearer <token>` work. The token itself is compared in constant time.
+    """
 
     def __init__(self, app, token: str):
         self.app = app
-        self.token = f"Bearer {token}".encode()
+        self.token = token.encode()
+
+    def _accepts(self, header: bytes) -> bool:
+        parts = header.strip().split(None, 1)
+        if len(parts) != 2 or parts[0].lower() != b"bearer":
+            hmac.compare_digest(b"", self.token)  # same work either way
+            return False
+        return hmac.compare_digest(parts[1].strip(), self.token)
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
@@ -247,9 +276,9 @@ class BearerAuth:
         presented = b""
         for name, value in scope.get("headers", []):
             if name == b"authorization":
-                presented = value.strip()
+                presented = value
                 break
-        if not hmac.compare_digest(presented, self.token):
+        if not self._accepts(presented):
             scope.setdefault("state", {})["auth_failed"] = True
             resp = error_json(401, "unauthorized", "missing or invalid bearer token",
                               headers={"WWW-Authenticate": 'Bearer realm="earshot-relay"'})
@@ -353,12 +382,13 @@ def _beacon_route(app: FastAPI, relay: Relay) -> None:
         description=(
             "The Earshot app POSTs one JSON beacon per playback phase. The token in the path is "
             "EARSHOT_RELAY_BEACON_TOKEN (the app sends no auth header). A wrong token is 404. Valid beacons are "
-            "stored, including keys the relay did not issue; a repeated beacon is a no-op 200. "
+            "stored, including keys the relay did not issue; a repeated beacon is a no-op 200. Over "
+            "EARSHOT_RELAY_BEACON_RATE_LIMIT the answer is 429, which the phone retries. "
             "Beacons record device playback, never that a person heard anything."
         ),
         status_code=200,
         response_class=Response,
-        responses={200: {"description": "Stored (empty body)"}, **_errors(400, 404, 413)},
+        responses={200: {"description": "Stored (empty body)"}, **_errors(400, 404, 413, 429)},
         openapi_extra={"requestBody": {"required": True, "content": {
             "application/json": {"schema": BeaconRequest.model_json_schema()}}}},
     )
@@ -366,10 +396,11 @@ def _beacon_route(app: FastAPI, relay: Relay) -> None:
         expected = relay.settings.beacon_token
         if not expected or not hmac.compare_digest(beacon_token.encode(), expected.encode()):
             raise ApiError(404, "not_found", "not found")
+        relay.beacon_admit()
         raw = await read_capped(request, BEACON_MAX_BYTES)
         try:
             data = json.loads(raw)
-        except (ValueError, UnicodeDecodeError):
+        except JSON_ERRORS:
             raise ApiError(400, "bad_json", "body is not JSON") from None
         clean, why = validate_beacon(data)
         if clean is None:
@@ -394,10 +425,17 @@ def _api_routes(app: FastAPI, relay: Relay) -> None:
         description=(
             "JSON body: text (written as a .say the phone speaks, or synthesized on the relay with speech=server). "
             "multipart/form-data: an audio file. The relay finishes PutObject (and TTS) before it answers, so 202 "
-            "means stored in the bucket; delivery to the phone is asynchronous. Location points at the receipt."
+            "means stored in the bucket; delivery to the phone is asynchronous. Location points at the receipt. "
+            "With an Idempotency-Key header, a repeat of the same key within 24 hours returns the original 202 body "
+            "(with Idempotent-Replayed: true) and writes nothing."
         ),
         responses={
-            202: {"headers": {"Location": {"description": "/v1/messages/{id}", "schema": {"type": "string"}}}},
+            202: {"description": "Stored in the bucket", "headers": {
+                "Location": {"description": "/v1/messages/{id}", "schema": {"type": "string"}},
+                "Idempotent-Replayed": {"description": "true when this is the original response to an earlier "
+                                                       "request with the same Idempotency-Key",
+                                        "schema": {"type": "string"}},
+            }},
             **_errors(400, 401, 403, 413, 415, 422, 429, 502, 504),
         },
         openapi_extra={"requestBody": {"required": True, "content": {
@@ -405,13 +443,34 @@ def _api_routes(app: FastAPI, relay: Relay) -> None:
             "multipart/form-data": {"schema": AudioMessageRequest.model_json_schema()},
         }}},
     )
-    async def post_message(request: Request, response: Response):
+    async def post_message(
+        request: Request,
+        response: Response,
+        idempotency_key: str | None = Header(
+            None, alias="Idempotency-Key",
+            description="Any 1-255 printable ASCII characters. The same key within 24 hours returns the original "
+                        "202 body instead of sending again, so a retried request never plays twice."),
+    ):
+        if idempotency_key is not None and not IDEMPOTENCY_KEY_RE.fullmatch(idempotency_key):
+            raise ApiError(422, "invalid_field", "Idempotency-Key must be 1-255 printable ASCII characters",
+                           "Idempotency-Key")
+        async with relay.idempotency(idempotency_key) as idem:
+            if idem.replay is not None:
+                result = idem.replay
+                response.headers["Idempotent-Replayed"] = "true"
+            else:
+                result = await _send(request, relay, idem.digest)
+        request.state.message_id = result["id"]
+        response.headers["Location"] = result["receipt_url"]
+        return result
+
+    async def _send(request: Request, relay: Relay, idem_key: str | None) -> dict:
         media = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
         if media == "application/json" or media.endswith("+json"):
             raw = await read_capped(request, MAX_JSON_BYTES)
             try:
                 data = json.loads(raw)
-            except (ValueError, UnicodeDecodeError):
+            except JSON_ERRORS:
                 raise ApiError(400, "bad_json", "body is not valid JSON") from None
             if not isinstance(data, dict):
                 raise ApiError(400, "bad_json", "body must be a JSON object")
@@ -424,16 +483,12 @@ def _api_routes(app: FastAPI, relay: Relay) -> None:
             for name in ("channel", "speech", "voice"):
                 if data.get(name) is not None and not isinstance(data[name], str):
                     raise ApiError(422, "invalid_field", f"{name} must be a string", name)
-            result = await relay.send_text(text=data["text"], channel=data.get("channel"), speech=data.get("speech"),
-                                           voice=data.get("voice"))
-        elif media == "multipart/form-data":
-            result = await _send_multipart(request, relay)
-        else:
-            raise ApiError(415, "unsupported_media_type",
-                           "send application/json (text) or multipart/form-data (an audio file named 'file')")
-        request.state.message_id = result["id"]
-        response.headers["Location"] = result["receipt_url"]
-        return result
+            return await relay.send_text(text=data["text"], channel=data.get("channel"), speech=data.get("speech"),
+                                         voice=data.get("voice"), idem_key=idem_key)
+        if media == "multipart/form-data":
+            return await _send_multipart(request, relay, idem_key)
+        raise ApiError(415, "unsupported_media_type",
+                       "send application/json (text) or multipart/form-data (an audio file named 'file')")
 
     @app.get(
         "/v1/messages/{message_id}",
@@ -484,7 +539,7 @@ def _api_routes(app: FastAPI, relay: Relay) -> None:
         return await relay.doctor()
 
 
-async def _send_multipart(request: Request, relay: Relay) -> dict:
+async def _send_multipart(request: Request, relay: Relay, idem_key: str | None = None) -> dict:
     cap = relay.settings.max_audio_bytes + MULTIPART_OVERHEAD
     declared = request.headers.get("content-length")
     if declared and declared.isdigit() and int(declared) > cap:
@@ -519,7 +574,9 @@ async def _send_multipart(request: Request, relay: Relay) -> dict:
             raise ApiError(422, "invalid_field", "channel must be a text field", "channel")
         ext = audio_extension(upload.filename, upload.content_type)
         size = upload.size if upload.size is not None else _measure(upload)
-        return await relay.send_audio(fileobj=upload.file, size=size, ext=ext, channel=channel or None)
+        # An empty channel field is an invalid channel (422), not "use the default": a templated `-F channel=$CHAN`
+        # with an unset variable must not quietly land somewhere else.
+        return await relay.send_audio(fileobj=upload.file, size=size, ext=ext, channel=channel, idem_key=idem_key)
     finally:
         await form.close()
 

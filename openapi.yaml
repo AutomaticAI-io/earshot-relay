@@ -31,11 +31,25 @@ paths:
       description: 'JSON body: text (written as a .say the phone speaks, or synthesized on the relay with
         speech=server). multipart/form-data: an audio file. The relay finishes PutObject (and TTS) before
         it answers, so 202 means stored in the bucket; delivery to the phone is asynchronous. Location
-        points at the receipt.'
+        points at the receipt. With an Idempotency-Key header, a repeat of the same key within 24 hours
+        returns the original 202 body (with Idempotent-Replayed: true) and writes nothing.'
       operationId: post_message_v1_messages_post
+      parameters:
+      - name: Idempotency-Key
+        in: header
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          description: Any 1-255 printable ASCII characters. The same key within 24 hours returns the
+            original 202 body instead of sending again, so a retried request never plays twice.
+          title: Idempotency-Key
+        description: Any 1-255 printable ASCII characters. The same key within 24 hours returns the original
+          202 body instead of sending again, so a retried request never plays twice.
       responses:
         '202':
-          description: Successful Response
+          description: Stored in the bucket
           content:
             application/json:
               schema:
@@ -45,60 +59,65 @@ paths:
               description: /v1/messages/{id}
               schema:
                 type: string
+            Idempotent-Replayed:
+              description: true when this is the original response to an earlier request with the same
+                Idempotency-Key
+              schema:
+                type: string
         '400':
+          description: Malformed request
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-          description: Bad Request
         '401':
+          description: Missing or invalid bearer token
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-          description: Unauthorized
         '403':
+          description: Channel not allowed
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-          description: Forbidden
         '413':
+          description: Body too large
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-          description: Request Entity Too Large
         '415':
+          description: Unsupported media type
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-          description: Unsupported Media Type
         '422':
+          description: Invalid field
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-          description: Unprocessable Entity
         '429':
+          description: Rate limited (see Retry-After)
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-          description: Too Many Requests
         '502':
+          description: Storage or TTS failure
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-          description: Bad Gateway
         '504':
+          description: TTS timeout
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-          description: Gateway Timeout
       requestBody:
         required: true
         content:
@@ -200,23 +219,23 @@ paths:
               schema:
                 $ref: '#/components/schemas/MessageList'
         '401':
+          description: Missing or invalid bearer token
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-          description: Unauthorized
         '404':
+          description: Not found
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-          description: Not Found
         '422':
+          description: Invalid field
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-          description: Unprocessable Entity
   /v1/messages/{message_id}:
     get:
       tags:
@@ -254,23 +273,23 @@ paths:
               schema:
                 $ref: '#/components/schemas/Receipt'
         '401':
+          description: Missing or invalid bearer token
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-          description: Unauthorized
         '404':
+          description: Not found
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-          description: Not Found
         '422':
+          description: Invalid field
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-          description: Unprocessable Entity
   /v1/status:
     get:
       tags:
@@ -285,7 +304,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/StatusResponse'
         '401':
-          description: Unauthorized
+          description: Missing or invalid bearer token
           content:
             application/json:
               schema:
@@ -305,7 +324,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/DoctorResponse'
         '401':
-          description: Unauthorized
+          description: Missing or invalid bearer token
           content:
             application/json:
               schema:
@@ -317,8 +336,9 @@ paths:
       summary: Receive one phone beacon (the app's 'Optional HTTPS beacon endpoint')
       description: The Earshot app POSTs one JSON beacon per playback phase. The token in the path is
         EARSHOT_RELAY_BEACON_TOKEN (the app sends no auth header). A wrong token is 404. Valid beacons
-        are stored, including keys the relay did not issue; a repeated beacon is a no-op 200. Beacons
-        record device playback, never that a person heard anything.
+        are stored, including keys the relay did not issue; a repeated beacon is a no-op 200. Over EARSHOT_RELAY_BEACON_RATE_LIMIT
+        the answer is 429, which the phone retries. Beacons record device playback, never that a person
+        heard anything.
       operationId: post_beacon_v1_beacons__beacon_token__post
       parameters:
       - name: beacon_token
@@ -331,23 +351,29 @@ paths:
         '200':
           description: Stored (empty body)
         '400':
+          description: Malformed request
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-          description: Bad Request
         '404':
+          description: Not found
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-          description: Not Found
         '413':
+          description: Body too large
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-          description: Request Entity Too Large
+        '429':
+          description: Rate limited (see Retry-After)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '422':
           description: Validation Error
           content:

@@ -72,16 +72,23 @@ class RelayClient:
             raise ClientError(f"cannot reach the relay at {self.http.base_url} ({type(exc).__name__})") from None
         return self._handle(resp)
 
-    def say(self, text: str, channel: str | None = None, speech: str | None = None, voice: str | None = None) -> dict:
-        body = {"text": text, "channel": channel, "speech": speech, "voice": voice}
-        return self._request("POST", "/v1/messages", json={k: v for k, v in body.items() if v is not None})
+    @staticmethod
+    def _idem(key: str | None) -> dict[str, str] | None:
+        return {"Idempotency-Key": key} if key else None
 
-    def drop(self, path: str, channel: str | None = None) -> dict:
+    def say(self, text: str, channel: str | None = None, speech: str | None = None, voice: str | None = None,
+            idempotency_key: str | None = None) -> dict:
+        body = {"text": text, "channel": channel, "speech": speech, "voice": voice}
+        return self._request("POST", "/v1/messages", json={k: v for k, v in body.items() if v is not None},
+                             headers=self._idem(idempotency_key))
+
+    def drop(self, path: str, channel: str | None = None, idempotency_key: str | None = None) -> dict:
         p = Path(path)
-        data = {"channel": channel} if channel else None
+        data = {"channel": channel} if channel is not None else None
         media = mimetypes.guess_type(p.name)[0] or "application/octet-stream"
         with p.open("rb") as fh:
-            return self._request("POST", "/v1/messages", files={"file": (p.name, fh, media)}, data=data, timeout=120)
+            return self._request("POST", "/v1/messages", files={"file": (p.name, fh, media)}, data=data, timeout=120,
+                                 headers=self._idem(idempotency_key))
 
     def receipt(self, message_id: str, wait: int = 0) -> dict:
         params = {"wait": wait} if wait else None

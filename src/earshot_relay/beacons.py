@@ -3,6 +3,8 @@
 Ported from the operator's beacon proxy. Required: channel, phase, at, device, app_version. The five playback
 phases also need key (under that channel) and last_modified. `heartbeat` is accepted for forward compatibility
 (buyer builds do not send it). Operator-only telemetry (audio, channels, incall, call) and unknown fields are dropped.
+Stricter than the proxy in two ways, because a leaked beacon URL must not be able to break the relay or the
+operator's terminal: timestamps must fall in 2000-2100, and device and app_version may not hold control characters.
 """
 
 from __future__ import annotations
@@ -19,7 +21,13 @@ PHASE_ORDER = {"detected": 1, "started": 2, "finished": 3, "failed": 3, "missed"
 MAX_SKEW_MS = 86_400_000
 MAX_BODY_BYTES = 4096
 RFC3339_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$")
-CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+# C0, DEL and C1 controls. Beacon text reaches the operator's terminal (`earshot-relay receipt`, `status`), so an
+# escape sequence in a forged beacon must never survive.
+CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+# Timestamps outside this window are refused: no real phone or bucket reports them, and near datetime.min/max the
+# skew correction (at - clock_skew_ms) would overflow.
+EARLIEST = datetime(2000, 1, 1, tzinfo=timezone.utc)
+LATEST = datetime(2100, 1, 1, tzinfo=timezone.utc)
 
 
 def parse_rfc3339(value: object) -> datetime | None:
@@ -33,8 +41,30 @@ def parse_rfc3339(value: object) -> datetime | None:
         main = f"{head}.{frac[:6].ljust(6, '0')}"
     try:
         return datetime.fromisoformat(main + zone).astimezone(timezone.utc)
-    except ValueError:
+    except (ValueError, OverflowError):
         return None
+
+
+def in_window(value: object) -> bool:
+    """An RFC 3339 timestamp between 2000-01-01 and 2100-01-01 UTC."""
+    dt = parse_rfc3339(value)
+    return dt is not None and EARLIEST <= dt < LATEST
+
+
+TERMINAL = ("finished", "skipped", "failed", "missed")
+
+
+def receipt_is_final(receipt: dict) -> bool:
+    """True when waiting longer cannot change the answer much.
+
+    `finished` outranks everything, so it is final at once. Any other terminal status is final only when every
+    device that has reported is terminal too: with two phones, one can report `missed` while the other is still
+    playing, and a moment later the message reads `finished`.
+    """
+    status = receipt.get("status")
+    if status == "finished":
+        return True
+    return status in TERMINAL and all(d.get("status") in TERMINAL for d in receipt.get("devices", []))
 
 
 def iso_ms(dt: datetime) -> str:
@@ -81,13 +111,13 @@ def validate_beacon(beacon: object) -> tuple[dict | None, str | None]:
     if last_modified is None:
         if not heartbeat:
             return None, "bad last_modified"
-    elif parse_rfc3339(last_modified) is None:
+    elif not in_window(last_modified):
         return None, "bad last_modified"
-    if parse_rfc3339(beacon.get("at")) is None:
+    if not in_window(beacon.get("at")):
         return None, "bad at"
     for name in ("device", "app_version"):
         v = beacon.get(name)
-        if not isinstance(v, str) or not 0 < len(v) <= 80:
+        if not isinstance(v, str) or not 0 < len(v) <= 80 or CONTROL_RE.search(v) is not None:
             return None, f"bad {name}"
     err = beacon.get("error")
     if err is not None and not isinstance(err, str):

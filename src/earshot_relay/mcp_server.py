@@ -16,6 +16,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 
 from . import RECEIPT_WORDING, __version__
+from .beacons import receipt_is_final
 
 INSTRUCTIONS = (
     "Earshot reads text aloud on the user's Android phone: the relay stores a message in the user's own bucket and the "
@@ -25,24 +26,29 @@ INSTRUCTIONS = (
 )
 
 SAY_DESCRIPTION = (
-    "Speak a short message aloud on the user's phone through Earshot. The text is stored in the user's bucket and the "
-    "Earshot app speaks it (Android text-to-speech by default). Keep it to one or two plain sentences. Returns the "
-    "message id; call receipt with it to learn whether the phone played it. Not for the alarm channel: urgent alerts "
-    "use the alarm tool, which exists only when the user enabled it."
+    "Send a short message to be spoken aloud on the user's phone through Earshot. The text is stored in the user's "
+    "bucket; if the Earshot app is listening it should speak it within seconds (Android text-to-speech by default, at "
+    "the phone's media volume; held while the phone is on a call). A successful call means stored, not played. Keep "
+    "it to one or two plain sentences. Returns the message id; call receipt with it to learn whether the phone played "
+    "it. Not for the alarm channel: urgent alerts use the alarm tool, which exists only when the user enabled it."
 )
 
 ALARM_DESCRIPTION = (
-    "LOUD urgent alert on the user's phone. It plays on the phone's alarm stream at maximum volume, gets through Do Not "
-    "Disturb's alarm exception, and plays even during a phone call, where the other party may hear it. Use it only for "
-    "deliberate urgency the user asked to be woken or interrupted for (a production outage, a failed deploy they are "
+    "LOUD urgent alert on the user's phone. The app plays a siren, then the message on the alarm stream at high "
+    "volume. It usually gets through Do Not Disturb (not 'Total silence') and plays during a phone call, where the "
+    "other party may hear it, unless the user turned off 'Alarms can interrupt calls'. It can still be silenced by "
+    "Total-silence Do Not Disturb, an Android refusal, a stopped service, a powered-off phone, battery restrictions or "
+    "no network, so never tell the user it is certain to wake them. It is not an emergency or life-safety service. "
+    "Use it only for urgency the user asked to be interrupted for (a production outage, a failed deploy they are "
     "waiting on). Never for routine status: use say. Rate limited by the relay."
 )
 
 RECEIPT_DESCRIPTION = (
     "Did the phone play it? Returns the device-playback receipt of a message (id from say or alarm, or 'latest'): "
-    "stored, detected, started, finished, skipped (the user skipped it), failed, missed (too old when it arrived) or "
-    "unconfirmed (no device report yet). wait_seconds (0-60) waits for a final status. A finished receipt means the "
-    "phone finished playing it, not that a person heard it."
+    "stored, detected, started, finished, skipped (the user skipped it), failed, missed (not played: it went stale, the "
+    "bucket changed or audio was unavailable) or unconfirmed (no device report yet). wait_seconds (0-60) waits for a final status; "
+    "`final` says whether waiting longer could still change it. A finished receipt means the phone finished playing "
+    "it, not that a person heard it."
 )
 
 SUMMARIES = {
@@ -52,7 +58,8 @@ SUMMARIES = {
     "finished": "The phone finished playing it (device playback; not proof a person heard it).",
     "skipped": "The phone started it but the user skipped it.",
     "failed": "The phone could not play it.",
-    "missed": "The phone saw it too late and did not play it (stale).",
+    "missed": "The phone did not play it: it went stale (too old, or held too long for a call), audio was "
+              "unavailable, or the bucket changed. See the hop error.",
     "unconfirmed": "No device has reported this message within the wait window; it may still report later.",
 }
 
@@ -141,6 +148,7 @@ def build_mcp(backend: Backend, *, alarm_allowed: bool) -> MCPServer:
         return {
             "id": r["id"],
             "status": r["status"],
+            "final": receipt_is_final(r),
             "summary": SUMMARIES.get(r["status"], r["status"]),
             "channel": r["channel"],
             "created_at": r["created_at"],
