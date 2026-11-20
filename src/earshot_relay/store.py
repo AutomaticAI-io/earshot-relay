@@ -60,6 +60,16 @@ CREATE TABLE IF NOT EXISTS pending(
   UNIQUE(channel, tag)
 );
 CREATE INDEX IF NOT EXISTS pending_due ON pending(due_at);
+CREATE TABLE IF NOT EXISTS failed_pending(
+  id TEXT PRIMARY KEY,
+  channel TEXT NOT NULL,
+  tag TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  failed_at TEXT NOT NULL,
+  attempts INTEGER NOT NULL,
+  error TEXT NOT NULL,
+  notified INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS idem_aliases(
   idem_key TEXT PRIMARY KEY,
   message_id TEXT NOT NULL,
@@ -75,7 +85,7 @@ MESSAGE_COLUMNS = {"idem_key": "TEXT", "tag": "TEXT", "normalized": "INTEGER NOT
 TAG_INDEX = "CREATE INDEX IF NOT EXISTS messages_tag ON messages(channel, tag, created_at)"
 # idem_key holds sha256(Idempotency-Key header), never the raw header. Added in schema version 2.
 IDEM_INDEX = "CREATE UNIQUE INDEX IF NOT EXISTS messages_idem ON messages(idem_key)"
-SCHEMA_VERSION = 3  # 2: idem_key. 3: tag, normalized, truncated, pending, idem_aliases, meta
+SCHEMA_VERSION = 4  # 2: idem_key. 3: tag, normalized, truncated, pending, idem_aliases, meta. 4: failed_pending
 
 
 @dataclass(frozen=True)
@@ -110,6 +120,19 @@ class PendingRow:
     truncated: bool
     merged: int
     attempts: int
+
+
+@dataclass(frozen=True)
+class FailedRow:
+    """A coalesced message whose write failed every retry. The text is gone; only this record is kept."""
+
+    id: str
+    channel: str
+    tag: str
+    created_at: str
+    failed_at: str
+    attempts: int
+    error: str
 
 
 @dataclass(frozen=True)
@@ -294,6 +317,45 @@ class Store:
             except sqlite3.Error:
                 pass  # busy (another reader): the next checkpoint gets it
 
+    def fail_pending(self, row: PendingRow, failed_at: str, error: str) -> None:
+        """Give up on a held message: keep a record without its text (visible in its receipt and in status)."""
+        with self._lock:
+            self._db.execute(
+                "INSERT OR REPLACE INTO failed_pending(id, channel, tag, created_at, failed_at, attempts, error)"
+                " VALUES(?,?,?,?,?,?,?)", (row.id, row.channel, row.tag, row.created_at, failed_at, row.attempts, error))
+            self._db.execute("DELETE FROM pending WHERE id=?", (row.id,))
+            try:
+                self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+            except sqlite3.Error:
+                pass
+
+    @staticmethod
+    def _failed(row: sqlite3.Row | None) -> FailedRow | None:
+        if row is None:
+            return None
+        return FailedRow(row["id"], row["channel"], row["tag"], row["created_at"], row["failed_at"], row["attempts"],
+                         row["error"])
+
+    def get_failed(self, message_id: str) -> FailedRow | None:
+        with self._lock:
+            return self._failed(self._db.execute("SELECT * FROM failed_pending WHERE id=?", (message_id,)).fetchone())
+
+    def failed_count(self) -> int:
+        with self._lock:
+            (n,) = self._db.execute("SELECT COUNT(*) FROM failed_pending").fetchone()
+        return n
+
+    def unnotified_failed(self) -> tuple[FailedRow | None, int]:
+        """The oldest failed coalesced message nobody was told about, and how many there are."""
+        with self._lock:
+            row = self._db.execute("SELECT * FROM failed_pending WHERE notified=0 ORDER BY failed_at ASC LIMIT 1").fetchone()
+            (n,) = self._db.execute("SELECT COUNT(*) FROM failed_pending WHERE notified=0").fetchone()
+        return self._failed(row), n
+
+    def mark_failed_notified(self) -> None:
+        with self._lock:
+            self._db.execute("UPDATE failed_pending SET notified=1 WHERE notified=0")
+
     def due_pending(self, now: str, limit: int = 50) -> list[PendingRow]:
         with self._lock:
             rows = self._db.execute("SELECT * FROM pending WHERE due_at <= ? ORDER BY due_at ASC LIMIT ?",
@@ -409,4 +471,5 @@ class Store:
             m = self._db.execute("DELETE FROM messages WHERE created_at < ?", (cutoff,)).rowcount
             b = self._db.execute("DELETE FROM beacons WHERE received_at < ?", (cutoff,)).rowcount
             self._db.execute("DELETE FROM idem_aliases WHERE created_at < ?", (cutoff,))
+            self._db.execute("DELETE FROM failed_pending WHERE failed_at < ?", (cutoff,))
         return m, b

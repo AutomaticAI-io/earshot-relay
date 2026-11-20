@@ -50,7 +50,7 @@ ALARM_DESCRIPTION = (
 
 RECEIPT_DESCRIPTION = (
     "Did the phone play it? Returns the device-playback receipt of a message (id from say or alarm, or 'latest'): "
-    "coalescing (held, not yet written), stored, detected, started, finished, skipped (the user skipped it), failed, missed (not played: it went stale, the "
+    "coalescing (held, not yet written), write_failed (the held message could not be written: nothing is stored, send it again), stored, detected, started, finished, skipped (the user skipped it), failed, missed (not played: it went stale, the "
     "bucket changed or audio was unavailable) or unconfirmed (no device report yet). wait_seconds (0-60) waits for a final status; "
     "`final` says whether waiting longer could still change it. A finished receipt means the phone finished playing "
     "it, not that a person heard it."
@@ -58,6 +58,8 @@ RECEIPT_DESCRIPTION = (
 
 SUMMARIES = {
     "coalescing": "Held for coalescing: nothing is in the bucket yet; it is written when the window closes.",
+    "write_failed": "The relay could not write this held message to the bucket after retries: nothing is stored and "
+                    "nothing will play. Send it again.",
     "stored": "Stored in the bucket; no device has reported it yet.",
     "detected": "The phone saw the message and queued it.",
     "started": "The phone started playing it.",

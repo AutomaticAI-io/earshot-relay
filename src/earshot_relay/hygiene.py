@@ -24,24 +24,28 @@ SENTENCE_END = ".!?…。！？"
 # ---- emoji and pictographs ----------------------------------------------------------------------------------------
 # Ranges, not a library: the Unicode emoji blocks plus the joiners and selectors that glue sequences together. Plain
 # text symbols that read fine aloud (the copyright, registered and trade-mark signs, arrows, math) are kept.
-EMOJI_RE = re.compile(
-    "["
+_EMOJI_CHARS = (
     "\U0001F000-\U0001FAFF"  # mahjong, cards, enclosed, pictographs, emoticons, transport, supplemental, extended-A
     "\U0001F1E6-\U0001F1FF"  # regional indicators (flags)
-    "☀-➿"  # miscellaneous symbols and dingbats (checks, crosses, warning, stars)
-    "⭐⭕⬛⬜"  # stars and squares that are emoji
-    "⌚⌛⏩-⏳⏸-⏺"  # watch, hourglass, media controls, alarm clock
-    "▪▫▶◀◻-◾"  # geometric shapes that are emoji
-    "⤴⤵〰〽㊗㊙"
-    "︎️‍⃣"  # variation selectors, zero-width joiner, keycap
+    "\u2600-\u27bf"  # miscellaneous symbols and dingbats (checks, crosses, warning, stars)
+    "\u2b50\u2b55\u2b1b\u2b1c"  # stars and squares that are emoji
+    "\u231a\u231b\u23e9-\u23f3\u23f8-\u23fa"  # watch, hourglass, media controls, alarm clock
+    "\u25aa\u25ab\u25b6\u25c0\u25fb-\u25fe"  # geometric shapes that are emoji
+    "\u2934\u2935\u3030\u303d\u3297\u3299"
+    "\ufe0e\ufe0f\u20e3"  # variation selectors, keycap
     "\U0001F3FB-\U0001F3FF"  # skin tones (inside the range above, kept for clarity)
     "\U000E0020-\U000E007F"  # tag characters (subdivision flags)
-    "]+"
 )
+# The zero-width joiner (U+200D) glues emoji into one sequence, so it goes with them. Between letters it is meaningful
+# (Malayalam, Devanagari, Sinhala conjuncts), so a joiner that does not touch an emoji is left alone.
+EMOJI_RE = re.compile(f"[{_EMOJI_CHARS}]+(?:\u200d[{_EMOJI_CHARS}]*)*")
 
 # ---- markdown ------------------------------------------------------------------------------------------------------
 # Spans are bounded ({1,300}) so a hostile line of unmatched markers cannot make the scan quadratic.
-FENCE_RE = re.compile(r"(?s)(?<![`~])(`{3,}+|~{3,}+)[^\n]{0,200}\n.*?(?:\1[`~]*|\Z)")
+# A code fence is a line that starts with 3+ backticks or tildes (up to 3 spaces of indent) and, for backticks, has no
+# backtick in the rest of the line; it ends at a line holding only a fence at least as long. See _strip_fences.
+FENCE_OPEN_RE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})(.*)$")
+FENCE_CLOSE_RE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})[ \t]*$")
 INLINE_CODE_RE = re.compile(r"(?<!`)`++([^`\n]{1,300})`+")
 IMAGE_RE = re.compile(r"!\[([^\]\n]{0,300})\]\([^)\n]{0,2000}\)")
 LINK_RE = re.compile(r"\[([^\]\n]{1,300})\]\([^)\n]{0,2000}\)")
@@ -54,6 +58,11 @@ RULE_RE = re.compile(r"^[ \t]{0,3}(?:-{3,}|\*{3,}|_{3,})[ \t]*$", re.MULTILINE)
 TABLE_SEP_RE = re.compile(r"^[ \t|:-]+$")
 LIST_RE = re.compile(r"^[ \t]*(?:[-*+\u2022]|\d{1,3}[.)])[ \t]+")
 BOLD_RE = re.compile(r"(\*\*|__)(?=\S)([^\n]{1,300}?)(?<=\S)\1")
+# __init__, __main__, __post_init__: a Python name, not bold text. A lone word like __bold__ is still bold.
+DUNDERS = frozenset(
+    "init main name file all call str repr new del doc dict class slots version enter exit iter next len eq ne lt gt "
+    "le ge hash bool getitem setitem delitem contains getattr setattr delattr dir format bytes int float add sub mul "
+    "aenter aexit await aiter anext module qualname".split())
 ITALIC_STAR_RE = re.compile(r"(?<![*\w])\*(?=[^\s*])([^\n*]{1,300}?)(?<=[^\s*])\*(?![*\w])")
 ITALIC_UNDER_RE = re.compile(r"(?<![_\w])_(?=[^\s_])([^\n_]{1,300}?)(?<=[^\s_])_(?![_\w])")
 STRIKE_RE = re.compile(r"~~(?=\S)([^\n]{1,300}?)(?<=\S)~~")
@@ -75,15 +84,59 @@ def _link(match: re.Match[str]) -> str:
     return "link" + (url[len(url) - kept:] if kept else "")
 
 
+def _bold(match: re.Match[str]) -> str:
+    if match.group(1) == "__" and (match.group(2) in DUNDERS or re.fullmatch(r"[a-z][a-z0-9]*(?:_[a-z0-9]+)+", match.group(2))):
+        return match.group(0)
+    return match.group(2)
+
+
+def _strip_fences(text: str) -> str:
+    """Replace each closed code block with the word "code". An opener with no closer, and a ``` that sits mid-line
+    (inline code), is left alone: the rest of the message is never swallowed. One pass over the lines; an opener that
+    finds no closer makes every later opener of the same character and at least that length a dead end too, so the
+    scan stays linear for practical input."""
+    lines = text.split("\n")
+    if "```" not in text and "~~~" not in text:
+        return text
+    out: list[str] = []
+    dead: dict[str, int] = {}  # fence character -> shortest opener length known to have no closer
+    i = 0
+    while i < len(lines):
+        opener = FENCE_OPEN_RE.match(lines[i])
+        if opener:
+            fence, info = opener.group(1), opener.group(2)
+            char, size = fence[0], len(fence)
+            if (char == "`" and "`" in info) or size >= dead.get(char, 1 << 30):
+                opener = None
+        if not opener:
+            out.append(lines[i])
+            i += 1
+            continue
+        end = None
+        for j in range(i + 1, len(lines)):
+            closer = FENCE_CLOSE_RE.match(lines[j])
+            if closer and closer.group(1)[0] == char and len(closer.group(1)) >= size:
+                end = j
+                break
+        if end is None:
+            dead[char] = min(size, dead.get(char, 1 << 30))
+            out.append(lines[i])
+            i += 1
+        else:
+            out.append("code")
+            i = end + 1
+    return "\n".join(out)
+
+
 def _strip_markdown(text: str) -> str:
-    text = FENCE_RE.sub(" code ", text)
+    text = _strip_fences(text)
     text = IMAGE_RE.sub(lambda m: m.group(1), text)
     text = LINK_RE.sub(lambda m: m.group(1), text)
     text = INLINE_CODE_RE.sub(lambda m: m.group(1), text)
     text = HEADING_RE.sub(lambda m: m.group(1) + HEADING_MARK, text)
     text = RULE_RE.sub("", text)
     text = QUOTE_RE.sub("", text)
-    text = BOLD_RE.sub(lambda m: m.group(2), text)
+    text = BOLD_RE.sub(_bold, text)
     text = STRIKE_RE.sub(lambda m: m.group(1), text)
     text = ITALIC_STAR_RE.sub(lambda m: m.group(1), text)
     return ITALIC_UNDER_RE.sub(lambda m: m.group(1), text)

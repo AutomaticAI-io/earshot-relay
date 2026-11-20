@@ -62,7 +62,7 @@ def receipt_is_final(receipt: dict) -> bool:
     playing, and a moment later the message reads `finished`.
     """
     status = receipt.get("status")
-    if status == "finished":
+    if status in ("finished", "write_failed"):  # write_failed: nothing was stored, so no phone will ever report
         return True
     return status in TERMINAL and all(d.get("status") in TERMINAL for d in receipt.get("devices", []))
 

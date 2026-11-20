@@ -144,7 +144,7 @@ def test_normalize_env_default_and_request_override(make_relay, auth, s3_admin, 
         b = post(c, auth, text="✅ raw please", normalize=False).json()
         assert b["normalized"] is False and objects(s3_admin, chan)[b["key"]] == "✅ raw please".encode()
         status = c.get("/v1/status", headers=auth).json()["hygiene"]
-        assert status == {"normalize": "basic", "max_words": 6, "coalescing_pending": 0}
+        assert status == {"normalize": "basic", "max_words": 6, "coalescing_pending": 0, "coalescing_failed": 0}
 
 
 def test_normalize_emoji_only_is_refused_and_flag_must_be_bool(client, auth):
@@ -401,7 +401,8 @@ def test_failed_writes_retry_then_drop(make_relay, auth, s3_admin, chan, monkeyp
         clock.advance(delay)
         run(relay.flush_due())
     assert relay.store.pending_count() == 0
-    assert c.get(f"/v1/messages/{doomed['id']}", headers=auth).status_code == 404
+    failed = c.get(f"/v1/messages/{doomed['id']}", headers=auth)  # not a silent 404: the receipt says it was lost
+    assert failed.status_code == 200 and failed.json()["status"] == "write_failed"
 
 
 # ---- cooldown ---------------------------------------------------------------------------------------------------------

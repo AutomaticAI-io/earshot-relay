@@ -11,7 +11,9 @@ Every compat route answers with:
 - `X-Earshot-Message-Id` and `Location: /v1/messages/{id}`, so the receipt is one GET away;
 - `X-Earshot-Ignored`: the request fields Earshot cannot honour (attachments, actions, click URLs, sounds,
   markdown...), named, never dropped silently;
-- `X-Earshot-Downgraded: alarm` when the sender asked for its top priority and compat alarm is off;
+- `X-Earshot-Downgraded: alarm` when the sender asked for its top priority and compat alarm is off or its rate limit
+  is used up (the message is stored as a normal item, never refused for it);
+- `X-Earshot-Promoted: alarm` when the top priority was stored on the alarm channel;
 - `X-Earshot-Status: coalescing|suppressed` when tag/coalesce/cooldown held or dropped the send (the protocol body
   still says 200, which then means accepted, not written), and `X-Earshot-Normalized` / `X-Earshot-Truncated`.
 
@@ -121,8 +123,11 @@ def header_text(value: str) -> str:
 
 
 def token_matches(relay: Relay, presented: str | None, *, pushover: bool = False) -> bool:
-    """Constant-time check against the relay token (and, on the Pushover route only, the Pushover-shaped token)."""
+    """Constant-time check against the relay token, the send-only compat token (any compat route: it opens nothing
+    else) and, on the Pushover route only, the Pushover-shaped token."""
     expected = [relay.settings.token]
+    if relay.settings.compat_token:
+        expected.append(relay.settings.compat_token)
     if pushover and relay.settings.compat_pushover_token:
         expected.append(relay.settings.compat_pushover_token)
     got = (presented or "").encode("utf-8", "replace")
@@ -318,11 +323,15 @@ async def deliver(relay: Relay, request: Request, incoming: Incoming, protocol: 
                        "Idempotency-Key")
     headers: dict[str, str] = {}
     channel = incoming.channel
-    if incoming.high:
-        if relay.settings.compat_alarm_allowed:
-            channel = "alarm"
-        elif channel != "alarm":
+    if incoming.high and channel != "alarm":
+        if not relay.settings.compat_alarm_allowed:
             headers["X-Earshot-Downgraded"] = "alarm"
+        elif relay.alarm_rate_limited():
+            # Over the alarm budget: a flapping monitor must not lose its alert. Store it as a normal item.
+            headers["X-Earshot-Downgraded"] = "alarm"
+        else:
+            channel = "alarm"
+            headers["X-Earshot-Promoted"] = "alarm"
     text = incoming.text if incoming.audio is None else ""
     if incoming.audio is None and not text:
         raise ApiError(400, "empty_text", "there is no title or message to speak", "message")
@@ -849,9 +858,12 @@ HEADERS_DOC = {
     "X-Earshot-Normalized": {"description": "'true' when the normalizer changed the text", "schema": {"type": "string"}},
     "X-Earshot-Truncated": {"description": "'true' when the text was cut at EARSHOT_RELAY_MAX_WORDS",
                             "schema": {"type": "string"}},
-    "X-Earshot-Downgraded": {"description": "'alarm' when the top priority was delivered as a normal item because "
-                                            "EARSHOT_RELAY_COMPAT_ALARM is off or alarm is not in "
-                                            "EARSHOT_RELAY_CHANNELS", "schema": {"type": "string"}},
+    "X-Earshot-Downgraded": {"description": "'alarm' when the top priority was stored as a normal item because "
+                                            "EARSHOT_RELAY_COMPAT_ALARM is off, alarm is not in "
+                                            "EARSHOT_RELAY_CHANNELS, or the alarm rate limit is used up",
+                             "schema": {"type": "string"}},
+    "X-Earshot-Promoted": {"description": "'alarm' when the top priority was stored on the alarm channel "
+                                          "(EARSHOT_RELAY_COMPAT_ALARM=1)", "schema": {"type": "string"}},
 }
 NTFY_JSON_SCHEMA = {"application/json": {"schema": {"type": "object", "required": ["topic"], "properties": {
     "topic": {"type": "string"}, "message": {"type": "string"}, "title": {"type": "string"},

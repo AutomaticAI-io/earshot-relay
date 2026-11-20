@@ -27,7 +27,8 @@ BUCKET_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{1,254}$")
 # (`earshot-relay token`) never contains them, so a value that does was never filled in.
 PLACEHOLDER_RE = re.compile(r"replace|changeme|change-me|your-token|placeholder", re.IGNORECASE)
 SECRET_VARS = ("EARSHOT_RELAY_TOKEN", "EARSHOT_RELAY_BEACON_TOKEN", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
-               "EARSHOT_RELAY_TTS_API_KEY", "ELEVENLABS_API_KEY", "EARSHOT_RELAY_COMPAT_PUSHOVER_TOKEN")
+               "EARSHOT_RELAY_TTS_API_KEY", "ELEVENLABS_API_KEY", "EARSHOT_RELAY_COMPAT_PUSHOVER_TOKEN",
+               "EARSHOT_RELAY_COMPAT_TOKEN")
 
 TTS_PROVIDERS = ("openai", "elevenlabs")
 ELEVENLABS_URL = "https://api.elevenlabs.io"
@@ -150,6 +151,7 @@ class Settings:
     compat_port: int | None = None
     compat_ntfy_topics: tuple[tuple[str, str], ...] = ()
     compat_pushover_token: str | None = field(default=None, repr=False)
+    compat_token: str | None = field(default=None, repr=False)  # send-only: valid on the compat routes, nowhere else
     normalize: str = "off"
     max_words: int | None = None
     watchdog_s: int | None = None
@@ -306,7 +308,8 @@ def load_settings(environ: dict[str, str] | None = None, *, check_ffmpeg: bool =
 
     hygiene = _hygiene_settings(e, take, problems)
     watchdog = _watchdog_settings(e, take, problems, beacon_token=beacon_token)
-    compat = _compat_settings(e, take, problems, channels=channels, port=port, beacon_port=beacon_port)
+    compat = _compat_settings(e, take, problems, channels=channels, port=port, beacon_port=beacon_port,
+                              main_token=token, beacon_token=beacon_token)
 
     if problems:
         raise ConfigError("\n".join(dict.fromkeys(problems)))
@@ -320,7 +323,8 @@ def load_settings(environ: dict[str, str] | None = None, *, check_ffmpeg: bool =
     )
 
 
-def _compat_settings(e, take, problems: list[str], *, channels: list[str], port, beacon_port) -> dict:
+def _compat_settings(e, take, problems: list[str], *, channels: list[str], port, beacon_port, main_token=None,
+                     beacon_token=None) -> dict:
     """EARSHOT_RELAY_COMPAT and friends. Everything is off unless EARSHOT_RELAY_COMPAT names a protocol."""
     raw = (take(env, "EARSHOT_RELAY_COMPAT", e) or "").strip().lower()
     names = [n for n in re.split(r"[\s,;]+", raw) if n] if raw not in ("", "off", "none", "0") else []
@@ -337,11 +341,13 @@ def _compat_settings(e, take, problems: list[str], *, channels: list[str], port,
     compat_port = take(_int, "EARSHOT_RELAY_COMPAT_PORT", raw_port, 0, 1, 65535) if raw_port else None
     raw_topics = take(env, "EARSHOT_RELAY_COMPAT_NTFY_TOPICS", e)
     pushover_token = take(env, "EARSHOT_RELAY_COMPAT_PUSHOVER_TOKEN", e)
+    send_token = take(env, "EARSHOT_RELAY_COMPAT_TOKEN", e)
 
     if not enabled:
         for var, value in (("EARSHOT_RELAY_COMPAT_PORT", raw_port), ("EARSHOT_RELAY_COMPAT_ALARM", alarm),
                            ("EARSHOT_RELAY_COMPAT_NTFY_TOPICS", raw_topics),
-                           ("EARSHOT_RELAY_COMPAT_PUSHOVER_TOKEN", pushover_token)):
+                           ("EARSHOT_RELAY_COMPAT_PUSHOVER_TOKEN", pushover_token),
+                           ("EARSHOT_RELAY_COMPAT_TOKEN", send_token)):
             if value:
                 problems.append(f"{var} is set but EARSHOT_RELAY_COMPAT names no protocol")
         return {}
@@ -388,8 +394,16 @@ def _compat_settings(e, take, problems: list[str], *, channels: list[str], port,
         elif pushover_token in PUSHOVER_DOC_EXAMPLES:
             problems.append("EARSHOT_RELAY_COMPAT_PUSHOVER_TOKEN is the example from Pushover's documentation; "
                             "generate one with: earshot-relay token --pushover")
+    if send_token:
+        if not API_TOKEN_RE.fullmatch(send_token):
+            problems.append(f"EARSHOT_RELAY_COMPAT_TOKEN must be at least {MIN_TOKEN_LEN} printable characters without "
+                            "spaces (generate one with: earshot-relay token)")
+        elif send_token in (main_token, beacon_token, pushover_token):
+            problems.append("EARSHOT_RELAY_COMPAT_TOKEN must differ from EARSHOT_RELAY_TOKEN, "
+                            "EARSHOT_RELAY_BEACON_TOKEN and EARSHOT_RELAY_COMPAT_PUSHOVER_TOKEN")
     return {"compat": tuple(enabled), "compat_alarm": alarm, "compat_port": compat_port,
-            "compat_ntfy_topics": tuple(topics.items()), "compat_pushover_token": pushover_token}
+            "compat_ntfy_topics": tuple(topics.items()), "compat_pushover_token": pushover_token,
+            "compat_token": send_token}
 
 
 def _tts_settings(e, take, problems: list[str], *, check_ffmpeg: bool) -> TtsSettings | None:

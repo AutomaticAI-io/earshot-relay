@@ -53,7 +53,7 @@ ERROR_DESCRIPTIONS = {
 }
 
 RECEIPT_STATUS_DOC = (
-    "stored | coalescing | detected | started | finished | skipped | failed | missed | unconfirmed. "
+    "stored | coalescing | write_failed | detected | started | finished | skipped | failed | missed | unconfirmed. "
     "A receipt records what the phone did (device playback); it is never proof that a person heard the message."
 )
 
@@ -142,7 +142,7 @@ class DeviceStateModel(BaseModel):
     app_version: str
 
 
-StatusLiteral = Literal["stored", "coalescing", "detected", "started", "finished", "skipped", "failed", "missed",
+StatusLiteral = Literal["stored", "coalescing", "write_failed", "detected", "started", "finished", "skipped", "failed", "missed",
                         "unconfirmed"]
 
 
@@ -225,6 +225,8 @@ class StatusCompat(BaseModel):
                                     "and alarm in EARSHOT_RELAY_CHANNELS); otherwise it plays as a normal item")
     ntfy_topics: dict[str, str] = Field(description="ntfy topic -> channel; any other topic is 404")
     pushover_token: bool = Field(description="EARSHOT_RELAY_COMPAT_PUSHOVER_TOKEN is set (the value is never shown)")
+    send_token: bool = Field(description="EARSHOT_RELAY_COMPAT_TOKEN is set: a send-only token for every compat route "
+                                         "(the value is never shown)")
 
 
 class StatusHygiene(BaseModel):
@@ -232,6 +234,8 @@ class StatusHygiene(BaseModel):
                                                            "request's normalize field overrides it")
     max_words: int | None = Field(description="EARSHOT_RELAY_MAX_WORDS (applies when text is normalized)")
     coalescing_pending: int = Field(description="Messages held right now for coalesce_s")
+    coalescing_failed: int = Field(description="Held messages whose write failed every retry, still inside "
+                                               "retention (their receipt reads write_failed)")
 
 
 class StatusWatchdog(BaseModel):
@@ -246,6 +250,9 @@ class StatusWatchdog(BaseModel):
                           "notified: the one notice for this incident was sent (or given up on).")
     incident_since: str | None = None
     incident_message: str | None = None
+    incident_kind: Literal["silent", "write_failed"] | None = Field(
+        None, description="silent: a stored message no device reported on. write_failed: a held message the relay "
+                          "accepted but could not write")
     last_notice_at: str | None = None
     last_notice_ok: bool | None = None
     last_error: str | None = Field(None, description="Why the last notice failed (never contains the URL)")

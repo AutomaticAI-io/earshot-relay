@@ -51,7 +51,8 @@ class TtsClient:
         """The request URL and headers for the configured provider. The API key goes only in a header."""
         key = self.settings.api_key
         if self.settings.provider == "elevenlabs":
-            voice_id = quote(voice or self.settings.voice or "", safe="")
+            # A dot is encoded too: a voice of "." or ".." must stay one path segment, not rewrite the request path.
+            voice_id = quote(voice or self.settings.voice or "", safe="").replace(".", "%2E")
             fmt = ELEVENLABS_FORMATS[self.settings.response_format]
             headers = {"Content-Type": "application/json", "Accept": "audio/*"}
             if key:

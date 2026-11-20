@@ -39,7 +39,7 @@ from .keys import (
     utf16_units,
 )
 from .storage import S3Writer, StorageError
-from .store import BeaconRow, MessageRow, PendingRow, Store, TooManyDevices, now_utc
+from .store import BeaconRow, FailedRow, MessageRow, PendingRow, Store, TooManyDevices, now_utc
 from .tts import TtsClient
 from .watchdog import Watchdog
 
@@ -58,7 +58,8 @@ ALARM_CAVEAT = (
 )
 # Rank of a device status: furthest phase first, then for terminal ties finished > skipped > failed > missed.
 TERMINAL_PREFERENCE = {"finished": 4, "skipped": 3, "failed": 2, "missed": 1}
-# A coalesced write that fails (the bucket or the TTS server is down) is retried after these delays, then dropped.
+# A coalesced write that fails (the bucket or the TTS server is down) is retried after these delays, then given up
+# on: the text is deleted and the id's receipt reads write_failed (never a silent 404).
 FLUSH_RETRY_S = (10, 30, 60)
 NO_BEACON_HINT = "no beacon has reached this relay; set the phone's beacon endpoint (see GET /v1/status)"
 
@@ -119,6 +120,10 @@ class RateLimiter:
                 raise ApiError(429, "rate_limited", f"too many {what} (limit {w.limit.describe()}); retry in {wait} s",
                                retry_after=wait)
         return [(w, w.take()) for w in windows]
+
+    def alarm_limited(self) -> bool:
+        """True when the next alarm send would be refused for the alarm budget alone (not the global limit)."""
+        return self.alarm_window is not None and self.alarm_window.retry_after() is not None
 
     @staticmethod
     def refund(reservation: list[tuple[SlidingWindow, float]]) -> None:
@@ -327,6 +332,9 @@ class Relay:
         self.watchdog = Watchdog(self, watchdog_transport) if settings.watchdog_s else None
 
     # sending ----------------------------------------------------------------------------------------------------
+
+    def alarm_rate_limited(self) -> bool:
+        return self.limiter.alarm_limited()
 
     def resolve_channel(self, channel: object) -> str:
         if channel is None:
@@ -538,7 +546,8 @@ class Relay:
                 code = exc.code if isinstance(exc, ApiError) else type(exc).__name__
                 attempts = row.attempts + 1
                 if attempts > len(FLUSH_RETRY_S):
-                    self.store.delete_pending(row.id)
+                    self.store.fail_pending(PendingRow(**{**row.__dict__, "attempts": attempts}),
+                                            iso_ms(self.clock()), str(code))
                     log.warning(json.dumps({"event": "coalesce_dropped", "message_id": row.id, "error": code}))
                 else:
                     due = self.clock() + timedelta(seconds=FLUSH_RETRY_S[attempts - 1])
@@ -608,6 +617,16 @@ class Relay:
                      f"{p.due_at} with the latest text sent under that tag."),
         }
 
+    def _failed_receipt(self, f: FailedRow) -> dict:
+        return {
+            "id": f.id, "type": "text", "speech": None, "channel": f.channel, "key": None,
+            "created_at": f.created_at, "status": "write_failed", "status_at": f.failed_at,
+            "object_last_modified": None, "hops": [], "devices": [],
+            "hint": (f"the relay accepted this message into a coalescing window under tag '{f.tag}' but could not write "
+                     f"it to the bucket after {f.attempts} attempts (last error: {f.error}). Nothing is stored and "
+                     "nothing will play. Check the bucket (and the TTS server) and send it again."),
+        }
+
     def _missing(self, message_id: str) -> ApiError:
         return ApiError(404, "not_found", "no message with that id" if message_id != "latest" else "no message sent yet")
 
@@ -616,7 +635,10 @@ class Relay:
         if msg is None:
             pending = self.store.get_pending_by_id(message_id) if message_id != "latest" else None
             if pending is None:
-                raise self._missing(message_id)
+                failed = self.store.get_failed(message_id) if message_id != "latest" else None
+                if failed is None:
+                    raise self._missing(message_id)
+                return self._failed_receipt(failed)
             return self._pending_receipt(pending)
         return self._receipt_for(msg)
 
@@ -626,7 +648,10 @@ class Relay:
         if msg is None:
             pending = self.store.get_pending_by_id(message_id) if message_id != "latest" else None
             if pending is None:
-                raise self._missing(message_id)
+                failed = self.store.get_failed(message_id) if message_id != "latest" else None
+                if failed is None:
+                    raise self._missing(message_id)
+                return self._failed_receipt(failed)
             pending_id = pending.id
         deadline = time.monotonic() + max(0.0, wait_s)
         while True:
@@ -637,7 +662,10 @@ class Relay:
             else:
                 pending = self.store.get_pending_by_id(pending_id)
                 if pending is None:
-                    raise ApiError(404, "not_found", "the coalesced message was dropped: its write failed repeatedly")
+                    failed = self.store.get_failed(pending_id)
+                    if failed is None:
+                        raise self._missing(pending_id)
+                    return self._failed_receipt(failed)
                 receipt = self._pending_receipt(pending)
             left = deadline - time.monotonic()
             if receipt_is_final(receipt) or left <= 0:
@@ -714,7 +742,8 @@ class Relay:
             },
             "compat": self.compat_status(),
             "hygiene": {"normalize": s.normalize, "max_words": s.max_words,
-                        "coalescing_pending": self.store.pending_count()},
+                        "coalescing_pending": self.store.pending_count(),
+                        "coalescing_failed": self.store.failed_count()},
             "watchdog": self.watchdog.status() if self.watchdog else {"enabled": False},
         }
 
@@ -729,6 +758,7 @@ class Relay:
             "alarm": s.compat_alarm_allowed,
             "ntfy_topics": s.ntfy_topics if "ntfy" in s.compat else {},
             "pushover_token": s.compat_pushover_token is not None,
+            "send_token": s.compat_token is not None,
         }
 
     async def doctor(self) -> dict:

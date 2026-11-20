@@ -283,9 +283,9 @@ paths:
       - core
       summary: 'The receipt: did the phone play it?'
       description: message_id may be 'latest'. wait=1..60 long-polls until the status is finished, skipped,
-        failed or missed, or the time is up. stored | coalescing | detected | started | finished | skipped
-        | failed | missed | unconfirmed. A receipt records what the phone did (device playback); it is
-        never proof that a person heard the message. A message with no beacon after EARSHOT_RELAY_RECEIPT_WAIT_MIN
+        failed or missed, or the time is up. stored | coalescing | write_failed | detected | started |
+        finished | skipped | failed | missed | unconfirmed. A receipt records what the phone did (device
+        playback); it is never proof that a person heard the message. A message with no beacon after EARSHOT_RELAY_RECEIPT_WAIT_MIN
         reads unconfirmed, which can still change if a beacon the phone parked while offline arrives.
       operationId: get_message_v1_messages__message_id__get
       parameters:
@@ -538,8 +538,12 @@ paths:
               schema:
                 type: string
             X-Earshot-Downgraded:
-              description: '''alarm'' when the top priority was delivered as a normal item because EARSHOT_RELAY_COMPAT_ALARM
-                is off or alarm is not in EARSHOT_RELAY_CHANNELS'
+              description: '''alarm'' when the top priority was stored as a normal item because EARSHOT_RELAY_COMPAT_ALARM
+                is off, alarm is not in EARSHOT_RELAY_CHANNELS, or the alarm rate limit is used up'
+              schema:
+                type: string
+            X-Earshot-Promoted:
+              description: '''alarm'' when the top priority was stored on the alarm channel (EARSHOT_RELAY_COMPAT_ALARM=1)'
               schema:
                 type: string
           content:
@@ -608,8 +612,12 @@ paths:
               schema:
                 type: string
             X-Earshot-Downgraded:
-              description: '''alarm'' when the top priority was delivered as a normal item because EARSHOT_RELAY_COMPAT_ALARM
-                is off or alarm is not in EARSHOT_RELAY_CHANNELS'
+              description: '''alarm'' when the top priority was stored as a normal item because EARSHOT_RELAY_COMPAT_ALARM
+                is off, alarm is not in EARSHOT_RELAY_CHANNELS, or the alarm rate limit is used up'
+              schema:
+                type: string
+            X-Earshot-Promoted:
+              description: '''alarm'' when the top priority was stored on the alarm channel (EARSHOT_RELAY_COMPAT_ALARM=1)'
               schema:
                 type: string
           content:
@@ -673,8 +681,12 @@ paths:
               schema:
                 type: string
             X-Earshot-Downgraded:
-              description: '''alarm'' when the top priority was delivered as a normal item because EARSHOT_RELAY_COMPAT_ALARM
-                is off or alarm is not in EARSHOT_RELAY_CHANNELS'
+              description: '''alarm'' when the top priority was stored as a normal item because EARSHOT_RELAY_COMPAT_ALARM
+                is off, alarm is not in EARSHOT_RELAY_CHANNELS, or the alarm rate limit is used up'
+              schema:
+                type: string
+            X-Earshot-Promoted:
+              description: '''alarm'' when the top priority was stored on the alarm channel (EARSHOT_RELAY_COMPAT_ALARM=1)'
               schema:
                 type: string
           content:
@@ -737,8 +749,12 @@ paths:
               schema:
                 type: string
             X-Earshot-Downgraded:
-              description: '''alarm'' when the top priority was delivered as a normal item because EARSHOT_RELAY_COMPAT_ALARM
-                is off or alarm is not in EARSHOT_RELAY_CHANNELS'
+              description: '''alarm'' when the top priority was stored as a normal item because EARSHOT_RELAY_COMPAT_ALARM
+                is off, alarm is not in EARSHOT_RELAY_CHANNELS, or the alarm rate limit is used up'
+              schema:
+                type: string
+            X-Earshot-Promoted:
+              description: '''alarm'' when the top priority was stored on the alarm channel (EARSHOT_RELAY_COMPAT_ALARM=1)'
               schema:
                 type: string
           content:
@@ -804,8 +820,12 @@ paths:
               schema:
                 type: string
             X-Earshot-Downgraded:
-              description: '''alarm'' when the top priority was delivered as a normal item because EARSHOT_RELAY_COMPAT_ALARM
-                is off or alarm is not in EARSHOT_RELAY_CHANNELS'
+              description: '''alarm'' when the top priority was stored as a normal item because EARSHOT_RELAY_COMPAT_ALARM
+                is off, alarm is not in EARSHOT_RELAY_CHANNELS, or the alarm rate limit is used up'
+              schema:
+                type: string
+            X-Earshot-Promoted:
+              description: '''alarm'' when the top priority was stored on the alarm channel (EARSHOT_RELAY_COMPAT_ALARM=1)'
               schema:
                 type: string
           content:
@@ -870,8 +890,12 @@ paths:
               schema:
                 type: string
             X-Earshot-Downgraded:
-              description: '''alarm'' when the top priority was delivered as a normal item because EARSHOT_RELAY_COMPAT_ALARM
-                is off or alarm is not in EARSHOT_RELAY_CHANNELS'
+              description: '''alarm'' when the top priority was stored as a normal item because EARSHOT_RELAY_COMPAT_ALARM
+                is off, alarm is not in EARSHOT_RELAY_CHANNELS, or the alarm rate limit is used up'
+              schema:
+                type: string
+            X-Earshot-Promoted:
+              description: '''alarm'' when the top priority was stored on the alarm channel (EARSHOT_RELAY_COMPAT_ALARM=1)'
               schema:
                 type: string
           content:
@@ -928,8 +952,12 @@ paths:
               schema:
                 type: string
             X-Earshot-Downgraded:
-              description: '''alarm'' when the top priority was delivered as a normal item because EARSHOT_RELAY_COMPAT_ALARM
-                is off or alarm is not in EARSHOT_RELAY_CHANNELS'
+              description: '''alarm'' when the top priority was stored as a normal item because EARSHOT_RELAY_COMPAT_ALARM
+                is off, alarm is not in EARSHOT_RELAY_CHANNELS, or the alarm rate limit is used up'
+              schema:
+                type: string
+            X-Earshot-Promoted:
+              description: '''alarm'' when the top priority was stored on the alarm channel (EARSHOT_RELAY_COMPAT_ALARM=1)'
               schema:
                 type: string
         '422':
@@ -1000,8 +1028,12 @@ paths:
               schema:
                 type: string
             X-Earshot-Downgraded:
-              description: '''alarm'' when the top priority was delivered as a normal item because EARSHOT_RELAY_COMPAT_ALARM
-                is off or alarm is not in EARSHOT_RELAY_CHANNELS'
+              description: '''alarm'' when the top priority was stored as a normal item because EARSHOT_RELAY_COMPAT_ALARM
+                is off, alarm is not in EARSHOT_RELAY_CHANNELS, or the alarm rate limit is used up'
+              schema:
+                type: string
+            X-Earshot-Promoted:
+              description: '''alarm'' when the top priority was stored on the alarm channel (EARSHOT_RELAY_COMPAT_ALARM=1)'
               schema:
                 type: string
         '422':
@@ -1077,8 +1109,12 @@ paths:
               schema:
                 type: string
             X-Earshot-Downgraded:
-              description: '''alarm'' when the top priority was delivered as a normal item because EARSHOT_RELAY_COMPAT_ALARM
-                is off or alarm is not in EARSHOT_RELAY_CHANNELS'
+              description: '''alarm'' when the top priority was stored as a normal item because EARSHOT_RELAY_COMPAT_ALARM
+                is off, alarm is not in EARSHOT_RELAY_CHANNELS, or the alarm rate limit is used up'
+              schema:
+                type: string
+            X-Earshot-Promoted:
+              description: '''alarm'' when the top priority was stored on the alarm channel (EARSHOT_RELAY_COMPAT_ALARM=1)'
               schema:
                 type: string
         '422':
@@ -1141,8 +1177,12 @@ paths:
               schema:
                 type: string
             X-Earshot-Downgraded:
-              description: '''alarm'' when the top priority was delivered as a normal item because EARSHOT_RELAY_COMPAT_ALARM
-                is off or alarm is not in EARSHOT_RELAY_CHANNELS'
+              description: '''alarm'' when the top priority was stored as a normal item because EARSHOT_RELAY_COMPAT_ALARM
+                is off, alarm is not in EARSHOT_RELAY_CHANNELS, or the alarm rate limit is used up'
+              schema:
+                type: string
+            X-Earshot-Promoted:
+              description: '''alarm'' when the top priority was stored on the alarm channel (EARSHOT_RELAY_COMPAT_ALARM=1)'
               schema:
                 type: string
         '422':
@@ -1205,8 +1245,12 @@ paths:
               schema:
                 type: string
             X-Earshot-Downgraded:
-              description: '''alarm'' when the top priority was delivered as a normal item because EARSHOT_RELAY_COMPAT_ALARM
-                is off or alarm is not in EARSHOT_RELAY_CHANNELS'
+              description: '''alarm'' when the top priority was stored as a normal item because EARSHOT_RELAY_COMPAT_ALARM
+                is off, alarm is not in EARSHOT_RELAY_CHANNELS, or the alarm rate limit is used up'
+              schema:
+                type: string
+            X-Earshot-Promoted:
+              description: '''alarm'' when the top priority was stored on the alarm channel (EARSHOT_RELAY_COMPAT_ALARM=1)'
               schema:
                 type: string
         '422':
@@ -1551,6 +1595,7 @@ components:
           enum:
           - stored
           - coalescing
+          - write_failed
           - detected
           - started
           - finished
@@ -1559,9 +1604,9 @@ components:
           - missed
           - unconfirmed
           title: Status
-          description: stored | coalescing | detected | started | finished | skipped | failed | missed
-            | unconfirmed. A receipt records what the phone did (device playback); it is never proof that
-            a person heard the message.
+          description: stored | coalescing | write_failed | detected | started | finished | skipped |
+            failed | missed | unconfirmed. A receipt records what the phone did (device playback); it
+            is never proof that a person heard the message.
         status_at:
           anyOf:
           - type: string
@@ -1639,6 +1684,7 @@ components:
           enum:
           - stored
           - coalescing
+          - write_failed
           - detected
           - started
           - finished
@@ -1647,9 +1693,9 @@ components:
           - missed
           - unconfirmed
           title: Status
-          description: stored | coalescing | detected | started | finished | skipped | failed | missed
-            | unconfirmed. A receipt records what the phone did (device playback); it is never proof that
-            a person heard the message.
+          description: stored | coalescing | write_failed | detected | started | finished | skipped |
+            failed | missed | unconfirmed. A receipt records what the phone did (device playback); it
+            is never proof that a person heard the message.
         status_at:
           anyOf:
           - type: string
@@ -1745,6 +1791,11 @@ components:
           type: boolean
           title: Pushover Token
           description: EARSHOT_RELAY_COMPAT_PUSHOVER_TOKEN is set (the value is never shown)
+        send_token:
+          type: boolean
+          title: Send Token
+          description: 'EARSHOT_RELAY_COMPAT_TOKEN is set: a send-only token for every compat route (the
+            value is never shown)'
       type: object
       required:
       - enabled
@@ -1753,6 +1804,7 @@ components:
       - alarm
       - ntfy_topics
       - pushover_token
+      - send_token
       title: StatusCompat
     StatusDevice:
       properties:
@@ -1802,11 +1854,17 @@ components:
           type: integer
           title: Coalescing Pending
           description: Messages held right now for coalesce_s
+        coalescing_failed:
+          type: integer
+          title: Coalescing Failed
+          description: Held messages whose write failed every retry, still inside retention (their receipt
+            reads write_failed)
       type: object
       required:
       - normalize
       - max_words
       - coalescing_pending
+      - coalescing_failed
       title: StatusHygiene
     StatusLimits:
       properties:
@@ -2009,6 +2067,16 @@ components:
           - type: string
           - type: 'null'
           title: Incident Message
+        incident_kind:
+          anyOf:
+          - type: string
+            enum:
+            - silent
+            - write_failed
+          - type: 'null'
+          title: Incident Kind
+          description: 'silent: a stored message no device reported on. write_failed: a held message the
+            relay accepted but could not write'
         last_notice_at:
           anyOf:
           - type: string

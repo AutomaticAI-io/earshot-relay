@@ -11,6 +11,8 @@ Rules, all of them tested with a controllable clock:
   arrives (any device, any message), which also starts the watch over from that moment.
 - EARSHOT_RELAY_WATCHDOG_COOLDOWN_S is a floor between notices, not a mute: an incident that opens inside the cooldown
   waits it out and is announced then, if it is still open.
+- A coalesced message the relay accepted but could never write (the bucket was down through every retry) is its own
+  kind of incident: one notice, then closed. It never clears on playback, because the message will not play.
 - A failing webhook is retried twice more (30 s, then 60 s later), then given up on for that incident.
 - The URL may hold a secret (an ntfy topic, a token). It is never logged and never shown, only its host is.
 """
@@ -28,7 +30,6 @@ import httpx
 
 from . import __version__
 from .beacons import iso_ms, parse_rfc3339
-from .store import MessageRow
 
 log = logging.getLogger("earshot_relay")
 
@@ -56,6 +57,8 @@ class WatchdogState:
     incident_since: str | None = None
     incident_message: str | None = None
     incident_channel: str | None = None
+    incident_kind: str = "silent"  # silent: a stored message nobody reported on. write_failed: a held message never written
+    incident_count: int = 1
     notified: bool = False
     attempts: int = 0
     next_attempt_at: str | None = None
@@ -91,16 +94,23 @@ class Watchdog:
         now = self.relay.clock()
         last_ok = store.last_playback_beacon_at()
         if last_ok and last_ok > st.last_clear_at:
-            if st.incident_since:
+            if st.incident_since and st.incident_kind == "silent":
                 log.info(json.dumps({"event": "watchdog_cleared", "notified": st.notified}))
+                self._close_incident()
             st.last_clear_at = last_ok
-            self._close_incident()
         if st.incident_since is None:
             late = store.undetected_message(st.last_clear_at, iso_ms(now - timedelta(seconds=self.settings.watchdog_s)))
             if late is not None:
-                self._open_incident(late, now)
+                self._open_incident(late.id, late.channel, now)
+            else:
+                lost, count = store.unnotified_failed()
+                if lost is not None:
+                    self._open_incident(lost.id, lost.channel, now, kind="write_failed", count=count)
         if st.incident_since and not st.notified:
             await self._notify(now)
+        if st.incident_since and st.notified and st.incident_kind == "write_failed":
+            store.mark_failed_notified()  # told once (or given up on); it never clears by playback
+            self._close_incident()
         if asdict(st) != before:
             store.set_meta(**{META_KEY: json.dumps(asdict(st))})
         if self._alive_at is None or (now - self._alive_at).total_seconds() >= ALIVE_EVERY_S:
@@ -110,13 +120,16 @@ class Watchdog:
     def _close_incident(self) -> None:
         st = self.state
         st.incident_since = st.incident_message = st.incident_channel = st.next_attempt_at = None
+        st.incident_kind, st.incident_count = "silent", 1
         st.notified, st.attempts = False, 0
 
-    def _open_incident(self, message: MessageRow, now: datetime) -> None:
+    def _open_incident(self, message_id: str, channel: str, now: datetime, *, kind: str = "silent",
+                       count: int = 1) -> None:
         st = self.state
-        st.incident_since, st.incident_message, st.incident_channel = iso_ms(now), message.id, message.channel
+        st.incident_since, st.incident_message, st.incident_channel = iso_ms(now), message_id, channel
+        st.incident_kind, st.incident_count = kind, count
         st.notified, st.attempts, st.next_attempt_at = False, 0, None
-        log.info(json.dumps({"event": "watchdog_incident", "message_id": message.id, "channel": message.channel}))
+        log.info(json.dumps({"event": "watchdog_incident", "kind": kind, "message_id": message_id, "channel": channel}))
 
     async def _notify(self, now: datetime) -> None:
         st = self.state
@@ -152,6 +165,11 @@ class Watchdog:
 
     def message_text(self) -> str:
         st, w = self.state, self.settings.watchdog_s
+        if st.incident_kind == "write_failed":
+            more = f" ({st.incident_count} messages in all; see GET /v1/status)" if st.incident_count > 1 else ""
+            return (f"Earshot: the relay accepted message {st.incident_message} (channel {st.incident_channel}) into a "
+                    f"coalescing window but could not write it to the bucket after several tries{more}. It was never "
+                    "stored and will not play. Check the bucket, then send it again.")
         return (f"Earshot: no device reported on message {st.incident_message} (channel {st.incident_channel}) within "
                 f"{w} s of it being stored. The phone may be off, offline or not listening, or the beacon URL is "
                 "wrong. The relay watches sends, so it said nothing before this one.")
@@ -162,12 +180,16 @@ class Watchdog:
         text = self.message_text()
         headers = {"User-Agent": f"earshot-relay-watchdog/{__version__}"}
         if self.format() == "text":
-            headers.update({"Content-Type": "text/plain; charset=utf-8", "Title": "Earshot: no playback report",
+            title = ("Earshot: message not written" if st.incident_kind == "write_failed"
+                     else "Earshot: no playback report")
+            headers.update({"Content-Type": "text/plain; charset=utf-8", "Title": title,
                             "Tags": "warning", "Priority": "4"})
             kwargs: dict = {"content": text.encode("utf-8")}
         else:
             kwargs = {"json": {
-                "event": "earshot.watchdog.no_playback_report", "text": text, "message_id": st.incident_message,
+                "event": ("earshot.watchdog.write_failed" if st.incident_kind == "write_failed"
+                          else "earshot.watchdog.no_playback_report"),
+                "text": text, "message_id": st.incident_message,
                 "channel": st.incident_channel, "incident_since": st.incident_since,
                 "after_s": self.settings.watchdog_s, "relay_version": __version__,
             }}
@@ -198,6 +220,7 @@ class Watchdog:
             "state": phase,
             "incident_since": st.incident_since,
             "incident_message": st.incident_message,
+            "incident_kind": st.incident_kind if st.incident_since else None,
             "last_notice_at": st.last_notice_at,
             "last_notice_ok": st.last_notice_ok,
             "last_error": st.last_error,
