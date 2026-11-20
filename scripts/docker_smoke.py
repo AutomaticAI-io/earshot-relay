@@ -91,7 +91,7 @@ def main() -> int:
         sh("docker", "build", "-q", "-t", args.image, str(ROOT))
         ok("image built")
 
-    moto_port, relay_port = free_port(), free_port()
+    moto_port, relay_port, compat_port = free_port(), free_port(), free_port()
     moto = ThreadedMotoServer(ip_address="127.0.0.1", port=moto_port, verbose=False)
     moto.start()
     endpoint = f"http://127.0.0.1:{moto_port}"
@@ -110,6 +110,7 @@ def main() -> int:
         f"EARSHOT_RELAY_TOKEN={token}", f"EARSHOT_RELAY_BEACON_TOKEN={beacon_token}",
         "EARSHOT_RELAY_ALLOW_HTTP_S3=1", "EARSHOT_RELAY_HOST=127.0.0.1", f"EARSHOT_RELAY_PORT={relay_port}",
         "EARSHOT_RELAY_PUBLIC_URL=https://relay.example.com",
+        "EARSHOT_RELAY_COMPAT=ntfy,gotify", f"EARSHOT_RELAY_COMPAT_PORT={compat_port}",
     ]) + "\n")
     os.chmod(env_file, 0o600)
     base = f"http://127.0.0.1:{relay_port}"
@@ -141,6 +142,19 @@ def main() -> int:
         require(status == 200 and receipt["status"] == "finished", "receipt reads finished", receipt)
         require([h["phase"] for h in receipt["hops"]] == ["detected", "started", "finished"]
                 and receipt["hops"][0]["since_upload_ms"] == 2838, "hops and since_upload_ms match the golden run")
+
+        # producer compat: an ntfy publish at the compat root and a Gotify message under the main-port prefix
+        sent = sh("curl", "-fsS", "-u", f"x:{token}", "-H", "Title: Smoke", "-d", "compat ntfy ok",
+                  f"http://127.0.0.1:{compat_port}/phone", "-w", "\n%{http_code}")
+        body, code = sent.stdout.rsplit("\n", 1)
+        cmsg = json.loads(body)
+        require(code == "200" and cmsg["event"] == "message", "ntfy publish at the compat root returns 200", sent.stdout)
+        status, receipt = http("GET", f"{base}/v1/messages/{cmsg['id']}", token)
+        require(status == 200 and receipt["status"] == "stored", "the ntfy send has a stored receipt", receipt)
+        require(admin.get_object(Bucket=BUCKET, Key=receipt["key"])["Body"].read() == b"Smoke. compat ntfy ok",
+                "ntfy send stored as 'Title. Message.'")
+        status, gmsg = http("POST", f"{base}/compat/gotify/message?token={token}", body={"title": "G", "message": "ok"})
+        require(status == 200 and isinstance(gmsg["id"], int), "Gotify message under /compat/gotify returns 200", gmsg)
 
         doctor = sh("docker", "exec", name, "earshot-relay", "doctor", check=False)
         require(doctor.returncode == 0, "earshot-relay doctor exits 0 inside the container", doctor.stdout + doctor.stderr)

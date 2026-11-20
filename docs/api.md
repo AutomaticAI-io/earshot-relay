@@ -56,6 +56,14 @@ Checks configuration and writes one inert `<default-channel>/relay-doctor-<times
 
 For the phone, not for you. Unauthenticated apart from the token in the path (404 on a wrong token). Body at most 4096 bytes. `429` over `EARSHOT_RELAY_BEACON_RATE_LIMIT`. See [receipts](receipts.md).
 
+## Compat routes
+
+With `EARSHOT_RELAY_COMPAT` set, the relay also answers ntfy, Gotify, Pushover and Join request shapes under
+`/compat/<protocol>` (and at the root of `EARSHOT_RELAY_COMPAT_PORT`). Responses use each protocol's own body and
+error shape, plus `X-Earshot-Message-Id` and `Location: /v1/messages/{id}`. A success means stored, not played.
+See [compat.md](compat.md). `GET /v1/status` has a `compat` object: `enabled`, `paths`, `port`, `alarm`,
+`ntfy_topics` and `pushover_token` (a boolean, never the value).
+
 ## GET /healthz
 
 `{"ok": true}`, no auth. Used by the container healthcheck.

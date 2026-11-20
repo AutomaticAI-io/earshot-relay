@@ -68,6 +68,7 @@ Retrying a send? Pass an `Idempotency-Key` header (CLI: `--idempotency-key`): th
 | `GET /v1/messages`, `GET /v1/status` | Recent messages; relay, bucket and device state. |
 | `POST /v1/doctor` | Checks configuration and the bucket write. |
 | `POST /v1/beacons/{token}` | Where the phone reports what it did. This is what makes receipts possible. |
+| `/compat/...` | Optional ntfy, Gotify, Pushover and Join request shapes, so existing producers switch by changing a URL ([docs/compat.md](docs/compat.md)). Off by default. |
 | `/mcp` | An MCP server over streamable HTTP, same bearer token. A stdio mode is `earshot-relay mcp`. |
 
 The full contract is [openapi.yaml](openapi.yaml); a readable version is [docs/api.md](docs/api.md).
@@ -90,6 +91,24 @@ The first form talks to a running relay over HTTP; the second runs a local stdio
 
 For agent hooks (speak when Claude Code needs you, or when it finishes), see [examples/](examples) and read the warning there: **hook examples send a slice of agent text to your bucket, so use a private bucket.**
 
+### Switch a producer over by changing a URL
+
+Tools that already push to ntfy, Gotify, Pushover or Join can push to the relay instead. Turn it on with
+`EARSHOT_RELAY_COMPAT=ntfy,gotify,pushover,join` (it is off by default), then:
+
+```sh
+curl -H "Authorization: Bearer $EARSHOT_API_TOKEN" -H "Title: Backup" -d "Nightly backup finished" \
+  http://127.0.0.1:8080/compat/ntfy/phone          # an ntfy publish, stored like a native send
+apprise -b "Server rebooted" "gotify://127.0.0.1:8080/compat/gotify/$EARSHOT_API_TOKEN"
+```
+
+These sends share the native rate limits, `Idempotency-Key` handling, bucket path and receipts, and a success reply
+means stored, not played. A producer's top priority (ntfy `5`, Gotify `8` and up, Pushover `2`) is delivered normally
+with `X-Earshot-Downgraded: alarm` unless you also set `EARSHOT_RELAY_COMPAT_ALARM=1` and list `alarm`. Unsupported
+fields are ignored and named in `X-Earshot-Ignored`. Tested with real clients (curl, Apprise, the ntfy and gotify
+CLIs, Uptime Kuma, a Go Pushover library); Pushover and Join clients that hard-code the vendor URL cannot be
+redirected. Everything, including what was and was not verified: [docs/compat.md](docs/compat.md).
+
 ### Receipts and the beacon URL
 
 The phone can report `detected`, `started` and `finished` to an HTTPS endpoint you choose. Set `EARSHOT_RELAY_BEACON_TOKEN` and `EARSHOT_RELAY_PUBLIC_URL`, run `earshot-relay status`, and paste the printed `https://<host>/v1/beacons/<token>` into the app's **Optional HTTPS beacon endpoint**. The phone must be able to reach that URL, which usually means a tunnel: [docs/tunnels.md](docs/tunnels.md) covers Tailscale serve and Cloudflare Tunnel.
@@ -107,6 +126,7 @@ A receipt records what the phone did (device playback). It is **not** proof that
 - The beacon route has its own rate limit (`EARSHOT_RELAY_BEACON_RATE_LIMIT`, 600 per minute) and accepts at most 16 devices per message, so a leaked beacon URL can forge receipts but cannot flood the relay.
 - Messages sit in your bucket as plain objects. Anyone who can read the bucket can read them.
 - Rate limits (60 per minute overall, 6 per hour for the alarm channel) are in memory and per process.
+- Compat routes ([docs/compat.md](docs/compat.md)) are off by default and take the same relay token. They never reach `alarm` unless you set `EARSHOT_RELAY_COMPAT_ALARM=1`. If you open `EARSHOT_RELAY_COMPAT_PORT`, publish it only where the producers are.
 
 ## What it is not
 
@@ -122,12 +142,13 @@ A receipt records what the phone did (device playback). It is **not** proof that
 uv sync
 uv run pytest -q                              # moto-backed; no network or real bucket needed
 uv run python scripts/gen_openapi.py          # regenerate openapi.yaml after API changes
+uv run python scripts/compat_clients.py      # drive real clients (curl, Apprise, ntfy CLI, ...) at an in-process relay; see docs/compat.md
 uv run python scripts/docker_smoke.py         # build the image and test it end to end against moto (Docker)
 EARSHOT_COMPAT_PROVIDERS=1 uv run pytest -q tests/test_providers.py   # SeaweedFS and Garage in Docker
 ```
 
 ## Docs
 
-[API](docs/api.md) · [Receipts](docs/receipts.md) · [Server TTS](docs/tts.md) · [Tunnels](docs/tunnels.md) · [Permissions](docs/permissions.md) · [MCP](docs/mcp.md) · [Configuration](docs/configuration.md) · [Examples](examples)
+[API](docs/api.md) · [Producer compat](docs/compat.md) · [Receipts](docs/receipts.md) · [Server TTS](docs/tts.md) · [Tunnels](docs/tunnels.md) · [Permissions](docs/permissions.md) · [MCP](docs/mcp.md) · [Configuration](docs/configuration.md) · [Examples](examples)
 
 License: MIT, copyright AutomaticAI.

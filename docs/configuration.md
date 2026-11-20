@@ -25,6 +25,18 @@ All settings are environment variables. Every secret also accepts a `_FILE` vari
 | `EARSHOT_RELAY_MAX_AUDIO_BYTES` | `26214400` | Largest accepted audio upload (25 MiB). |
 | `EARSHOT_RELAY_RETENTION_DAYS` | `7` | Index rows older than this are pruned daily. Bucket objects are never touched. |
 
+## Producer compat (optional, off by default)
+
+Details, URLs and what was tested: [compat.md](compat.md).
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `EARSHOT_RELAY_COMPAT` | off | `ntfy`, `gotify`, `pushover`, `join` (comma-separated) or `all`. An unknown name is a startup error, and so is any other `EARSHOT_RELAY_COMPAT_*` variable set without this one. |
+| `EARSHOT_RELAY_COMPAT_PORT` | unset | A listener where ntfy and Gotify live at the server root, for clients that cannot use a path prefix (Apprise `ntfy://`). Differs from the main and beacon ports. |
+| `EARSHOT_RELAY_COMPAT_NTFY_TOPICS` | every non-alarm channel, by name | `topic` or `topic=channel`, comma-separated. Anything else is `404`. |
+| `EARSHOT_RELAY_COMPAT_ALARM` | off | A protocol's top priority reaches `alarm` only with this on and `alarm` in `EARSHOT_RELAY_CHANNELS`; otherwise it is delivered normally with `X-Earshot-Downgraded: alarm`. |
+| `EARSHOT_RELAY_COMPAT_PUSHOVER_TOKEN` | unset | Exactly 30 letters and digits (`earshot-relay token --pushover`), accepted only on the Pushover route, so Pushover-shaped libraries pass their own token check. A secret (also `..._FILE`). |
+
 ## Receipts
 
 | Variable | Default | Notes |

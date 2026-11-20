@@ -28,8 +28,9 @@ ENV EARSHOT_RELAY_HOST=0.0.0.0 \
     PYTHONUNBUFFERED=1
 USER 10001
 VOLUME /data
-# 8081 is used only with EARSHOT_RELAY_BEACON_PORT=8081 (publish it too; see docs/tunnels.md).
-EXPOSE 8080 8081
+# 8081 is used only with EARSHOT_RELAY_BEACON_PORT=8081 (publish it too; see docs/tunnels.md); 8082 only with
+# EARSHOT_RELAY_COMPAT_PORT=8082 (see docs/compat.md).
+EXPOSE 8080 8081 8082
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD python -c "import os,sys,urllib.request as u; sys.exit(0 if u.urlopen('http://127.0.0.1:%s/healthz' % os.environ.get('EARSHOT_RELAY_PORT','8080'), timeout=4).status == 200 else 1)"
 ENTRYPOINT ["earshot-relay"]

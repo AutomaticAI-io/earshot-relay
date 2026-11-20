@@ -11,6 +11,8 @@ services:
       - "127.0.0.1:8080:8080"
       # Uncomment with EARSHOT_RELAY_BEACON_PORT=8081 (beacon-only listener for the phone; see docs/tunnels.md).
       # - "127.0.0.1:8081:8081"
+      # Uncomment with EARSHOT_RELAY_COMPAT_PORT=8082 (root listener for ntfy and Gotify producers; see docs/compat.md).
+      # - "127.0.0.1:8082:8082"
     volumes:
       - relay-data:/data
 

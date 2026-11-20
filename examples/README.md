@@ -8,6 +8,8 @@
 | [`github-actions.yml`](github-actions.yml) | **Untested.** No workflow was run. |
 | [`n8n.md`](n8n.md) | **Untested.** |
 | [`home-assistant.md`](home-assistant.md) | **Untested.** |
+| [`apprise.md`](apprise.md) (Apprise `ntfy://`, `ntfys://`, `gotify://`) | **Tested** with Apprise 2.3.0 against a live relay (`scripts/compat_clients.py`); the requests are replayed in `tests/test_compat.py`. |
+| [`uptime-kuma.md`](uptime-kuma.md) (ntfy and Gotify providers) | **Tested** with Uptime Kuma 1.23.16 (its notification Test call). Version 2 was **not** run. |
 
 The agent examples send a slice of agent text to your bucket. Use a private bucket (see
 [docs/permissions.md](../docs/permissions.md)).
