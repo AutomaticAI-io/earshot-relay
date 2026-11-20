@@ -10,6 +10,9 @@ RUN mkdir -p /dist \
  && uv build --wheel --out-dir /dist
 
 FROM python:3.12-slim
+LABEL org.opencontainers.image.source="https://github.com/AutomaticAI-io/earshot-relay" \
+      org.opencontainers.image.description="Send speech to your phone through your own S3 bucket and the Earshot Android app: HTTP API, MCP server and CLI." \
+      org.opencontainers.image.licenses="MIT"
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ffmpeg \
  && rm -rf /var/lib/apt/lists/*

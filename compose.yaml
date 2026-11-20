@@ -1,8 +1,8 @@
 services:
   earshot-relay:
-    # Build locally until an image is published: `docker compose up -d --build`
+    # Pulls the published image. `docker compose up -d --build` builds this checkout instead.
+    image: ghcr.io/automaticai-io/earshot-relay:latest
     build: .
-    image: earshot-relay:local
     init: true
     restart: unless-stopped
     env_file: .env

@@ -1,11 +1,13 @@
 name: ci
 on:
   push:
+    branches: [main]
   pull_request:
+permissions:
+  contents: read
 jobs:
   test:
-    # Private repo: self-hosted runner only (no paid GitHub-hosted minutes).
-    runs-on: [self-hosted, Linux, delonet]
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
@@ -21,7 +23,7 @@ jobs:
   docker-smoke:
     # Spec 15.9: build the image, run it against moto, curl send, replayed beacons, receipt finished.
     needs: test
-    runs-on: [self-hosted, Linux, delonet]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
@@ -32,7 +34,7 @@ jobs:
   providers:
     # Spec 15.4: PutObject against SeaweedFS and Garage containers with a write-only key.
     needs: test
-    runs-on: [self-hosted, Linux, delonet]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5

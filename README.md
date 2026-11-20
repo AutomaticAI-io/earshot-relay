@@ -12,17 +12,19 @@ Put thing in bucket. Hear it on phone. The relay is the "put thing in bucket" pa
 
 ## Run it
 
-No image is published yet, so build it once from this checkout:
+The image is `ghcr.io/automaticai-io/earshot-relay` (linux/amd64 and linux/arm64, so a Raspberry Pi works):
 
 ```sh
-docker build -t earshot-relay:local .              # or: docker compose up -d --build
-cp .env.example .env                               # fill in the bucket, the writer key and a token
-docker run --rm earshot-relay:local token          # prints a random token for EARSHOT_RELAY_TOKEN
+curl -fsSLO https://raw.githubusercontent.com/AutomaticAI-io/earshot-relay/main/.env.example && mv .env.example .env
+docker run --rm ghcr.io/automaticai-io/earshot-relay token    # prints a random token for EARSHOT_RELAY_TOKEN
+# fill in .env: the bucket, the writer key and that token
 docker run -d --name earshot-relay --restart unless-stopped \
   --env-file .env -p 127.0.0.1:8080:8080 -v earshot-relay-data:/data \
-  earshot-relay:local
+  ghcr.io/automaticai-io/earshot-relay
 docker exec earshot-relay earshot-relay doctor     # checks the relay and writes one inert test object
 ```
+
+`:latest` is the newest release, `:1` follows 1.x, and `:edge` is the tip of `main`. With compose, `docker compose up -d` uses the same image; `docker compose up -d --build` builds this checkout instead.
 
 The relay refuses to start while `.env` still holds the example placeholders or an empty token. Without Docker: `uv sync`, then `uv run earshot-relay serve` with the same environment variables (put them in your shell, or `set -a; . ./.env; set +a`).
 
