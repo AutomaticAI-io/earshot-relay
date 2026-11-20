@@ -64,7 +64,7 @@ def base_env(endpoint: str, data_dir: str, **extra: str) -> dict[str, str]:
 def make_relay(moto_endpoint, tmp_path):
     made: list[Store] = []
 
-    def factory(*, tts_transport=None, clock=None, monotonic=None, **extra: str) -> Relay:
+    def factory(*, tts_transport=None, watchdog_transport=None, clock=None, monotonic=None, **extra: str) -> Relay:
         settings = load_settings(base_env(moto_endpoint, str(tmp_path / f"data{len(made)}"), **extra), check_ffmpeg=False)
         store = Store(settings.db_path)
         made.append(store)
@@ -74,6 +74,8 @@ def make_relay(moto_endpoint, tmp_path):
             kwargs["clock"] = clock
         if monotonic is not None:
             kwargs["monotonic"] = monotonic
+        if watchdog_transport is not None:
+            kwargs["watchdog_transport"] = watchdog_transport
         return Relay(settings, store, S3Writer(settings), tts, **kwargs)
 
     yield factory

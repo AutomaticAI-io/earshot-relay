@@ -286,8 +286,13 @@ class Store:
             self._db.execute("UPDATE pending SET attempts=?, due_at=? WHERE id=?", (attempts, due_at, message_id))
 
     def delete_pending(self, message_id: str) -> None:
+        """Delete a held message and checkpoint, so no copy of its text lingers in the write-ahead log."""
         with self._lock:
             self._db.execute("DELETE FROM pending WHERE id=?", (message_id,))
+            try:
+                self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+            except sqlite3.Error:
+                pass  # busy (another reader): the next checkpoint gets it
 
     def due_pending(self, now: str, limit: int = 50) -> list[PendingRow]:
         with self._lock:
