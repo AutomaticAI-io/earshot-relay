@@ -1,14 +1,12 @@
 """The delivery watchdog: one out-of-band notice when a send gets no playback report from the phone.
 
-It watches SENDS, not phones. When a message has been stored for EARSHOT_RELAY_WATCHDOG_S seconds and no device has
-reported anything about it (no `detected`, `started`, `finished`, `failed` or `missed` beacon), that is an incident:
-the relay POSTs one notice to EARSHOT_RELAY_WATCHDOG_URL, outside the phone path, so a dead phone does not have to tell
-you it is dead. With no traffic it stays silent, and an idle dead phone is invisible to it: the app sends no heartbeat.
+It watches sends, not idle phones. A stored key without its own `detected` beacon after
+EARSHOT_RELAY_WATCHDOG_S seconds opens an incident. Unrelated beacons and other phases cannot clear it.
+The relay POSTs one notice to EARSHOT_RELAY_WATCHDOG_URL outside the phone path. With no traffic it stays silent.
 
-Rules, all of them tested with a controllable clock:
+Rules, tested with a controllable clock:
 
-- One notice per incident. An incident opens at the first undetected message and clears when any playback beacon
-  arrives (any device, any message), which also starts the watch over from that moment.
+- One notice per incident; it clears once every overdue send has its own detected receipt.
 - EARSHOT_RELAY_WATCHDOG_COOLDOWN_S is a floor between notices, not a mute: an incident that opens inside the cooldown
   waits it out and is announced then, if it is still open.
 - A failing webhook is retried twice more (30 s, then 60 s later), then given up on for that incident.
@@ -23,7 +21,6 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from urllib.parse import urlsplit
 
-import anyio
 import httpx
 
 from . import __version__
@@ -89,16 +86,14 @@ class Watchdog:
         st, store = self.state, self.relay.store
         before = asdict(st)
         now = self.relay.clock()
-        last_ok = store.last_playback_beacon_at()
-        if last_ok and last_ok > st.last_clear_at:
-            if st.incident_since:
-                log.info(json.dumps({"event": "watchdog_cleared", "notified": st.notified}))
-            st.last_clear_at = last_ok
+        late = store.undetected_message(st.enabled_since, iso_ms(now - timedelta(seconds=self.settings.watchdog_s)))
+        if st.incident_since and late is None:
+            log.info(json.dumps({"event": "watchdog_cleared", "notified": st.notified}))
             self._close_incident()
-        if st.incident_since is None:
-            late = store.undetected_message(st.last_clear_at, iso_ms(now - timedelta(seconds=self.settings.watchdog_s)))
-            if late is not None:
-                self._open_incident(late, now)
+        if st.incident_since is None and late is not None:
+            self._open_incident(late, now)
+        elif st.incident_since and late is not None and st.incident_message != late.id:
+            self._open_incident(late, now)
         if st.incident_since and not st.notified:
             await self._notify(now)
         if asdict(st) != before:
@@ -205,14 +200,30 @@ class Watchdog:
             "note": NOTE,
         }
 
-    @property
-    def interval_s(self) -> float:
-        return min(5.0, max(1.0, self.settings.watchdog_s / 10))
+    def next_check_at(self) -> datetime | None:
+        st, now = self.state, self.relay.clock()
+        if st.incident_since:
+            if st.notified:
+                return None  # only new sends or matching receipts can change this incident
+            due = now
+            if st.next_attempt_at:
+                due = max(due, parse_rfc3339(st.next_attempt_at) or now)
+            if st.last_notice_at:
+                due = max(due, (parse_rfc3339(st.last_notice_at) or now)
+                          + timedelta(seconds=self.settings.watchdog_cooldown_s))
+            return due
+        first = self.relay.store.undetected_message(st.enabled_since, iso_ms(now))
+        if first is None:
+            return None
+        return (parse_rfc3339(first.created_at) or now) + timedelta(seconds=self.settings.watchdog_s)
 
     async def run(self) -> None:
+        """Wake on a send/receipt or the next outstanding deadline; no idle timer."""
         while True:
             try:
                 await self.check()
-            except Exception as exc:  # noqa: BLE001 - the watchdog must never take the relay down
+                due = self.next_check_at()
+                await self.relay.signal.wait(max(0.01, (due - self.relay.clock()).total_seconds()) if due else None)
+            except Exception as exc:  # noqa: BLE001 - watchdog failures cannot take the API down
                 log.warning(json.dumps({"event": "watchdog_failed", "error": type(exc).__name__}))
-            await anyio.sleep(self.interval_s)
+                await self.relay.signal.wait(30)

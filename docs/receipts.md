@@ -23,7 +23,7 @@ The token is part of the URL, so it lives in the phone's settings and in your pr
 
 | Status | Meaning |
 | --- | --- |
-| `coalescing` | Not stored yet: the text is held for `coalesce_s` and will be written once, with the latest text under its tag ([hygiene](hygiene.md)). The receipt has `write_at`. Once written, the same id reads as a normal receipt. |
+| `coalescing` | Not stored yet: the text is held for `coalesce_window_s` and will be written once, with the latest text under its tag ([hygiene](hygiene.md)). The receipt has `write_at`. Once written, the same id reads as a normal receipt. |
 | `stored` | The object is in the bucket. Nothing heard from the phone yet. |
 | `detected` | The phone saw the object. |
 | `started` | Playback began. |

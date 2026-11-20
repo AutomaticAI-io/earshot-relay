@@ -15,8 +15,8 @@ Every compat route answers with:
 - `X-Earshot-Status: coalescing|suppressed` when tag/coalesce/cooldown held or dropped the send (the protocol body
   still says 200, which then means accepted, not written), and `X-Earshot-Normalized` / `X-Earshot-Truncated`.
 
-None of these protocols can carry Earshot's hygiene fields, so they ride as `X-Earshot-Tag`, `X-Earshot-Coalesce-S`,
-`X-Earshot-Cooldown-S` and `X-Earshot-Normalize` headers, or the query parameters `earshot_tag`, `earshot_coalesce_s`,
+None of these protocols can carry Earshot's hygiene fields, so they ride as `X-Earshot-Tag`, `X-Earshot-Coalesce-Window-S`,
+`X-Earshot-Cooldown-S` and `X-Earshot-Normalize` headers, or the query parameters `earshot_tag`, `earshot_coalesce_window_s`,
 `earshot_cooldown_s` and `earshot_normalize` (for producers that can set a URL but not a header). The server-wide
 EARSHOT_RELAY_NORMALIZE default applies to every compat send without any of them.
 
@@ -45,7 +45,7 @@ from starlette.datastructures import UploadFile
 
 from .beacons import parse_rfc3339
 from .config import NTFY_TOPIC_RE
-from .keys import AUDIO_EXTENSIONS, MAX_TEXT_UTF8_BYTES, MEDIA_TYPE_EXTENSIONS, ApiError
+from .keys import MAX_TEXT_UTF8_BYTES, ApiError
 from .service import Relay
 
 log = logging.getLogger("earshot_relay")
@@ -70,7 +70,6 @@ class Incoming:
     high: bool = False  # the protocol's top priority (ntfy 5, Gotify >= 8, Pushover 2)
     channel: str | None = None  # None: the relay's default channel
     ignored: list[str] = field(default_factory=list)
-    audio: tuple[IO[bytes], int, str] | None = None  # (file, size, extension) for an audio attachment
 
     def ignore(self, *names: str) -> None:
         for n in names:
@@ -283,7 +282,7 @@ def _int_field(data: dict, name: str) -> int | None:
 
 # ---- delivery (shared by every protocol) --------------------------------------------------------------------------
 
-HYGIENE_NAMES = ("tag", "coalesce_s", "cooldown_s", "normalize")
+HYGIENE_NAMES = ("tag", "coalesce_window_s", "cooldown_s", "normalize")
 FLAG_WORDS = {"1": True, "true": True, "yes": True, "on": True, "0": False, "false": False, "no": False, "off": False}
 
 
@@ -323,23 +322,18 @@ async def deliver(relay: Relay, request: Request, incoming: Incoming, protocol: 
             channel = "alarm"
         elif channel != "alarm":
             headers["X-Earshot-Downgraded"] = "alarm"
-    text = incoming.text if incoming.audio is None else ""
-    if incoming.audio is None and not text:
-        raise ApiError(400, "empty_text", "there is no title or message to speak", "message")
+    text = incoming.text
+    if not text:
+        raise ApiError(400, "empty_text", "there is no title or message to speak; compat attachments are unsupported",
+                       "message")
     hygiene = hygiene_params(request)
-    if incoming.audio is not None and hygiene:
-        incoming.ignore(*(f"earshot_{n}" for n in hygiene))  # audio is never normalized, tagged or coalesced
-        hygiene = {}
     async with relay.idempotency(idem_header) as idem:
         if idem.replay is not None:
             result = idem.replay
             headers["Idempotent-Replayed"] = "true"
-        elif incoming.audio is not None:
-            fileobj, size, ext = incoming.audio
-            result = await relay.send_audio(fileobj=fileobj, size=size, ext=ext, channel=channel, idem_key=idem.digest)
         else:
             try:
-                result = await relay.send_text(text=text, channel=channel, idem_key=idem.digest, **hygiene)
+                result = await relay.send_text(text=text, channel=channel, idem_key=idem.digest, compat=True, **hygiene)
             except ApiError as exc:
                 if exc.field == "text":
                     exc.field = "message"
@@ -510,14 +504,6 @@ def ntfy_success(result: dict, topic: str, title: str, message: str, priority: i
     return body
 
 
-def _audio_ext(filename: str, media: str) -> str | None:
-    name = filename.rsplit("/", 1)[-1]
-    if "." in name.lstrip("."):
-        ext = name.rsplit(".", 1)[1].lower()
-        return ext if ext in AUDIO_EXTENSIONS else None
-    return MEDIA_TYPE_EXTENSIONS.get(media) if not filename else None
-
-
 def _ntfy_routes(app: FastAPI, relay: Relay, prefix: str, include_in_schema: bool) -> None:
     topics = relay.settings.ntfy_topics
 
@@ -582,28 +568,20 @@ def _ntfy_routes(app: FastAPI, relay: Relay, prefix: str, include_in_schema: boo
             cap = max(relay.settings.max_audio_bytes, MAX_TEXT_UTF8_BYTES)
             body_file, size = await spool_capped(request, cap)
             media = _media(request)
-            ext = _audio_ext(filename, media) if size else None
             message = param_message
-            if ext is not None:
-                incoming.audio = (body_file, size, ext)
-                for name, value in (("title", incoming.title), ("message", param_message)):
-                    if value:
-                        incoming.ignore(name)
-                message = f"You received a file: {filename or 'audio.' + ext}"
-            elif size and (filename or param_message):
-                incoming.ignore("attachment")  # ntfy reads the body as an attachment here; Earshot cannot speak it
+            attachment = bool(filename or media.startswith("audio/") or media == "application/octet-stream")
+            if size and (attachment or param_message):
+                incoming.ignore("attachment")
             elif size:
                 if size > MAX_TEXT_UTF8_BYTES:
                     raise ApiError(413, "text_too_long", f"message is over {MAX_TEXT_UTF8_BYTES} bytes")
                 try:
                     message = body_file.read().decode("utf-8").strip()
                 except UnicodeDecodeError:
-                    raise ApiError(400, "bad_request", "the body is not UTF-8 text; to send audio, add a Filename "
-                                                       "header ending in " + "/".join("." + e for e in AUDIO_EXTENSIONS)
-                                   ) from None
-            if filename and ext is None:
+                    raise ApiError(400, "bad_request", "the body is not UTF-8 text; compat attachments are unsupported") from None
+            if filename:
                 incoming.ignore("filename")
-            incoming.message = message if ext is None else ""
+            incoming.message = message
             delivered = await deliver(relay, request, incoming, "ntfy")
             body = ntfy_success(delivered.result, topic, incoming.title, message, priority, params.get("tags"))
             return JSONResponse(body, headers=delivered.headers)

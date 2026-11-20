@@ -32,7 +32,7 @@ SAY_DESCRIPTION = (
     "it to one or two plain sentences. Returns the message id; call receipt with it to learn whether the phone played "
     "it. Not for the alarm channel: urgent alerts use the alarm tool, which exists only when the user enabled it. "
     "Hygiene options: normalize=true strips emoji, markdown and URLs before storing (links become the word 'link'). "
-    "tag with coalesce_s holds the write that many seconds and writes only the latest text sent under that tag, so a "
+    "tag with coalesce_window_s holds the write that many seconds and writes only the latest text sent under that tag, so a "
     "burst of updates is spoken once (status 'coalescing' until it is written; the id is the one the message will have). "
     "tag with cooldown_s drops a repeat of the tag inside the cooldown (status 'suppressed', nothing written). Use "
     "them for progress updates and flapping alerts, not for one-off messages."
@@ -149,16 +149,16 @@ def build_mcp(backend: Backend, *, alarm_allowed: bool) -> MCPServer:
               annotations=ToolAnnotations(title="Say on phone", readOnlyHint=False, destructiveHint=False,
                                           idempotentHint=False, openWorldHint=True))
     async def say(text: str, channel: str | None = None, speech: str | None = None, voice: str | None = None,
-                   normalize: bool | None = None, tag: str | None = None, coalesce_s: float | None = None,
+                   normalize: bool | None = None, tag: str | None = None, coalesce_window_s: float | None = None,
                    cooldown_s: float | None = None) -> dict[str, Any]:
         """text: what to speak. channel: optional, default the relay's default. speech: device or server. voice: server
-        only. normalize: strip emoji, markdown and URLs. tag + coalesce_s: write only the latest text sent under the tag
+        only. normalize: strip emoji, markdown and URLs. tag + coalesce_window_s: write only the latest text sent under the tag
         within that many seconds. tag + cooldown_s: drop a repeat of the tag inside that many seconds."""
         if channel == "alarm":
             hint = "use the alarm tool" if alarm_allowed else "alarm is not enabled on this relay"
             raise ToolError(f"say does not send to the alarm channel; {hint}")
         return _sent(await backend.send({"text": text, "channel": channel, "speech": speech, "voice": voice,
-                                         "normalize": normalize, "tag": tag, "coalesce_s": coalesce_s,
+                                         "normalize": normalize, "tag": tag, "coalesce_window_s": coalesce_window_s,
                                          "cooldown_s": cooldown_s}))
 
     if alarm_allowed:

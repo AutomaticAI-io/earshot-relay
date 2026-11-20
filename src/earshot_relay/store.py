@@ -4,6 +4,7 @@ closes and the object is written, then the row is deleted (secure_delete is on, 
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 from dataclasses import dataclass
@@ -57,6 +58,8 @@ CREATE TABLE IF NOT EXISTS pending(
   truncated INTEGER NOT NULL DEFAULT 0,
   merged INTEGER NOT NULL DEFAULT 1,
   attempts INTEGER NOT NULL DEFAULT 0,
+  compat INTEGER NOT NULL DEFAULT 0,
+  window_end_at TEXT,
   UNIQUE(channel, tag)
 );
 CREATE INDEX IF NOT EXISTS pending_due ON pending(due_at);
@@ -64,6 +67,11 @@ CREATE TABLE IF NOT EXISTS idem_aliases(
   idem_key TEXT PRIMARY KEY,
   message_id TEXT NOT NULL,
   created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS suppressed_idem(
+  idem_key TEXT PRIMARY KEY,
+  created_at TEXT NOT NULL,
+  result TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS meta(
   k TEXT PRIMARY KEY,
@@ -110,6 +118,8 @@ class PendingRow:
     truncated: bool
     merged: int
     attempts: int
+    compat: bool = False
+    window_end_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -152,6 +162,11 @@ class Store:
             for name, decl in MESSAGE_COLUMNS.items():  # a version 1 or 2 database
                 if name not in columns:
                     self._db.execute(f"ALTER TABLE messages ADD COLUMN {name} {decl}")
+            pending_columns = {r["name"] for r in self._db.execute("PRAGMA table_info(pending)")}
+            for name, decl in {"compat": "INTEGER NOT NULL DEFAULT 1", "window_end_at": "TEXT"}.items():
+                if name not in pending_columns:
+                    self._db.execute(f"ALTER TABLE pending ADD COLUMN {name} {decl}")
+            self._db.execute("UPDATE pending SET window_end_at=due_at WHERE window_end_at IS NULL")
             self._db.execute(IDEM_INDEX)
             self._db.execute(TAG_INDEX)
             self._db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
@@ -237,13 +252,12 @@ class Store:
         return self._message(row)
 
     def undetected_message(self, after: str, before: str) -> MessageRow | None:
-        """The oldest message created in (after, before] that no device has reported on at all (the watchdog)."""
-        marks = ",".join("?" * len(PLAYBACK_PHASES))
+        """The oldest send in [after, before] without a matching detected receipt (never a global beacon cursor)."""
         with self._lock:
             row = self._db.execute(
-                "SELECT rowid, * FROM messages m WHERE m.created_at > ? AND m.created_at <= ? AND NOT EXISTS ("
-                f"SELECT 1 FROM beacons b WHERE b.key = m.key AND b.phase IN ({marks}))"
-                " ORDER BY m.created_at ASC, m.rowid ASC LIMIT 1", (after, before, *PLAYBACK_PHASES)).fetchone()
+                "SELECT rowid, * FROM messages m WHERE m.created_at >= ? AND m.created_at <= ? AND NOT EXISTS ("
+                "SELECT 1 FROM beacons b WHERE b.key = m.key AND b.phase = 'detected')"
+                " ORDER BY m.created_at ASC, m.rowid ASC LIMIT 1", (after, before)).fetchone()
         return self._message(row)
 
     # coalescing (pending writes) ------------------------------------------------------------------------------
@@ -254,7 +268,7 @@ class Store:
             return None
         return PendingRow(row["id"], row["channel"], row["tag"], row["created_at"], row["due_at"], row["text"],
                           row["speech"], row["voice"], bool(row["normalized"]), bool(row["truncated"]), row["merged"],
-                          row["attempts"])
+                          row["attempts"], bool(row["compat"]), row["window_end_at"])
 
     def get_pending(self, channel: str, tag: str) -> PendingRow | None:
         with self._lock:
@@ -269,9 +283,10 @@ class Store:
         with self._lock:
             self._db.execute(
                 "INSERT INTO pending(id, channel, tag, created_at, due_at, text, speech, voice, normalized, truncated,"
-                " merged, attempts) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                " merged, attempts, compat, window_end_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (row.id, row.channel, row.tag, row.created_at, row.due_at, row.text, row.speech, row.voice,
-                 int(row.normalized), int(row.truncated), row.merged, row.attempts))
+                 int(row.normalized), int(row.truncated), row.merged, row.attempts, int(row.compat),
+                 row.window_end_at or row.due_at))
 
     def update_pending(self, message_id: str, *, text: str, speech: str, voice: str | None, normalized: bool,
                        truncated: bool) -> None:
@@ -300,10 +315,25 @@ class Store:
                                     (now, limit)).fetchall()
         return [self._pending(r) for r in rows]
 
+    def next_pending_at(self) -> str | None:
+        with self._lock:
+            row = self._db.execute("SELECT MIN(due_at) AS t FROM pending").fetchone()
+        return row["t"] if row else None
+
     def pending_count(self) -> int:
         with self._lock:
             (n,) = self._db.execute("SELECT COUNT(*) FROM pending").fetchone()
         return n
+
+    def save_suppressed(self, digest: str, at: str, result: dict) -> None:
+        with self._lock:
+            self._db.execute("INSERT OR REPLACE INTO suppressed_idem VALUES(?,?,?)", (digest, at, json.dumps(result)))
+
+    def get_suppressed(self, digest: str, cutoff: str) -> dict | None:
+        with self._lock:
+            row = self._db.execute("SELECT result FROM suppressed_idem WHERE idem_key=? AND created_at>=?",
+                                   (digest, cutoff)).fetchone()
+        return json.loads(row["result"]) if row else None
 
     def add_alias(self, idem_key: str, message_id: str, created_at: str) -> None:
         with self._lock:
@@ -408,5 +438,6 @@ class Store:
         with self._lock:
             m = self._db.execute("DELETE FROM messages WHERE created_at < ?", (cutoff,)).rowcount
             b = self._db.execute("DELETE FROM beacons WHERE received_at < ?", (cutoff,)).rowcount
+            self._db.execute("DELETE FROM suppressed_idem WHERE created_at < ?", (cutoff,))
             self._db.execute("DELETE FROM idem_aliases WHERE created_at < ?", (cutoff,))
         return m, b

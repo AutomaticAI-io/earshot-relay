@@ -95,7 +95,7 @@ headers or as query parameters (the header wins):
 | --- | --- | --- |
 | `X-Earshot-Normalize` | `earshot_normalize` | `true` or `false` (`1`, `yes`, `on`, `0`, `no`, `off` too) |
 | `X-Earshot-Tag` | `earshot_tag` | the tag |
-| `X-Earshot-Coalesce-S` | `earshot_coalesce_s` | seconds |
+| `X-Earshot-Coalesce-Window-S` | `earshot_coalesce_window_s` | seconds |
 | `X-Earshot-Cooldown-S` | `earshot_cooldown_s` | seconds |
 
 `EARSHOT_RELAY_NORMALIZE=basic` applies to these routes without any header. When a send is held or dropped, the

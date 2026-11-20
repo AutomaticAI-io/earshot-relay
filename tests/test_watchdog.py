@@ -123,9 +123,9 @@ def test_a_detected_beacon_clears_the_incident_and_the_next_one_waits_out_the_co
     assert len(hook.requests) == 2 and relay.watchdog.status()["state"] == "notified"
 
 
-def test_an_incident_that_clears_during_the_cooldown_sends_nothing(setup, auth):
+def test_an_incident_only_clears_after_all_missing_keys_are_detected(setup, auth):
     relay, clock, hook, c = setup(EARSHOT_RELAY_WATCHDOG_COOLDOWN_S="1800")
-    post(c, auth, text="one")
+    first = post(c, auth, text="one").json()
     clock.advance(121)
     check(relay)
     assert len(hook.requests) == 1
@@ -136,10 +136,13 @@ def test_an_incident_that_clears_during_the_cooldown_sends_nothing(setup, auth):
     beacon(relay, second["key"], clock)
     clock.advance(2000)
     check(relay)
-    assert len(hook.requests) == 1 and relay.watchdog.status()["state"] == "idle"
+    assert len(hook.requests) == 1 and relay.watchdog.status()["state"] == "notified"
+    beacon(relay, first["key"], clock)
+    check(relay)
+    assert relay.watchdog.status()["state"] == "idle"
 
 
-def test_any_playback_phase_counts_but_a_heartbeat_does_not(setup, auth):
+def test_only_detected_phase_counts_and_heartbeat_does_not(setup, auth):
     relay, clock, hook, c = setup()
     msg = post(c, auth, text="x").json()
     chan = msg["channel"]
@@ -156,7 +159,10 @@ def test_any_playback_phase_counts_but_a_heartbeat_does_not(setup, auth):
     beacon(relay2, m2["key"], clock2, phase="started")
     clock2.advance(300)
     check(relay2)
-    assert hook2.requests == []
+    assert len(hook2.requests) == 1
+    beacon(relay2, m2["key"], clock2, phase="detected")
+    check(relay2)
+    assert relay2.watchdog.status()["state"] == "idle"
 
 
 def test_ntfy_style_urls_get_a_plain_text_body(setup, auth):
@@ -307,8 +313,6 @@ def test_the_background_loop_is_wired_into_the_app(setup, auth):
 
 @pytest.mark.parametrize("extra, expect", [
     ({"EARSHOT_RELAY_WATCHDOG_S": "120"}, "EARSHOT_RELAY_WATCHDOG_URL is required"),
-    ({"EARSHOT_RELAY_WATCHDOG_S": "120", "EARSHOT_RELAY_WATCHDOG_URL": HOOK, "EARSHOT_RELAY_BEACON_TOKEN": None},
-     "EARSHOT_RELAY_WATCHDOG_S needs receipts"),
     ({"EARSHOT_RELAY_WATCHDOG_S": "5", "EARSHOT_RELAY_WATCHDOG_URL": HOOK}, "between 10 and 86400"),
     ({"EARSHOT_RELAY_WATCHDOG_S": "abc", "EARSHOT_RELAY_WATCHDOG_URL": HOOK}, "must be a whole number"),
     ({"EARSHOT_RELAY_WATCHDOG_S": "120", "EARSHOT_RELAY_WATCHDOG_URL": "ftp://x/y"}, "http\\(s\\) URL"),
@@ -316,12 +320,32 @@ def test_the_background_loop_is_wired_into_the_app(setup, auth):
      "FORMAT must be one of"),
     ({"EARSHOT_RELAY_WATCHDOG_S": "120", "EARSHOT_RELAY_WATCHDOG_URL": HOOK, "EARSHOT_RELAY_WATCHDOG_COOLDOWN_S": "5"},
      "COOLDOWN_S must be between"),
-    ({"EARSHOT_RELAY_WATCHDOG_URL": HOOK}, "EARSHOT_RELAY_WATCHDOG_URL is set but EARSHOT_RELAY_WATCHDOG_S is not"),
     ({"EARSHOT_RELAY_WATCHDOG_COOLDOWN_S": "100"}, "COOLDOWN_S is set but EARSHOT_RELAY_WATCHDOG_S is not"),
 ])
 def test_watchdog_config_errors(moto_endpoint, tmp_path, extra, expect):
     with pytest.raises(ConfigError, match=expect):
         load_settings(base_env(moto_endpoint, str(tmp_path), **extra), check_ffmpeg=False)
+
+
+def test_watchdog_url_uses_default_threshold_and_missing_beacons_disable_it(make_relay, moto_endpoint, tmp_path):
+    s = load_settings(base_env(moto_endpoint, str(tmp_path), EARSHOT_RELAY_WATCHDOG_URL=HOOK), check_ffmpeg=False)
+    assert s.watchdog_s == 120
+    disabled = make_relay(EARSHOT_RELAY_WATCHDOG_URL=HOOK, EARSHOT_RELAY_BEACON_TOKEN=None)
+    assert disabled.watchdog is None
+
+
+def test_unrelated_detection_never_clears_missing_key(setup, auth):
+    relay, clock, hook, c = setup()
+    first = post(c, auth, text="missing").json()
+    second = post(c, auth, text="detected").json()
+    beacon(relay, second["key"], clock)
+    clock.advance(121)
+    check(relay)
+    assert len(hook.requests) == 1
+    assert relay.watchdog.status()["incident_message"] == first["id"]
+    beacon(relay, first["key"], clock)
+    check(relay)
+    assert relay.watchdog.status()["state"] == "idle"
 
 
 def test_watchdog_off_values_and_url_file(moto_endpoint, tmp_path):

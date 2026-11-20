@@ -5,6 +5,7 @@ Startup validation fails fast with messages that name variables, never their val
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -27,9 +28,11 @@ BUCKET_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{1,254}$")
 # (`earshot-relay token`) never contains them, so a value that does was never filled in.
 PLACEHOLDER_RE = re.compile(r"replace|changeme|change-me|your-token|placeholder", re.IGNORECASE)
 SECRET_VARS = ("EARSHOT_RELAY_TOKEN", "EARSHOT_RELAY_BEACON_TOKEN", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
-               "EARSHOT_RELAY_TTS_API_KEY", "ELEVENLABS_API_KEY", "EARSHOT_RELAY_COMPAT_PUSHOVER_TOKEN")
+               "EARSHOT_RELAY_TTS_API_KEY", "ELEVENLABS_API_KEY", "GEMINI_API_KEY", "EARSHOT_RELAY_COMPAT_PUSHOVER_TOKEN")
 
-TTS_PROVIDERS = ("openai", "elevenlabs")
+TTS_PROVIDERS = ("openai", "elevenlabs", "gemini")
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta"
+GEMINI_DEFAULT_MODEL = "gemini-2.5-flash-preview-tts"
 ELEVENLABS_URL = "https://api.elevenlabs.io"
 ELEVENLABS_DEFAULT_MODEL = "eleven_multilingual_v2"
 NORMALIZE_MODES = ("off", "basic")
@@ -152,6 +155,7 @@ class Settings:
     compat_pushover_token: str | None = field(default=None, repr=False)
     normalize: str = "off"
     max_words: int | None = None
+    channel_hygiene: tuple[tuple[str, str | None, int | None], ...] = ()
     watchdog_s: int | None = None
     watchdog_url: str | None = field(default=None, repr=False)  # may carry a topic or token: never logged or shown
     watchdog_cooldown_s: int = 1800
@@ -160,6 +164,15 @@ class Settings:
     @property
     def normalize_default(self) -> bool:
         return self.normalize == "basic"
+
+    def hygiene_for(self, channel: str) -> tuple[bool, int | None]:
+        mode, words = self.normalize, self.max_words
+        for name, override_mode, override_words in self.channel_hygiene:
+            if name == channel:
+                mode = override_mode if override_mode is not None else mode
+                words = override_words if override_words is not None else words
+                break
+        return mode == "basic", words
 
     @property
     def watchdog_host(self) -> str | None:
@@ -304,7 +317,7 @@ def load_settings(environ: dict[str, str] | None = None, *, check_ffmpeg: bool =
         problems.append("EARSHOT_RELAY_DEFAULT_SPEECH=server needs EARSHOT_RELAY_TTS_URL "
                         "(or EARSHOT_RELAY_TTS_PROVIDER=elevenlabs)")
 
-    hygiene = _hygiene_settings(e, take, problems)
+    hygiene = _hygiene_settings(e, take, problems, channels=channels)
     watchdog = _watchdog_settings(e, take, problems, beacon_token=beacon_token)
     compat = _compat_settings(e, take, problems, channels=channels, port=port, beacon_port=beacon_port)
 
@@ -347,8 +360,6 @@ def _compat_settings(e, take, problems: list[str], *, channels: list[str], port,
         return {}
     if compat_port is not None and compat_port in (port, beacon_port):
         problems.append("EARSHOT_RELAY_COMPAT_PORT must differ from EARSHOT_RELAY_PORT and EARSHOT_RELAY_BEACON_PORT")
-    if alarm and "alarm" not in channels:
-        problems.append("EARSHOT_RELAY_COMPAT_ALARM=1 needs alarm in EARSHOT_RELAY_CHANNELS")
 
     topics: dict[str, str] = {}
     if "ntfy" in enabled:
@@ -405,8 +416,9 @@ def _tts_settings(e, take, problems: list[str], *, check_ffmpeg: bool) -> TtsSet
                 problems.append(f"{orphan} is set but EARSHOT_RELAY_TTS_URL is not")
         return None
     elevenlabs = provider == "elevenlabs"
-    if elevenlabs and not tts_url:
-        tts_url = ELEVENLABS_URL
+    gemini = provider == "gemini"
+    if not tts_url and (elevenlabs or gemini):
+        tts_url = ELEVENLABS_URL if elevenlabs else GEMINI_URL
     tts_url = tts_url.rstrip("/")
     tu = urlsplit(tts_url)
     if tu.scheme not in ("http", "https") or not tu.netloc or tu.query or tu.fragment:
@@ -416,6 +428,10 @@ def _tts_settings(e, take, problems: list[str], *, check_ffmpeg: bool) -> TtsSet
     model = take(env, "EARSHOT_RELAY_TTS_MODEL", e)
     if elevenlabs:
         model = model or ELEVENLABS_DEFAULT_MODEL
+    elif gemini:
+        model = model or GEMINI_DEFAULT_MODEL
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", model):
+            problems.append("EARSHOT_RELAY_TTS_MODEL must be a Gemini model id, not a path")
     elif not model:
         problems.append("EARSHOT_RELAY_TTS_MODEL is required when EARSHOT_RELAY_TTS_URL is set")
     voice = take(env, "EARSHOT_RELAY_TTS_VOICE", e)
@@ -425,7 +441,14 @@ def _tts_settings(e, take, problems: list[str], *, check_ffmpeg: bool) -> TtsSet
             else "EARSHOT_RELAY_TTS_URL is set (the OpenAI speech API requires a voice; a request can still override it)"))
     elif not VOICE_RE.fullmatch(voice):
         problems.append("EARSHOT_RELAY_TTS_VOICE must match ^[A-Za-z0-9_+().: -]{1,100}$")
-    if elevenlabs:
+    if gemini:
+        api_key = take(env, "GEMINI_API_KEY", e) or take(env, "EARSHOT_RELAY_TTS_API_KEY", e)
+        if not api_key:
+            problems.append("GEMINI_API_KEY is required when EARSHOT_RELAY_TTS_PROVIDER=gemini")
+        fmt = (take(env, "EARSHOT_RELAY_TTS_FORMAT", e) or "pcm").lower()
+        if fmt != "pcm":
+            problems.append("EARSHOT_RELAY_TTS_FORMAT must be pcm for Gemini (converted to Ogg/Opus)")
+    elif elevenlabs:
         # The ElevenLabs key comes from the environment (or a *_FILE secret), under its usual name or the relay's.
         api_key = take(env, "ELEVENLABS_API_KEY", e) or take(env, "EARSHOT_RELAY_TTS_API_KEY", e)
         if not api_key:
@@ -441,16 +464,15 @@ def _tts_settings(e, take, problems: list[str], *, check_ffmpeg: bool) -> TtsSet
             problems.append("EARSHOT_RELAY_TTS_FORMAT must be mp3 or wav")
     timeout = take(_int, "EARSHOT_RELAY_TTS_TIMEOUT_S", take(env, "EARSHOT_RELAY_TTS_TIMEOUT_S", e), 60, 1, 600)
     leadin = take(_int, "EARSHOT_RELAY_TTS_LEADIN_MS", take(env, "EARSHOT_RELAY_TTS_LEADIN_MS", e), 700, 0, 10000)
-    if check_ffmpeg and leadin and shutil.which("ffmpeg") is None:
-        problems.append("EARSHOT_RELAY_TTS_LEADIN_MS is above 0 but ffmpeg is not installed "
-                        "(install ffmpeg or set EARSHOT_RELAY_TTS_LEADIN_MS=0)")
+    if check_ffmpeg and (leadin or gemini) and shutil.which("ffmpeg") is None:
+        problems.append("ffmpeg is not installed; required for Gemini PCM conversion and nonzero EARSHOT_RELAY_TTS_LEADIN_MS")
     if not model:
         return None
     return TtsSettings(provider=provider, url=tts_url, model=model, voice=voice, api_key=api_key, response_format=fmt,
                        timeout_s=float(timeout or 60), leadin_ms=leadin or 0)
 
 
-def _hygiene_settings(e, take, problems: list[str]) -> dict:
+def _hygiene_settings(e, take, problems: list[str], *, channels: list[str]) -> dict:
     """EARSHOT_RELAY_NORMALIZE and EARSHOT_RELAY_MAX_WORDS."""
     mode = (take(env, "EARSHOT_RELAY_NORMALIZE", e) or "off").lower()
     if mode not in NORMALIZE_MODES:
@@ -458,7 +480,26 @@ def _hygiene_settings(e, take, problems: list[str]) -> dict:
         mode = "off"
     raw_words = take(env, "EARSHOT_RELAY_MAX_WORDS", e)
     max_words = take(_int, "EARSHOT_RELAY_MAX_WORDS", raw_words, 0, 1, MAX_WORDS_LIMIT) if raw_words else None
-    return {"normalize": mode, "max_words": max_words}
+    raw_channels = take(env, "EARSHOT_RELAY_CHANNEL_HYGIENE", e)
+    overrides = []
+    if raw_channels:
+        try:
+            mapping = json.loads(raw_channels)
+            if not isinstance(mapping, dict):
+                raise ValueError
+            for channel, options in mapping.items():
+                if channel not in channels or not isinstance(options, dict) or set(options) - {"normalize", "max_words"}:
+                    raise ValueError
+                override_mode, words = options.get("normalize"), options.get("max_words")
+                if override_mode is not None and override_mode not in NORMALIZE_MODES:
+                    raise ValueError
+                if words is not None and (type(words) is not int or not 1 <= words <= MAX_WORDS_LIMIT):
+                    raise ValueError
+                overrides.append((channel, override_mode, words))
+        except (ValueError, TypeError, RecursionError):
+            problems.append("EARSHOT_RELAY_CHANNEL_HYGIENE must be a JSON object of allowed channels with "
+                            "normalize=off|basic and/or max_words=1..1000")
+    return {"normalize": mode, "max_words": max_words, "channel_hygiene": tuple(overrides)}
 
 
 def _watchdog_settings(e, take, problems: list[str], *, beacon_token: str | None) -> dict:
@@ -467,20 +508,19 @@ def _watchdog_settings(e, take, problems: list[str], *, beacon_token: str | None
     raw_url = take(env, "EARSHOT_RELAY_WATCHDOG_URL", e)
     raw_cooldown = take(env, "EARSHOT_RELAY_WATCHDOG_COOLDOWN_S", e)
     raw_format = take(env, "EARSHOT_RELAY_WATCHDOG_FORMAT", e)
-    if not raw_s or raw_s.lower() in ("off", "0", "none", "disabled"):
-        for var, value in (("EARSHOT_RELAY_WATCHDOG_URL", raw_url), ("EARSHOT_RELAY_WATCHDOG_COOLDOWN_S", raw_cooldown),
-                           ("EARSHOT_RELAY_WATCHDOG_FORMAT", raw_format)):
-            if value:
-                problems.append(f"{var} is set but EARSHOT_RELAY_WATCHDOG_S is not")
+    if raw_s and raw_s.lower() in ("off", "0", "none", "disabled"):
+        return {}
+    if not raw_s and not raw_url:
+        if raw_cooldown:
+            problems.append("EARSHOT_RELAY_WATCHDOG_COOLDOWN_S is set but EARSHOT_RELAY_WATCHDOG_S is not")
+        if raw_format:
+            problems.append("EARSHOT_RELAY_WATCHDOG_FORMAT is set but EARSHOT_RELAY_WATCHDOG_S is not")
         return {}
     seconds = take(_int, "EARSHOT_RELAY_WATCHDOG_S", raw_s, 120, WATCHDOG_MIN_S, WATCHDOG_MAX_S)
     cooldown = take(_int, "EARSHOT_RELAY_WATCHDOG_COOLDOWN_S", raw_cooldown, 1800, 60, 7 * 86400)
     fmt = (raw_format or "auto").lower()
     if fmt not in WATCHDOG_FORMATS:
         problems.append(f"EARSHOT_RELAY_WATCHDOG_FORMAT must be one of: {', '.join(WATCHDOG_FORMATS)}")
-    if not beacon_token:
-        problems.append("EARSHOT_RELAY_WATCHDOG_S needs receipts: set EARSHOT_RELAY_BEACON_TOKEN (the watchdog "
-                        "watches for the phone's 'detected' beacon; without beacons it cannot tell)")
     if not raw_url:
         problems.append("EARSHOT_RELAY_WATCHDOG_URL is required when EARSHOT_RELAY_WATCHDOG_S is set")
     else:

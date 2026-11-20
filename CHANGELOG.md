@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes. Versions follow semver. A `202` always means stored (or, with `coalesce_s`, held), never played;
+All notable changes. Versions follow semver. A `202` always means stored (or, with `coalesce_window_s`, held), never played;
 receipts describe device playback, never that a person heard anything.
 
 ## 1.1.0
@@ -16,7 +16,7 @@ Producer compatibility and hygiene for every sender (HTTP, MCP, CLI and the comp
 - **Text normalizer**: `EARSHOT_RELAY_NORMALIZE=off|basic` (default `off`), a per-request `normalize` true/false,
   and `EARSHOT_RELAY_MAX_WORDS`. Strips emoji and markdown, says URLs as "link", collapses whitespace, cuts at a
   sentence boundary. Text only, never audio. Responses report `normalized` and `truncated`.
-- **Coalesce and cooldown by tag**: `tag` with `coalesce_s` holds the write and writes only the latest text once
+- **Coalesce and cooldown by tag**: `tag` with `coalesce_window_s` holds the write and writes only the latest text once
   (`202`, status `coalescing`, the eventual id); `tag` with `cooldown_s` drops repeats (`200`, status `suppressed`).
   Held messages persist in SQLite and flush at startup. Pre-write by design: the relay holds `PutObject` only and
   cannot replace an object. ntfy sequence ids and Gotify extras are not mapped. Compat routes take the same options as
@@ -29,7 +29,7 @@ Producer compatibility and hygiene for every sender (HTTP, MCP, CLI and the comp
   environment only, voice id required, model id configurable, mp3 or opus, then the existing lead-in to Ogg/Opus.
   Tested against a stub server only. Docs for local OpenAI-compatible voices (Kokoro-FastAPI, openedai-speech, LocalAI),
   marked untested.
-- MCP `say` and CLI `say` take `normalize`, `tag`, `coalesce_s` and `cooldown_s`; `GET /v1/status` reports the TTS
+- MCP `say` and CLI `say` take `normalize`, `tag`, `coalesce_window_s` and `cooldown_s`; `GET /v1/status` reports the TTS
   provider, hygiene settings and watchdog state; `earshot-relay doctor` checks the watchdog.
 
 ### Changed

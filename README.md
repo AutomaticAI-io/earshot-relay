@@ -68,7 +68,7 @@ Retrying a send? Pass an `Idempotency-Key` header (CLI: `--idempotency-key`): th
 | `GET /v1/messages`, `GET /v1/status` | Recent messages; relay, bucket and device state. |
 | `POST /v1/doctor` | Checks configuration and the bucket write. |
 | `POST /v1/beacons/{token}` | Where the phone reports what it did. This is what makes receipts possible. |
-| `tag`, `coalesce_s`, `cooldown_s`, `normalize` | Hygiene for every sender: strip emoji, markdown and URLs before speaking, merge a burst under one tag into one message, drop repeats, and an optional delivery watchdog that posts a notice when sends get no playback report ([docs/hygiene.md](docs/hygiene.md)). |
+| `tag`, `coalesce_window_s`, `cooldown_s`, `normalize` | Hygiene for every sender: strip emoji, markdown and URLs before speaking, merge a burst under one tag into one message, drop repeats, and an optional delivery watchdog that posts a notice when sends get no playback report ([docs/hygiene.md](docs/hygiene.md)). |
 | `/compat/...` | Optional ntfy, Gotify, Pushover and Join request shapes, so existing producers switch by changing a URL ([docs/compat.md](docs/compat.md)). Off by default. |
 | `/mcp` | An MCP server over streamable HTTP, same bearer token. A stdio mode is `earshot-relay mcp`. |
 

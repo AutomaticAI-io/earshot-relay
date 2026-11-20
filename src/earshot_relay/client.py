@@ -78,9 +78,9 @@ class RelayClient:
 
     def say(self, text: str, channel: str | None = None, speech: str | None = None, voice: str | None = None,
             idempotency_key: str | None = None, normalize: bool | None = None, tag: str | None = None,
-            coalesce_s: float | None = None, cooldown_s: float | None = None) -> dict:
+            coalesce_window_s: float | None = None, cooldown_s: float | None = None) -> dict:
         body = {"text": text, "channel": channel, "speech": speech, "voice": voice, "normalize": normalize, "tag": tag,
-                "coalesce_s": coalesce_s, "cooldown_s": cooldown_s}
+                "coalesce_window_s": coalesce_window_s, "cooldown_s": cooldown_s}
         return self._request("POST", "/v1/messages", json={k: v for k, v in body.items() if v is not None},
                              headers=self._idem(idempotency_key))
 

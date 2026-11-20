@@ -79,7 +79,7 @@ def known_ids(main) -> set[str]:
 # ---- replay of real-client requests ----------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("path", fixtures(), ids=lambda p: p.stem)
+@pytest.mark.parametrize("path", [p for p in fixtures() if p.stem != "ntfy_cli_file_audio"], ids=lambda p: p.stem)
 def test_real_client_request_is_accepted(path, clients, s3_admin):
     main, root, _ = clients
     fx = json.loads(path.read_text())
@@ -108,7 +108,7 @@ def test_real_client_request_is_accepted(path, clients, s3_admin):
         assert r.headers.get(name) == value, name
 
 
-@pytest.mark.parametrize("path", fixtures(), ids=lambda p: p.stem)
+@pytest.mark.parametrize("path", [p for p in fixtures() if p.stem != "ntfy_cli_file_audio"], ids=lambda p: p.stem)
 def test_fixture_response_shape_is_the_protocols(path, clients):
     main, root, _ = clients
     fx = json.loads(path.read_text())
@@ -141,7 +141,6 @@ def test_compat_is_off_by_default(moto_endpoint, tmp_path):
     ({"EARSHOT_RELAY_COMPAT_ALARM": "1"}, "names no protocol"),
     ({"EARSHOT_RELAY_COMPAT_NTFY_TOPICS": "phone"}, "names no protocol"),
     ({"EARSHOT_RELAY_COMPAT": "gotify", "EARSHOT_RELAY_COMPAT_NTFY_TOPICS": "phone"}, "does not include ntfy"),
-    ({"EARSHOT_RELAY_COMPAT": "ntfy", "EARSHOT_RELAY_COMPAT_ALARM": "1"}, "needs alarm in EARSHOT_RELAY_CHANNELS"),
     ({"EARSHOT_RELAY_COMPAT": "ntfy", "EARSHOT_RELAY_COMPAT_NTFY_TOPICS": "phone=nowhere"}, "not in EARSHOT_RELAY_CHANNELS"),
     ({"EARSHOT_RELAY_COMPAT": "ntfy", "EARSHOT_RELAY_CHANNELS": "phone,alarm",
       "EARSHOT_RELAY_COMPAT_NTFY_TOPICS": "boom=alarm"}, "also needs EARSHOT_RELAY_COMPAT_ALARM=1"),
@@ -315,16 +314,22 @@ def test_ntfy_unicode_title_header_is_decoded(clients, s3_admin):
     assert stored_text(s3_admin, message_key(main, BEARER, mid)["key"]) == "Café. déjà vu"
 
 
-def test_ntfy_audio_attachment_is_played_as_audio(clients, s3_admin):
+def test_ntfy_audio_attachment_is_rejected_without_text(clients):
     main, root, _ = clients
     before = known_ids(main)
     wav = b"RIFF\x24\x00\x00\x00WAVEfmt " + b"\x00" * 32
     r = root.put("/phone", content=wav, headers={**BEARER, "X-Filename": "ding.wav"})
-    assert r.status_code == 200
-    (mid,) = new_ids(main, before)
-    info = message_key(main, BEARER, mid)
-    assert info["type"] == "audio" and info["key"].endswith(".wav")
-    assert s3_admin.get_object(Bucket=BUCKET, Key=info["key"])["Body"].read() == wav
+    assert r.status_code == 400 and "attachments are unsupported" in r.json()["error"]
+    assert new_ids(main, before) == []
+
+
+def test_ntfy_attachment_with_message_ignores_binary(clients, s3_admin):
+    main, root, _ = clients
+    r = root.put("/phone", content=b"RIFF" + b"\x00" * 32,
+                 headers={**BEARER, "X-Filename": "ding.wav", "Message": "A message"})
+    assert r.status_code == 200 and "attachment" in r.headers["x-earshot-ignored"]
+    info = message_key(main, BEARER, r.headers["x-earshot-message-id"])
+    assert info["type"] == "text" and stored_text(s3_admin, info["key"]) == "A message"
 
 
 def test_ntfy_prefix_routes_on_the_main_app(clients):
@@ -335,6 +340,20 @@ def test_ntfy_prefix_routes_on_the_main_app(clients):
 
 
 # ---- alarm gate ------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("flag,allowlist,expect_alarm", [
+    (False, False, False), (True, False, False), (False, True, False), (True, True, True),
+])
+def test_alarm_requires_both_switches(compat_relay, flag, allowlist, expect_alarm):
+    relay = compat_relay(EARSHOT_RELAY_CHANNELS="phone,alarm" if allowlist else "phone",
+                         EARSHOT_RELAY_COMPAT_ALARM="1" if flag else "0")
+    with TestClient(create_compat_app(relay)) as c:
+        r = c.post("/phone", content="smoke", headers={**BEARER, "Priority": "5"})
+        assert r.status_code == 200
+        assert bool(r.headers.get("x-earshot-downgraded")) is not expect_alarm
+        msg = relay.store.get_message(r.headers["x-earshot-message-id"])
+        assert msg.channel == ("alarm" if expect_alarm else "phone")
 
 
 def test_top_priority_goes_to_alarm_only_when_both_switches_are_on(compat_relay, s3_admin):
