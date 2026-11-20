@@ -23,6 +23,7 @@ The token is part of the URL, so it lives in the phone's settings and in your pr
 
 | Status | Meaning |
 | --- | --- |
+| `coalescing` | Not stored yet: the text is held for `coalesce_s` and will be written once, with the latest text under its tag ([hygiene](hygiene.md)). The receipt has `write_at`. Once written, the same id reads as a normal receipt. |
 | `stored` | The object is in the bucket. Nothing heard from the phone yet. |
 | `detected` | The phone saw the object. |
 | `started` | Playback began. |
@@ -43,6 +44,12 @@ With several phones, the status is the furthest any device got. If devices end i
 Clock skew: the app sends `clock_skew_ms` (phone clock minus the S3 server clock, from the listing's `Date` header) when it knows it, and the relay computes `at_server = at - clock_skew_ms`. `since_upload_ms` is the time from the object's `LastModified` (as the phone saw it) to that hop, both on the server clock. Treat it as a rough figure.
 
 Heartbeat beacons update device state in `GET /v1/status` and are never hops. Replayed or duplicate beacons are ignored. Beacons parked on a phone that was offline arrive later and still flip `unconfirmed` to the real status.
+
+## Silent phones
+
+Receipts answer when you ask. To be told without asking, set [the delivery watchdog](hygiene.md#delivery-watchdog): it
+posts one notice to a URL you choose when a stored message gets no beacon within `EARSHOT_RELAY_WATCHDOG_S` seconds.
+It watches sends, not idle phones (the app sends no heartbeat).
 
 ## The beacon wire format
 

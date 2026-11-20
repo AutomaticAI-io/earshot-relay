@@ -47,15 +47,39 @@ Details, URLs and what was tested: [compat.md](compat.md).
 | `EARSHOT_RELAY_RECEIPT_WAIT_MIN` | `60` | After this many minutes without a beacon, a message becomes `unconfirmed`. |
 | `EARSHOT_RELAY_BEACON_RATE_LIMIT` | `600/min` | Beacons accepted per window before `429` (the phone retries), or `off`. |
 
+## Hygiene (optional)
+
+Details: [hygiene.md](hygiene.md).
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `EARSHOT_RELAY_NORMALIZE` | `off` | `off` or `basic`: strip emoji and markdown, say links as "link", collapse whitespace. A request's `normalize` true/false overrides it. |
+| `EARSHOT_RELAY_MAX_WORDS` | unset | 1 to 1000. Cuts normalized text at a sentence boundary. Needs the normalizer to run (setting or request). |
+
+Coalescing (`tag`, `coalesce_s`, `cooldown_s`) is per request and has no global setting.
+
+## Delivery watchdog (optional, needs receipts)
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `EARSHOT_RELAY_WATCHDOG_S` | off | 10 to 86400 seconds a stored message may go without any playback beacon before an incident opens (120 is a good start). Needs `EARSHOT_RELAY_BEACON_TOKEN`. It watches sends, not idle phones. |
+| `EARSHOT_RELAY_WATCHDOG_URL` | required with the above | `http(s)` URL that gets the notice. May hold a secret (an ntfy topic); also `..._URL_FILE`. Never logged or shown. |
+| `EARSHOT_RELAY_WATCHDOG_COOLDOWN_S` | `1800` | 60 to 604800. Minimum seconds between notices. |
+| `EARSHOT_RELAY_WATCHDOG_FORMAT` | `auto` | `auto`, `json` or `text`. Auto sends plain text to ntfy-style hosts and JSON elsewhere. |
+
+Setting the URL or the cooldown without `EARSHOT_RELAY_WATCHDOG_S` is a startup error.
+
 ## Server-side speech (optional)
 
 | Variable | Default | Notes |
 | --- | --- | --- |
-| `EARSHOT_RELAY_TTS_URL` | unset | Base URL of an OpenAI-compatible API (the relay calls `<url>/audio/speech`). No credentials in the URL; use the API key variable. |
-| `EARSHOT_RELAY_TTS_MODEL` | required with the URL | |
-| `EARSHOT_RELAY_TTS_VOICE` | required with the URL | Default voice (the OpenAI speech API requires one); a request can override it. |
-| `EARSHOT_RELAY_TTS_API_KEY` | unset | Sent as a bearer token to the TTS server. |
-| `EARSHOT_RELAY_TTS_FORMAT` | `mp3` | `mp3` or `wav`. |
+| `EARSHOT_RELAY_TTS_PROVIDER` | `openai` | `openai` (any OpenAI-compatible server) or `elevenlabs`. See [tts.md](tts.md). |
+| `EARSHOT_RELAY_TTS_URL` | unset | Base URL of an OpenAI-compatible API (the relay calls `<url>/audio/speech`). No credentials in the URL; use the API key variable. With `elevenlabs` it defaults to `https://api.elevenlabs.io` and is only for a proxy or a test server. |
+| `EARSHOT_RELAY_TTS_MODEL` | required with the URL | ElevenLabs: optional, default `eleven_multilingual_v2`. |
+| `EARSHOT_RELAY_TTS_VOICE` | required with the URL or ElevenLabs | Default voice (OpenAI voice name, or an ElevenLabs voice id); a request can override it. |
+| `EARSHOT_RELAY_TTS_API_KEY` | unset | Sent as a bearer token to the OpenAI-compatible TTS server. |
+| `ELEVENLABS_API_KEY` | required with `elevenlabs` | Environment (or `ELEVENLABS_API_KEY_FILE`) only. Sent as `xi-api-key`. `EARSHOT_RELAY_TTS_API_KEY` is accepted as a fallback. |
+| `EARSHOT_RELAY_TTS_FORMAT` | `mp3` | `mp3` or `wav`; ElevenLabs: `mp3` or `opus`. |
 | `EARSHOT_RELAY_TTS_TIMEOUT_S` | `60` | |
 | `EARSHOT_RELAY_TTS_LEADIN_MS` | `700` | Silence prepended with ffmpeg. `0` writes the TTS output unchanged. |
 | `EARSHOT_RELAY_DEFAULT_SPEECH` | `device` | `device` (phone voice) or `server` (needs the TTS URL). |

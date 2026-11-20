@@ -86,6 +86,26 @@ The alarm plays a siren on the phone's alarm stream, also during a call unless t
 is off; "Total silence" Do Not Disturb, an Android refusal, a stopped service, a powered-off phone or no network can
 still silence it.
 
+## Normalizer, tags and coalescing on these routes
+
+The four protocols have no fields for [hygiene](hygiene.md), so Earshot's own options ride beside the request, as
+headers or as query parameters (the header wins):
+
+| Header | Query parameter | Value |
+| --- | --- | --- |
+| `X-Earshot-Normalize` | `earshot_normalize` | `true` or `false` (`1`, `yes`, `on`, `0`, `no`, `off` too) |
+| `X-Earshot-Tag` | `earshot_tag` | the tag |
+| `X-Earshot-Coalesce-S` | `earshot_coalesce_s` | seconds |
+| `X-Earshot-Cooldown-S` | `earshot_cooldown_s` | seconds |
+
+`EARSHOT_RELAY_NORMALIZE=basic` applies to these routes without any header. When a send is held or dropped, the
+protocol's own body still reports success (it is accepted, not written), and the response says what really happened
+with `X-Earshot-Status: coalescing` or `suppressed`; `X-Earshot-Normalized: true` and `X-Earshot-Truncated: true` report
+the text changes. A bad value is a `400` in the protocol's error shape. Join's `earshot_*` query parameters are not
+listed as ignored. ntfy's sequence id and Gotify's extras are not mapped (the relay cannot replace a delivered
+message; see [hygiene](hygiene.md#coalesce-and-cooldown-by-tag)). Tested with the in-process test suite, not with
+real clients.
+
 ## ntfy
 
 Use the relay as your ntfy server. Auth is the relay token, in any place ntfy clients put a token:

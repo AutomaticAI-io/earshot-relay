@@ -29,11 +29,11 @@ Other MCP clients use the same two shapes: a URL plus an `Authorization` header,
 
 | Tool | Purpose |
 | --- | --- |
-| `say(text, channel?, speech?, voice?)` | Store a short message for the phone to speak. A success means stored, not played. Refuses the `alarm` channel (and the default channel can never be `alarm`). |
+| `say(text, channel?, speech?, voice?, normalize?, tag?, coalesce_s?, cooldown_s?)` | Store a short message for the phone to speak. A success means stored, not played; with `coalesce_s` it means held, to be written once when the window closes ([hygiene](hygiene.md)). Refuses the `alarm` channel (and the default channel can never be `alarm`). |
 | `alarm(text)` | LOUD. Exists only when `alarm` is in `EARSHOT_RELAY_CHANNELS`. See the caveat below. |
 | `receipt(id="latest", wait_seconds=0)` | What the phone did with a message, plus `final` (whether waiting longer could still change it). Describes device playback, not that a person heard it. |
 | `recent(limit=10, channel?)` | Recent messages with their status. |
-| `status()` | Relay version, channels, default channel, speech settings, last beacon and devices. Never returns the beacon URL (it contains a secret). |
+| `status()` | Relay version, channels, default channel, speech settings, hygiene and watchdog state, last beacon and devices. Never returns the beacon URL (it contains a secret). |
 
 **The alarm caveat.** The `alarm` tool's description gives the model the same caveat: the app plays a siren, then the message on the phone's alarm stream at high volume. It usually gets through Do Not Disturb (not "Total silence") and plays during a phone call, where the other party may hear it, unless the app's **Alarms can interrupt calls** is off. Total-silence Do Not Disturb, an Android refusal, a stopped service, a powered-off phone, battery restrictions or no network can still silence it. It is not an emergency or life-safety service, and the tool tells the model never to promise the user it will wake them.
 
