@@ -4,7 +4,7 @@ A receipt answers "what did the phone do with this message?" It records device p
 
 ## How it works
 
-1. You send a message. The relay writes the object and remembers the id, channel, key and time (never the text).
+1. You send a message. The relay writes the object and remembers the id, channel, key and time (never the text, except text held for `coalesce_s`, which is deleted when it is written).
 2. The phone polls the bucket, plays the object, and reports `detected`, `started` and `finished` (or `failed` or `missed`) to the beacon URL.
 3. The relay matches each beacon to the message by object key and builds the timeline.
 
@@ -24,6 +24,7 @@ The token is part of the URL, so it lives in the phone's settings and in your pr
 | Status | Meaning |
 | --- | --- |
 | `coalescing` | Not stored yet: the text is held for `coalesce_s` and will be written once, with the latest text under its tag ([hygiene](hygiene.md)). The receipt has `write_at`. Once written, the same id reads as a normal receipt. |
+| `write_failed` | Only for a held (coalesced) message: the relay accepted it but could not write it to the bucket after its retries. Nothing is stored and nothing will play; send it again. Final at once. |
 | `stored` | The object is in the bucket. Nothing heard from the phone yet. |
 | `detected` | The phone saw the object. |
 | `started` | Playback began. |

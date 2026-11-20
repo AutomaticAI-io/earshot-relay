@@ -17,7 +17,7 @@ All settings are environment variables. Every secret also accepts a `_FILE` vari
 | --- | --- | --- |
 | `EARSHOT_RELAY_TOKEN` | required | Bearer token for callers. 32 or more printable characters. `earshot-relay token` makes one. A value still holding an `.env.example` placeholder (`replace...`) is refused, for every secret. |
 | `EARSHOT_RELAY_HOST` / `EARSHOT_RELAY_PORT` | `127.0.0.1` / `8080` | The container image sets host `0.0.0.0`; publish it on loopback only. |
-| `EARSHOT_RELAY_DATA_DIR` | `~/.local/share/earshot-relay` (`/data` in the image) | Holds the SQLite index (message ids and receipts; no message text). |
+| `EARSHOT_RELAY_DATA_DIR` | `~/.local/share/earshot-relay` (`/data` in the image) | Holds the SQLite index (message ids and receipts; no message text, except text held for `coalesce_s`, deleted when it is written). |
 | `EARSHOT_RELAY_CHANNELS` | `phone` | Comma-separated channels the relay may send to. `alarm` is loud and is sendable only if listed here. |
 | `EARSHOT_RELAY_DEFAULT_CHANNEL` | `phone` if listed, else the first non-alarm channel | Must be in the list, and can never be `alarm`: every send without a channel (CLI `say`, MCP `say`, hooks) uses it. |
 | `EARSHOT_RELAY_RATE_LIMIT` | `60/min` | Overall send limit, or `off`. |
@@ -34,7 +34,8 @@ Details, URLs and what was tested: [compat.md](compat.md).
 | `EARSHOT_RELAY_COMPAT` | off | `ntfy`, `gotify`, `pushover`, `join` (comma-separated) or `all`. An unknown name is a startup error, and so is any other `EARSHOT_RELAY_COMPAT_*` variable set without this one. |
 | `EARSHOT_RELAY_COMPAT_PORT` | unset | A listener where ntfy and Gotify live at the server root, for clients that cannot use a path prefix (Apprise `ntfy://`). Differs from the main and beacon ports. |
 | `EARSHOT_RELAY_COMPAT_NTFY_TOPICS` | every non-alarm channel, by name | `topic` or `topic=channel`, comma-separated. Anything else is `404`. |
-| `EARSHOT_RELAY_COMPAT_ALARM` | off | A protocol's top priority reaches `alarm` only with this on and `alarm` in `EARSHOT_RELAY_CHANNELS`; otherwise it is delivered normally with `X-Earshot-Downgraded: alarm`. |
+| `EARSHOT_RELAY_COMPAT_ALARM` | off | A protocol's top priority reaches `alarm` only with this on and `alarm` in `EARSHOT_RELAY_CHANNELS`; otherwise it is stored as a normal item with `X-Earshot-Downgraded: alarm` (as is a send over the alarm rate limit). |
+| `EARSHOT_RELAY_COMPAT_TOKEN` | unset | A send-only token (32+ printable characters, `earshot-relay token`, different from the relay token) accepted on every compat route and nowhere else: not `/v1/*`, the doctor, receipts or MCP. Give producers this one. A secret (also `..._FILE`). |
 | `EARSHOT_RELAY_COMPAT_PUSHOVER_TOKEN` | unset | Exactly 30 letters and digits (`earshot-relay token --pushover`), accepted only on the Pushover route, so Pushover-shaped libraries pass their own token check. A secret (also `..._FILE`). |
 
 ## Receipts

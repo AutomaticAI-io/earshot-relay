@@ -12,9 +12,11 @@ those services; it just understands what their clients send.
 ## Read this first
 
 - **A success response means stored, not played.** It is the protocol's own success body (ntfy's JSON, Gotify's
-  message, Pushover's `status: 1`, Join's `success: true`) and it says the relay wrote the object to your bucket.
-  Whether the phone played it is in the receipt (`X-Earshot-Message-Id` and `Location` point to it). A receipt shows
-  device playback; it is not proof that a person heard anything.
+  message, Pushover's `status: 1`, Join's `success: true`) and it says the relay stored the object in your bucket. Two
+  cases are different and say so in `X-Earshot-Status`: `coalescing` (the text is only held until its window closes)
+  and `suppressed` (a cooldown dropped it, nothing was written). Whether the phone played it is in the receipt
+  (`X-Earshot-Message-Id` points to it; read it on the main port). A receipt shows device playback; it is not proof
+  that a person heard anything.
 - **Off by default.** Nothing is reachable until `EARSHOT_RELAY_COMPAT` names a protocol.
 - **The alarm channel is never reachable by accident.** See [Priorities and the alarm channel](#priorities-and-the-alarm-channel).
   The alarm is not an emergency or life-safety service, and Do Not Disturb set to "Total silence" can silence it.
@@ -31,9 +33,10 @@ EARSHOT_RELAY_COMPAT_PORT=8082                     # optional: a second listener
 | Variable | Default | Notes |
 | --- | --- | --- |
 | `EARSHOT_RELAY_COMPAT` | off | Comma-separated: `ntfy`, `gotify`, `pushover`, `join`, or `all`. Unknown names stop the relay at startup. |
-| `EARSHOT_RELAY_COMPAT_PORT` | unset | A listener where ntfy and Gotify live at the server root (`/`, `/{topic}`, `/message`). Needed for clients that cannot use a path prefix (Apprise `ntfy://`). Must differ from the main and beacon ports. Publish it only where the producers are, for example `127.0.0.1:8082` or your tailnet. |
+| `EARSHOT_RELAY_COMPAT_PORT` | unset | A listener where ntfy and Gotify live at the server root (`/`, `/{topic}`, `/message`). Needed for clients that cannot use a path prefix (Apprise `ntfy://`). Must differ from the main and beacon ports. Publish it only where the producers are, for example `127.0.0.1:8082` or your tailnet. With Docker add `-p 127.0.0.1:8082:8082` to `docker run` (compose.yaml has the line commented out). The relay has no TLS of its own: for `ntfys://` put a reverse proxy or tunnel in front of this port. |
 | `EARSHOT_RELAY_COMPAT_NTFY_TOPICS` | each non-alarm channel is a topic of the same name | Allowlist, `topic` or `topic=channel`, comma-separated: `phone,doorbell=phone`. A topic not listed is a `404` in ntfy's error shape. A topic mapped to `alarm` also needs `EARSHOT_RELAY_COMPAT_ALARM=1`. |
 | `EARSHOT_RELAY_COMPAT_ALARM` | off | Lets a protocol's top priority reach the `alarm` channel. Needs `alarm` in `EARSHOT_RELAY_CHANNELS`. |
+| `EARSHOT_RELAY_COMPAT_TOKEN` | unset | A send-only token, 32+ printable characters (`earshot-relay token`), different from the relay token. Accepted on every compat route (ntfy, Gotify, Pushover, Join) and nowhere else: not on `/v1/*`, the doctor, receipts or MCP. Give producers this one instead of the relay token. A secret (also `..._FILE`). |
 | `EARSHOT_RELAY_COMPAT_PUSHOVER_TOKEN` | unset | An optional 30-character token (letters and digits only) that Pushover-shaped clients accept, valid only on the Pushover route. `earshot-relay token --pushover` makes one. Pushover's documented example keys are refused. |
 
 Two places serve each protocol:
@@ -46,7 +49,12 @@ Two places serve each protocol:
 | Join | `/compat/join/_ah/api/messaging/v1/sendPush` | `/_ah/api/messaging/v1/sendPush` |
 
 The compat listener serves only these routes and `/healthz`: no native API, no OpenAPI page, no MCP. The compat
-topics `healthz`, `v1`, `compat` and `mcp` (and `message` when Gotify is on) cannot be ntfy topics there.
+topics `healthz`, `v1`, `compat` and `mcp` (and `message` when Gotify is on) cannot be ntfy topics there. A path or
+method a protocol does not use (Gotify's `GET /health` or `/version`, ntfy's `GET /{topic}/json` subscribe) answers in
+the relay's own `404` or `405` shape, not the protocol's.
+
+Because the compat listener serves no native API, a receipt is read on the **main** port: `Location: /v1/messages/{id}`
+and `X-Earshot-Message-Id` name the message, but following that path on the compat port is a `404`.
 
 `GET /v1/status` and `earshot-relay status` show what is enabled and where.
 
@@ -78,10 +86,14 @@ All four protocols map the same way.
 | Join | none | all |
 
 A top-priority send goes to the `alarm` channel only when `alarm` is in `EARSHOT_RELAY_CHANNELS` **and**
-`EARSHOT_RELAY_COMPAT_ALARM=1`. Otherwise it is delivered on its normal channel and the response carries
-`X-Earshot-Downgraded: alarm`, so a producer's "critical" never turns your phone into a siren by default.
+`EARSHOT_RELAY_COMPAT_ALARM=1`. Otherwise it is stored on its normal channel and the response carries
+`X-Earshot-Downgraded: alarm`, so a producer's "critical" never turns your phone into a siren by default. When it does
+reach the alarm channel the response says so with `X-Earshot-Promoted: alarm`.
 Mind the defaults of the tools you point at it: Uptime Kuma's ntfy sends `DOWN` at priority `5` and its Gotify sends
-priority `8`, so with the alarm switch on every DOWN is loud. Alarm sends also use the stricter `EARSHOT_RELAY_ALARM_RATE_LIMIT`.
+priority `8`, so with the alarm switch on every DOWN is loud. Alarm sends also use the stricter `EARSHOT_RELAY_ALARM_RATE_LIMIT` (6 an hour by default). A compat send over that
+budget is **not refused**: it is stored as a normal item with `X-Earshot-Downgraded: alarm`, so a flapping monitor
+keeps getting its alerts through (quietly) once the siren budget is used up. Only a caller that chose the `alarm`
+channel itself (the native API, or an ntfy topic mapped to `alarm`) gets a `429`.
 The alarm plays a siren on the phone's alarm stream, also during a call unless the app's "Alarms can interrupt calls"
 is off; "Total silence" Do Not Disturb, an Android refusal, a stopped service, a powered-off phone or no network can
 still silence it.
@@ -98,13 +110,30 @@ headers or as query parameters (the header wins):
 | `X-Earshot-Coalesce-S` | `earshot_coalesce_s` | seconds |
 | `X-Earshot-Cooldown-S` | `earshot_cooldown_s` | seconds |
 
+**Which producers can carry them.** Anything that sets a request header or edits the URL: curl and scripts, the ntfy
+CLI (`-H "X-Earshot-Tag: disk"`), Tasker and any HTTP Request action, a webhook you build yourself (a
+`?earshot_tag=...` query parameter). **Apprise `ntfy://` and Uptime Kuma cannot**: Apprise posts a fixed header set
+(it ignores `+Header=value` URL parameters) and has no way to add a query string, and Kuma exposes neither. For those
+producers only the server-wide `EARSHOT_RELAY_NORMALIZE=basic` (and `EARSHOT_RELAY_MAX_WORDS`) reaches the text;
+tag, coalesce and cooldown are not reachable, so send through a small script or the native API when you need them.
+
 `EARSHOT_RELAY_NORMALIZE=basic` applies to these routes without any header. When a send is held or dropped, the
 protocol's own body still reports success (it is accepted, not written), and the response says what really happened
 with `X-Earshot-Status: coalescing` or `suppressed`; `X-Earshot-Normalized: true` and `X-Earshot-Truncated: true` report
 the text changes. A bad value is a `400` in the protocol's error shape. Join's `earshot_*` query parameters are not
 listed as ignored. ntfy's sequence id and Gotify's extras are not mapped (the relay cannot replace a delivered
-message; see [hygiene](hygiene.md#coalesce-and-cooldown-by-tag)). Tested with the in-process test suite, not with
-real clients.
+message; see [hygiene](hygiene.md#coalesce-and-cooldown-by-tag)). The options were tested with the
+in-process test suite, not with real clients.
+
+## Credentials: keep the token out of URLs where you can
+
+Gotify (`?token=`), ntfy (`?auth=`, `?authorization=`) and Join (`?apikey=`) can carry the token in the query string,
+and Pushover and Join in a form body. The relay never logs a query string or a token, but **a reverse proxy or tunnel in
+front of it (Traefik, Cloudflare, nginx) usually logs the full request URI**, so a URL token lands in those logs. Prefer
+a header (`Authorization: Bearer`, `X-Gotify-Key`) wherever the client lets you. And do not hand producers the relay
+token: set `EARSHOT_RELAY_COMPAT_TOKEN`, a send-only token that opens the compat routes and nothing else, so a token
+leaked from a URL or a producer's config can send but cannot read receipts, run the doctor or reach MCP. (Pushover's
+own 30-character token, `EARSHOT_RELAY_COMPAT_PUSHOVER_TOKEN`, is likewise valid only on the Pushover route.)
 
 ## ntfy
 
@@ -132,7 +161,9 @@ are then ignored and named in `X-Earshot-Ignored`.
 
 Unsupported and ignored (named in `X-Earshot-Ignored` when sent): `tags`, `click`, `icon`, `attach`, `actions`,
 `markdown`, `email`, `call`, `template`, `sequence_id`, and `cache`, `firebase` or `unifiedpush` when set to anything
-but their defaults. Refused: `delay`, `at` and `in`.
+but their defaults. A non-audio file upload (`ntfy publish --file a.txt`) is not stored: with a message the message is
+stored and `attachment` and `filename` are named as ignored; with no message the send is a `400`. Refused: `delay`, `at`
+and `in`.
 
 | Setting | Value |
 | --- | --- |
@@ -205,7 +236,7 @@ Run on 2026-11-20 with curl 8.14.1, Apprise 2.3.0, ntfy CLI 2.22.0, gotify-cli 2
 | curl, ntfy GET | `curl -G http://H:8080/compat/ntfy/phone/publish --data-urlencode "message=Garage door left open" --data-urlencode "title=Garage" --data-urlencode "auth=<b64 of Bearer $T>"` | `Garage door left open` (title said once) |
 | curl, ntfy JSON | `curl -H "Authorization: Bearer $T" -d '{"topic":"phone","title":"CI","message":"Build 512 passed","priority":4,"click":"https://ci.example.com/512"}' http://H:8080/compat/ntfy` | stored, `click` ignored |
 | Apprise ntfy | `apprise -b "washer done" -t Laundry "ntfy://earshot:$T@H:8082/phone"` | stored, `icon` ignored |
-| Apprise ntfys | `apprise ... "ntfys://$T@H:TLS/phone?auth=token&verify=no&priority=max"` | stored, downgraded |
+| Apprise ntfys | `apprise ... "ntfys://$T@H:TLS/phone?auth=token&verify=no&priority=max"` (`H:TLS` is a TLS terminator in front of the compat port; the relay has no TLS of its own) | stored, downgraded |
 | ntfy CLI | `docker run --rm --network host binwiederhier/ntfy publish --token $T --title Backup --priority high http://H:8080/compat/ntfy/phone "Nightly backup finished"` | stored |
 | ntfy CLI, root, Basic | `... publish -u earshot:$T http://H:8082/phone "Dryer done"` | stored |
 | ntfy CLI, audio file | `... publish --token $T --file /work/ding.wav http://H:8080/compat/ntfy/phone` | stored as `.wav`, bytes identical |
@@ -241,5 +272,7 @@ route is built from the documented HTTP shape, not recorded from Tasker).
 | `401` with a Pushover client | `token` is not the relay token or `EARSHOT_RELAY_COMPAT_PUSHOVER_TOKEN`. |
 | Apprise `ntfy://` gets `401` | It posts to the root: use the compat port, not a path. |
 | `413` / `400` on a long message | Over the 4000 UTF-16 code unit cap; shorten it. The relay never cuts text. |
-| `400 delay_unsupported` | The producer set an ntfy delay; there is no scheduler. |
-| `X-Earshot-Downgraded: alarm` | The producer asked for top priority; see [Priorities and the alarm channel](#priorities-and-the-alarm-channel). |
+| `400` "Earshot cannot schedule a message (delay/at/in)" (ntfy code `40000`) | The producer set an ntfy delay; there is no scheduler. |
+| `X-Earshot-Downgraded: alarm` | The producer asked for top priority and it was stored as a normal item: the alarm switch is off, or the alarm rate limit is used up. See [Priorities and the alarm channel](#priorities-and-the-alarm-channel). |
+| `X-Earshot-Promoted: alarm` | The producer's top priority was stored on the alarm channel. |
+| `404` on the `Location` URL | You followed it on the compat port. Read receipts on the main port. |

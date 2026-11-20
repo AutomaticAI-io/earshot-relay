@@ -15,8 +15,13 @@ Settings, Notifications, Setup Notification, type **Ntfy**:
 | Authentication Method | Access Token |
 | Access Token | the relay token (`EARSHOT_RELAY_TOKEN`) |
 
+Kuma cannot send Earshot's `X-Earshot-*` headers or `earshot_*` query parameters, so only the server-wide
+`EARSHOT_RELAY_NORMALIZE=basic` applies to its messages (no tag, coalesce or cooldown). Alarm sends are limited
+(`EARSHOT_RELAY_ALARM_RATE_LIMIT`, 6 an hour): a flapping monitor's seventh DOWN in the hour is stored as a normal
+item with `X-Earshot-Downgraded: alarm`, not refused. Give Kuma `EARSHOT_RELAY_COMPAT_TOKEN`, not the relay token.
+
 Test result: the stored text is `phone [Uptime-Kuma]. Earshot Testing` (title, then message). Kuma's DOWN priority is 5, which is a top priority: without `EARSHOT_RELAY_COMPAT_ALARM=1` it is
-delivered normally with `X-Earshot-Downgraded: alarm`. **With** the alarm switch on, every DOWN plays the loud alarm
+stored as a normal item with `X-Earshot-Downgraded: alarm`. **With** the alarm switch on, every DOWN plays the loud alarm
 channel (a siren; not an emergency service, and Total-silence Do Not Disturb can still block it). Lower the priority
 in the provider if that is not what you want. Kuma's `tags` are ignored.
 

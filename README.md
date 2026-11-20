@@ -63,7 +63,7 @@ Retrying a send? Pass an `Idempotency-Key` header (CLI: `--idempotency-key`): th
 
 | | |
 | --- | --- |
-| `POST /v1/messages` | Text (`{"text": ...}`) or an audio file (multipart). Returns 202 once the object is in the bucket. Optional `Idempotency-Key` header. |
+| `POST /v1/messages` | Text (`{"text": ...}`) or an audio file (multipart). Returns 202 once the object is stored in the bucket, or held (`status: coalescing`) when sent with `coalesce_s`. Optional `Idempotency-Key` header. |
 | `GET /v1/messages/{id}` | The receipt: `stored`, `detected`, `started`, `finished`, `skipped`, `failed`, `missed` or `unconfirmed`, with a timeline. `?wait=30` long-polls. |
 | `GET /v1/messages`, `GET /v1/status` | Recent messages; relay, bucket and device state. |
 | `POST /v1/doctor` | Checks configuration and the bucket write. |
@@ -104,7 +104,7 @@ apprise -b "Server rebooted" "gotify://127.0.0.1:8080/compat/gotify/$EARSHOT_API
 ```
 
 These sends share the native rate limits, `Idempotency-Key` handling, bucket path and receipts, and a success reply
-means stored, not played. A producer's top priority (ntfy `5`, Gotify `8` and up, Pushover `2`) is delivered normally
+means stored, not played. A producer's top priority (ntfy `5`, Gotify `8` and up, Pushover `2`) is stored as a normal item
 with `X-Earshot-Downgraded: alarm` unless you also set `EARSHOT_RELAY_COMPAT_ALARM=1` and list `alarm`. Unsupported
 fields are ignored and named in `X-Earshot-Ignored`. Tested with real clients (curl, Apprise, the ntfy and gotify
 CLIs, Uptime Kuma, a Go Pushover library); Pushover and Join clients that hard-code the vendor URL cannot be
@@ -122,12 +122,12 @@ A receipt records what the phone did (device playback). It is **not** proof that
 - The relay needs only `s3:PutObject` on the channel prefixes. It never reads your bucket and never holds the phone's read key ([docs/permissions.md](docs/permissions.md)).
 - The default channel list is `phone` only. The loud `alarm` channel cannot be sent to unless you list it in `EARSHOT_RELAY_CHANNELS`, the MCP `alarm` tool exists only then, and `alarm` can never be the default channel.
 - What `alarm` does on the phone: a siren, then the message on the alarm stream at high volume, ahead of normal items. It plays during a phone call (unless the app's **Alarms can interrupt calls** is off) and the other party may hear it. Do Not Disturb set to "Total silence", an Android refusal, a stopped service, a powered-off phone, battery restrictions or no network can still silence it. It is **not** an emergency or life-safety service.
-- Message text is not stored in the relay's database and is not logged. Tokens are never logged. Secrets can be supplied as files (`EARSHOT_RELAY_TOKEN_FILE`, ...).
+- Message text is not stored in the relay's database and is not logged, with one exception: text held for `coalesce_s` sits in SQLite until its window closes, then is deleted ([docs/hygiene.md](docs/hygiene.md)). Tokens are never logged. Secrets can be supplied as files (`EARSHOT_RELAY_TOKEN_FILE`, ...).
 - Bind to localhost (the compose file does) and put a tunnel or an HTTPS reverse proxy in front. Do not expose the plain-HTTP port to the internet.
 - The beacon route has its own rate limit (`EARSHOT_RELAY_BEACON_RATE_LIMIT`, 600 per minute) and accepts at most 16 devices per message, so a leaked beacon URL can forge receipts but cannot flood the relay.
 - Messages sit in your bucket as plain objects. Anyone who can read the bucket can read them.
 - Rate limits (60 per minute overall, 6 per hour for the alarm channel) are in memory and per process.
-- Compat routes ([docs/compat.md](docs/compat.md)) are off by default and take the same relay token. They never reach `alarm` unless you set `EARSHOT_RELAY_COMPAT_ALARM=1`. If you open `EARSHOT_RELAY_COMPAT_PORT`, publish it only where the producers are.
+- Compat routes ([docs/compat.md](docs/compat.md)) are off by default and take the relay token, or a send-only `EARSHOT_RELAY_COMPAT_TOKEN` that opens nothing but those routes (prefer it: a URL token lands in proxy logs). They never reach `alarm` unless you set `EARSHOT_RELAY_COMPAT_ALARM=1`. If you open `EARSHOT_RELAY_COMPAT_PORT`, publish it only where the producers are.
 
 ## What it is not
 

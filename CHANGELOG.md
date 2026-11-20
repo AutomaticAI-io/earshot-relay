@@ -32,6 +32,25 @@ Producer compatibility and hygiene for every sender (HTTP, MCP, CLI and the comp
 - MCP `say` and CLI `say` take `normalize`, `tag`, `coalesce_s` and `cooldown_s`; `GET /v1/status` reports the TTS
   provider, hygiene settings and watchdog state; `earshot-relay doctor` checks the watchdog.
 
+### Fixed (review round 2)
+
+- Normalizer: an inline ```` ```x``` ```` or a stray triple backtick no longer deletes the rest of the message; only a
+  line-start fence with a closing line becomes "code". `__init__`-style names keep their underscores. A zero-width
+  joiner between letters (Indic scripts) is kept; it is removed only inside emoji sequences.
+- Compat: a top-priority send over the alarm rate limit is stored as a normal item (`X-Earshot-Downgraded: alarm`)
+  instead of a `429`. `X-Earshot-Promoted: alarm` says when it reached the alarm channel.
+- A coalesced message whose write fails every retry reads `write_failed` (was a 404), is counted in
+  `hygiene.coalescing_failed` and raises a watchdog notice (`incident_kind: write_failed`). Schema v4 adds
+  `failed_pending` (no message text).
+- ElevenLabs: a per-request voice of `.` or `..` can no longer rewrite the request path.
+- Docs: coalesced text is the one exception to "no message text in the database"; compat wording says "stored", not
+  "delivered"; which producers can carry hygiene options (Apprise `ntfy://` and Uptime Kuma cannot); receipts are read on
+  the main port; URL tokens land in proxy logs; the Docker and TLS notes for the compat port.
+
+### Added (review round 2)
+
+- `EARSHOT_RELAY_COMPAT_TOKEN`: a send-only token for every compat route, valid nowhere else.
+
 ### Changed
 
 - The message index gained `tag`, `normalized` and `truncated` columns and the `pending`, `idem_aliases` and `meta`

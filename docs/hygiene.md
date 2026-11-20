@@ -16,10 +16,14 @@ trace. The normalizer fixes the **text** before it is stored. It never touches a
 
 What `basic` does:
 
-- Removes emoji, pictographs, flags, skin tones and the joiners that glue them. Plain symbols that read fine aloud
+- Removes emoji, pictographs, flags, skin tones and the zero-width joiners inside emoji sequences (a joiner between
+  letters, as in Malayalam or Devanagari, stays). Plain symbols that read fine aloud
   (the copyright and trade-mark signs, arrows, math) stay.
 - Removes markdown: bold, italic, strikethrough, headings, block quotes, rules, list markers, table pipes, inline
-  code (the code text stays) and links (the link text stays). A fenced code block becomes the word "code".
+  code (the code text stays) and links (the link text stays). A fenced code block (a line that starts with three or
+  more backticks or tildes, up to a closing line) becomes the word "code". Inline triple backticks mid-line are inline
+  code, and a fence that never closes is left alone: the rest of the message is never swallowed. Python-style
+  names such as `__init__` and `__post_init__` keep their underscores.
   Headings, list items and table rows each end in a period, so the voice pauses between them.
 - Replaces every bare URL with the word "link" (a sentence-ending period stays).
 - Collapses all whitespace, including line breaks, to single spaces.
@@ -36,8 +40,10 @@ in the message index and on the receipt. The text itself is still never kept.
 curl -fsS -X POST http://127.0.0.1:8080/v1/messages -H "Authorization: Bearer $EARSHOT_API_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"text": "**Deploy done** :tada: see https://ci.example.com/run/8812/very/long/path", "normalize": true}'
-# spoken: "Deploy done see link"   response: "normalized": true
+# spoken: "Deploy done :tada: see link"   response: "normalized": true
 ```
+
+Emoji shortcodes such as `:tada:` are plain text, not emoji characters, so they are not removed.
 
 ## Coalesce and cooldown by tag
 
@@ -74,8 +80,11 @@ holds the text before writing and writes once. The consequences are all delibera
 - The window delays delivery by up to `coalesce_s`. Do not coalesce anything urgent (an `alarm` message you
   tagged would wait out its window too).
 - One send is counted against the rate limit per window, when it opens. Updates merged into an open window are free.
-- A write that fails is retried after 10, 30 and 60 seconds, then dropped with a log line (`coalesce_dropped`); the
-  receipt for that id is then a 404. Nothing is retried forever.
+- A write that fails is retried after 10, 30 and 60 seconds, then given up on (log line `coalesce_dropped`). The
+  sender was told `202`, so the loss is made visible: the text is deleted, but the id's receipt reads
+  `write_failed` (nothing is stored; send it again), `GET /v1/status` counts it in `hygiene.coalescing_failed`, and a
+  configured watchdog sends one notice (`earshot.watchdog.write_failed`). The record is pruned with the other index rows
+  after `EARSHOT_RELAY_RETENTION_DAYS`. Nothing is retried forever.
 - `Idempotency-Key` works across merges: a retried request replays the same `202`.
 - Coalescing is for text. The audio upload has no such fields; on the compat routes, hygiene options sent with an
   audio file are ignored and listed in `X-Earshot-Ignored`.
@@ -114,6 +123,8 @@ one notice. The app sends no heartbeat, so **an idle dead phone raises nothing**
 silent. A notice means "no device reported on this message in time", not "the phone is off" (it may be offline, not
 listening, or the beacon URL may be wrong).
 
+- **A held message that was never written** (see coalescing above) is its own incident: one notice, then closed. A
+  playback beacon from another message does not clear it, because that message will not play.
 - **One notice per incident.** The incident closes when any playback beacon arrives from any device (a late, parked
   beacon counts); more undetected sends meanwhile do not notify again.
 - **Cooldown delays, it does not mute.** A new incident inside `WATCHDOG_COOLDOWN_S` of the last notice waits it out
@@ -131,4 +142,4 @@ listening, or the beacon URL may be wrong).
 
 `GET /v1/status` has a `watchdog` object: `enabled`, `after_s`, `cooldown_s`, `format`, `target_host`, `state`
 (`idle`, `incident` or `notified`), `incident_since`, `incident_message`, `last_notice_at`, `last_notice_ok`,
-`last_error`, `notices_sent` and a `note` repeating what it does not claim. `earshot-relay doctor` also checks it.
+`last_error`, `notices_sent`, `incident_kind` (`silent` or `write_failed`) and a `note` repeating what it does not claim. `earshot-relay doctor` also checks it.

@@ -17,9 +17,14 @@ apprise -t "Laundry" -b "washer done" "ntfy://earshot:$EARSHOT_API_TOKEN@relay-h
 apprise -b "washer done" "ntfys://$EARSHOT_API_TOKEN@relay.example.com/phone?auth=token"
 ```
 
+Apprise `ntfy://` cannot carry `X-Earshot-*` headers or an `earshot_*` query string, so only the server-wide
+`EARSHOT_RELAY_NORMALIZE=basic` applies (see [compat](../docs/compat.md#normalizer-tags-and-coalescing-on-these-routes)).
+For a plain Docker run, publish the compat port with `-p 127.0.0.1:8082:8082`; `ntfys://` needs a TLS terminator in
+front of it. Use `EARSHOT_RELAY_COMPAT_TOKEN` as the password so the producer holds a send-only credential.
+
 `phone` is a channel name (or a key of `EARSHOT_RELAY_COMPAT_NTFY_TOPICS`). Apprise sends an `X-Icon` header by
-default; the relay ignores it and names it in `X-Earshot-Ignored`. `priority=max` is a top priority: it is delivered
-normally with `X-Earshot-Downgraded: alarm` unless `EARSHOT_RELAY_COMPAT_ALARM=1`.
+default; the relay ignores it and names it in `X-Earshot-Ignored`. `priority=max` is a top priority: it is stored as
+a normal item with `X-Earshot-Downgraded: alarm` unless `EARSHOT_RELAY_COMPAT_ALARM=1`.
 
 ## gotify://: works with or without a path prefix
 
