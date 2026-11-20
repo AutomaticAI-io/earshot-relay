@@ -259,7 +259,7 @@ def cmd_status(args) -> int:
           f"{s['bucket']['last_write_ok_at'] or 'never'}")
     print(f"channels   {', '.join(s['channels'])} (default {s.get('default_channel', s['channels'][0])})")
     print(f"speech     default {s['speech']['default']}; server TTS "
-          f"{'configured' if s['speech']['server_configured'] else 'not configured'}")
+          f"{'configured (' + str(s['speech'].get('provider')) + ')' if s['speech']['server_configured'] else 'not configured'}")
     if not r["configured"]:
         print("receipts   off (set EARSHOT_RELAY_BEACON_TOKEN)")
     else:

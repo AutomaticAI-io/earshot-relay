@@ -1943,6 +1943,15 @@ components:
         server_configured:
           type: boolean
           title: Server Configured
+        provider:
+          anyOf:
+          - type: string
+            enum:
+            - openai
+            - elevenlabs
+          - type: 'null'
+          title: Provider
+          description: The TTS provider, when server speech is configured
       type: object
       required:
       - default

@@ -330,7 +330,7 @@ def test_status(client, auth):
     assert s["relay"]["version"] == __version__
     assert s["bucket"]["name"] == BUCKET and s["bucket"]["last_write_ok_at"] is None
     assert s["channels"] == ["phone"]
-    assert s["speech"] == {"default": "device", "server_configured": False}
+    assert s["speech"] == {"default": "device", "server_configured": False, "provider": None}
     assert s["receipts"]["configured"] is True
     assert s["receipts"]["beacon_url"] == f"https://relay.example.com/v1/beacons/{BEACON_TOKEN}"
     assert "not proof" in s["receipts"]["note"]

@@ -694,7 +694,8 @@ class Relay:
             "bucket": {"endpoint_host": s.endpoint_host, "name": s.bucket, "last_write_ok_at": last_write},
             "channels": list(s.channels),
             "default_channel": s.default_channel,
-            "speech": {"default": s.default_speech, "server_configured": self.tts is not None},
+            "speech": {"default": s.default_speech, "server_configured": self.tts is not None,
+                       "provider": self.tts.settings.provider if self.tts else None},
             "receipts": {
                 "configured": s.beacon_token is not None,
                 "beacon_url": self.beacon_url(),

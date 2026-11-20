@@ -183,6 +183,7 @@ class StatusBucket(BaseModel):
 class StatusSpeech(BaseModel):
     default: Literal["device", "server"]
     server_configured: bool
+    provider: Literal["openai", "elevenlabs"] | None = Field(default=None, description="The TTS provider, when server speech is configured")
 
 
 class StatusDevice(BaseModel):
