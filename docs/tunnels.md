@@ -7,7 +7,15 @@ Sending needs nothing special: your scripts talk to the relay, the relay talks t
 
 If you only send from the same machine or LAN and do not need receipts, skip this page.
 
-**Expose as little as you can.** Set `EARSHOT_RELAY_BEACON_PORT=8081` to serve only the beacon endpoint and `/healthz` on a second port, and point the phone's tunnel at that port. The API and MCP stay on the main port, on localhost.
+**Expose as little as you can.** Set `EARSHOT_RELAY_BEACON_PORT=8081` to serve only the beacon endpoint and `/healthz` on a second port, and point the phone's tunnel at that port. The API and MCP stay on the main port, on localhost. Once the beacon port is set, the main port no longer answers beacons, so the second port must be reachable from the host:
+
+```sh
+# docker run: publish both ports on loopback
+docker run -d --name earshot-relay --restart unless-stopped --env-file .env \
+  -p 127.0.0.1:8080:8080 -p 127.0.0.1:8081:8081 -v earshot-relay-data:/data earshot-relay:local
+```
+
+With compose, uncomment the `127.0.0.1:8081:8081` line in `compose.yaml`. If the tunnel points at a port that is not published, beacons fail without an error on the relay and every receipt stays `stored`, then `unconfirmed`.
 
 ## Tailscale (private to your tailnet)
 

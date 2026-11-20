@@ -6,7 +6,8 @@ set -euo pipefail
 URL="${EARSHOT_API_URL:-http://127.0.0.1:8080}"
 TEXT="${1:-Hello from earshot relay}"
 
-# Text -> the phone reads it out loud (202 Accepted once the object is in the bucket).
+# Text -> stored as a .say; if the Earshot app is listening, the phone should speak it within seconds.
+# 202 Accepted means the object is in the bucket, not that it played: the receipt below says what the phone did.
 payload=$(jq -n --arg text "$TEXT" '{text: $text}')
 resp=$(curl -fsS -X POST "$URL/v1/messages" \
   -H "Authorization: Bearer $EARSHOT_API_TOKEN" \

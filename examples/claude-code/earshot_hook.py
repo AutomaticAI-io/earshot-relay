@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Claude Code hook: speak a short line on your phone through earshot-relay. Standard library only.
 
-  Notification -> "Claude Code needs attention in <project>"
+  Notification -> "Claude Code needs your permission in <project>" (permission_prompt), "... is waiting for you ..."
+                  (idle_prompt) or "... has a question ..." (elicitation_dialog). Other notification types (a login
+                  that succeeded, a finished subagent, quota notices) stay silent.
   Stop         -> the first sentence or two of the assistant's last message (about 300 characters at most)
 
 WARNING: the Stop hook sends a slice of what the agent wrote to your bucket. Use a private bucket and a
@@ -92,10 +94,21 @@ def project_name(payload: dict) -> str:
     return os.path.basename((payload.get("cwd") or "").rstrip("/")) or "your project"
 
 
+NOTIFICATION_LINES = {
+    "permission_prompt": "Claude Code needs your permission in {project}.",
+    "idle_prompt": "Claude Code is waiting for you in {project}.",
+    "elicitation_dialog": "Claude Code has a question in {project}.",
+}
+
+
 def build_line(payload: dict) -> str | None:
     event = payload.get("hook_event_name")
     if event == "Notification":
-        return f"Claude Code needs attention in {project_name(payload)}."
+        kind = payload.get("notification_type")
+        if kind is None:  # an older Claude Code that does not say which kind
+            return f"Claude Code needs attention in {project_name(payload)}."
+        template = NOTIFICATION_LINES.get(kind)
+        return template.format(project=project_name(payload)) if template else None
     if event == "Stop":
         if payload.get("stop_hook_active"):
             return None  # a Stop hook already kept the agent going; do not speak twice

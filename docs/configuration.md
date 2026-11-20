@@ -15,13 +15,13 @@ All settings are environment variables. Every secret also accepts a `_FILE` vari
 
 | Variable | Default | Notes |
 | --- | --- | --- |
-| `EARSHOT_RELAY_TOKEN` | required | Bearer token for callers. 32 or more printable characters. `earshot-relay token` makes one. |
+| `EARSHOT_RELAY_TOKEN` | required | Bearer token for callers. 32 or more printable characters. `earshot-relay token` makes one. A value still holding an `.env.example` placeholder (`replace...`) is refused, for every secret. |
 | `EARSHOT_RELAY_HOST` / `EARSHOT_RELAY_PORT` | `127.0.0.1` / `8080` | The container image sets host `0.0.0.0`; publish it on loopback only. |
 | `EARSHOT_RELAY_DATA_DIR` | `~/.local/share/earshot-relay` (`/data` in the image) | Holds the SQLite index (message ids and receipts; no message text). |
 | `EARSHOT_RELAY_CHANNELS` | `phone` | Comma-separated channels the relay may send to. `alarm` is loud and is sendable only if listed here. |
-| `EARSHOT_RELAY_DEFAULT_CHANNEL` | first channel | Must be in the list. |
+| `EARSHOT_RELAY_DEFAULT_CHANNEL` | `phone` if listed, else the first non-alarm channel | Must be in the list, and can never be `alarm`: every send without a channel (CLI `say`, MCP `say`, hooks) uses it. |
 | `EARSHOT_RELAY_RATE_LIMIT` | `60/min` | Overall send limit, or `off`. |
-| `EARSHOT_RELAY_ALARM_RATE_LIMIT` | `6/hour` | Applies to the `alarm` channel, or `off`. |
+| `EARSHOT_RELAY_ALARM_RATE_LIMIT` | `6/hour` | Applies to the `alarm` channel, or `off`. A send whose TTS or PutObject fails does not count. |
 | `EARSHOT_RELAY_MAX_AUDIO_BYTES` | `26214400` | Largest accepted audio upload (25 MiB). |
 | `EARSHOT_RELAY_RETENTION_DAYS` | `7` | Index rows older than this are pruned daily. Bucket objects are never touched. |
 
@@ -33,14 +33,15 @@ All settings are environment variables. Every secret also accepts a `_FILE` vari
 | `EARSHOT_RELAY_PUBLIC_URL` | unset | `https://` base the phone can reach. Used only to print the beacon URL in `status`. |
 | `EARSHOT_RELAY_BEACON_PORT` | unset | Serve only the beacon endpoint on a second port, so a tunnel can expose just that. Needs a beacon token. |
 | `EARSHOT_RELAY_RECEIPT_WAIT_MIN` | `60` | After this many minutes without a beacon, a message becomes `unconfirmed`. |
+| `EARSHOT_RELAY_BEACON_RATE_LIMIT` | `600/min` | Beacons accepted per window before `429` (the phone retries), or `off`. |
 
 ## Server-side speech (optional)
 
 | Variable | Default | Notes |
 | --- | --- | --- |
-| `EARSHOT_RELAY_TTS_URL` | unset | Base URL of an OpenAI-compatible API (the relay calls `<url>/audio/speech`). |
+| `EARSHOT_RELAY_TTS_URL` | unset | Base URL of an OpenAI-compatible API (the relay calls `<url>/audio/speech`). No credentials in the URL; use the API key variable. |
 | `EARSHOT_RELAY_TTS_MODEL` | required with the URL | |
-| `EARSHOT_RELAY_TTS_VOICE` | unset | Default voice; a request can override it. |
+| `EARSHOT_RELAY_TTS_VOICE` | required with the URL | Default voice (the OpenAI speech API requires one); a request can override it. |
 | `EARSHOT_RELAY_TTS_API_KEY` | unset | Sent as a bearer token to the TTS server. |
 | `EARSHOT_RELAY_TTS_FORMAT` | `mp3` | `mp3` or `wav`. |
 | `EARSHOT_RELAY_TTS_TIMEOUT_S` | `60` | |

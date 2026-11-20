@@ -25,10 +25,11 @@ rest_command:
 Use it from an automation:
 
 ```yaml
-action:
-  - service: rest_command.earshot_say
+actions:
+  - action: rest_command.earshot_say
     data:
       message: "The garage door has been open for ten minutes."
 ```
 
-`tojson` quotes the message safely. A `202` response means the message is in the bucket.
+`tojson` quotes the message safely. A `202` response means the message is stored in the bucket, not that the phone
+has played it yet.

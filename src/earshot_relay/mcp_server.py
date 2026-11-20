@@ -20,7 +20,7 @@ from .beacons import receipt_is_final
 
 INSTRUCTIONS = (
     "Earshot reads text aloud on the user's Android phone: the relay stores a message in the user's own bucket and the "
-    "Earshot app plays it. Keep spoken text short and plain: one or two sentences, no markdown, code, URLs or long "
+    "Earshot app, when it is listening, plays it. A successful send means stored, not heard. Keep spoken text short and plain: one or two sentences, no markdown, code, URLs or long "
     "lists. Never put secrets, passwords, tokens or private data in spoken text: it is stored in the bucket and spoken "
     "out loud. Use alarm (when present) only for urgency the user asked for. " + RECEIPT_WORDING
 )

@@ -7,7 +7,7 @@ If you want a better voice, point the relay at any server that implements the Op
 ```sh
 EARSHOT_RELAY_TTS_URL=https://tts.example.com/v1
 EARSHOT_RELAY_TTS_MODEL=your-model
-EARSHOT_RELAY_TTS_VOICE=your-voice        # optional default
+EARSHOT_RELAY_TTS_VOICE=your-voice        # required: the default voice (the OpenAI API requires one)
 EARSHOT_RELAY_TTS_API_KEY=...             # optional bearer token for the TTS server
 EARSHOT_RELAY_TTS_FORMAT=mp3              # mp3 or wav
 EARSHOT_RELAY_DEFAULT_SPEECH=device       # or server, to make server speech the default

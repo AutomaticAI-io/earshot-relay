@@ -5,7 +5,7 @@ The relay only writes. It never lists, reads or deletes objects (a test asserts 
 Keep **two separate keys** for one bucket:
 
 - **Writer** (this relay): `s3:PutObject` on the channel prefixes.
-- **Phone** (the Earshot app): list and read on the same prefixes. See the app's own bucket guide.
+- **Phone** (the Earshot app): list and read on the same prefixes. See the [Earshot buyer guide](https://store.automaticai.io/earshot/guide/).
 
 Writer policy intent (adapt the syntax to your provider; `BUCKET` is a placeholder):
 

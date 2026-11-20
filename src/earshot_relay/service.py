@@ -547,6 +547,9 @@ class Relay:
                       "use https://<your public host> + receipts.beacon_path")
         else:
             check("receipts", False, "EARSHOT_RELAY_BEACON_TOKEN is unset: messages send, but no receipts")
+        if s.beacon_port:
+            check("beacon_port", True, f"beacons are served only on port {s.beacon_port}, not on {s.port}: publish it "
+                  f"too (docker: -p 127.0.0.1:{s.beacon_port}:{s.beacon_port}) and point the tunnel at it")
         if self.tts is not None:
             leadin = self.tts.settings.leadin_ms
             ff = shutil.which("ffmpeg") is not None

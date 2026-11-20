@@ -21,7 +21,7 @@ claude mcp add earshot \
   -- earshot-relay mcp
 ```
 
-`earshot-relay mcp` needs the package installed (`pip install .`, or `uvx --from . earshot-relay mcp` from a checkout).
+`earshot-relay mcp` must be on the PATH of the process that starts it. Install it once with `uv tool install /absolute/path/to/earshot-relay` (or `pip install /absolute/path/to/earshot-relay`). Claude Code starts a stdio server from the project you are working in, not from the relay checkout, so a relative form such as `uvx --from . earshot-relay mcp` fails there; `uvx --from /absolute/path/to/earshot-relay earshot-relay mcp` works if you prefer not to install.
 
 Other MCP clients use the same two shapes: a URL plus an `Authorization` header, or a command plus environment variables.
 
@@ -29,11 +29,13 @@ Other MCP clients use the same two shapes: a URL plus an `Authorization` header,
 
 | Tool | Purpose |
 | --- | --- |
-| `say(text, channel?, speech?, voice?)` | Speak a short message on the phone. Refuses the `alarm` channel. |
-| `alarm(text)` | LOUD. Exists only when `alarm` is in `EARSHOT_RELAY_CHANNELS`. Speaks on the alarm channel, which may interrupt a phone call; the other party may hear it. |
-| `receipt(id="latest", wait_seconds=0)` | What the phone did with a message. Describes device playback, not that a person heard it. |
+| `say(text, channel?, speech?, voice?)` | Store a short message for the phone to speak. A success means stored, not played. Refuses the `alarm` channel (and the default channel can never be `alarm`). |
+| `alarm(text)` | LOUD. Exists only when `alarm` is in `EARSHOT_RELAY_CHANNELS`. See the caveat below. |
+| `receipt(id="latest", wait_seconds=0)` | What the phone did with a message, plus `final` (whether waiting longer could still change it). Describes device playback, not that a person heard it. |
 | `recent(limit=10, channel?)` | Recent messages with their status. |
-| `status()` | Channels, speech settings, limits, devices. Never returns the beacon URL (it contains a secret). |
+| `status()` | Relay version, channels, default channel, speech settings, last beacon and devices. Never returns the beacon URL (it contains a secret). |
+
+**The alarm caveat.** The `alarm` tool's description gives the model the same caveat: the app plays a siren, then the message on the phone's alarm stream at high volume. It usually gets through Do Not Disturb (not "Total silence") and plays during a phone call, where the other party may hear it, unless the app's **Alarms can interrupt calls** is off. Total-silence Do Not Disturb, an Android refusal, a stopped service, a powered-off phone, battery restrictions or no network can still silence it. It is not an emergency or life-safety service, and the tool tells the model never to promise the user it will wake them.
 
 Tools return structured results; a failure is an MCP tool error whose text starts with the relay's error code (`rate_limited`, `channel_not_allowed`, ...).
 

@@ -84,6 +84,25 @@ def test_hook_notification_says_needs_attention(live_relay, s3_admin):
     assert message_text(s3_admin, sent(live_relay)[0]) == "Claude Code needs attention in shop."
 
 
+@pytest.mark.parametrize("kind, line", [
+    ("permission_prompt", "Claude Code needs your permission in shop."),
+    ("idle_prompt", "Claude Code is waiting for you in shop."),
+    ("elicitation_dialog", "Claude Code has a question in shop."),
+])
+def test_hook_notification_types_that_need_you(live_relay, s3_admin, kind, line):
+    payload = {"hook_event_name": "Notification", "cwd": "/work/shop", "message": "m", "notification_type": kind}
+    assert run(HOOK, [], json.dumps(payload), live_relay).returncode == 0
+    assert message_text(s3_admin, sent(live_relay)[0]) == line
+
+
+@pytest.mark.parametrize("kind", ["auth_success", "elicitation_complete", "agent_completed", "quota_auto_resume_fired"])
+def test_hook_notification_types_that_do_not_need_you_stay_silent(live_relay, kind):
+    before = sent(live_relay)
+    payload = {"hook_event_name": "Notification", "cwd": "/work/shop", "message": "ok", "notification_type": kind}
+    assert run(HOOK, [], json.dumps(payload), live_relay).returncode == 0
+    assert sent(live_relay) == before
+
+
 def test_hook_stop_speaks_a_short_gist(live_relay, s3_admin):
     msg = "All tests pass now. I also tidied the imports.\n\n" + "More detail. " * 50
     p = run(HOOK, [], json.dumps({"hook_event_name": "Stop", "stop_hook_active": False, "last_assistant_message": msg}), live_relay)
@@ -117,6 +136,7 @@ def test_hook_always_exits_zero(live_relay, stdin, token, url_override):
 
 def test_hook_settings_json_is_valid_and_async():
     cfg = json.loads((EX / "claude-code" / "settings.hooks.json").read_text())
+    assert set(cfg["hooks"]["Notification"][0]["matcher"].split("|")) == set(hook.NOTIFICATION_LINES)
     for event in ("Notification", "Stop"):
         h = cfg["hooks"][event][0]["hooks"][0]
         assert h["type"] == "command" and h["async"] is True and h["timeout"] <= 10 and "earshot_hook.py" in h["command"]

@@ -1,6 +1,6 @@
 # API
 
-The machine-readable contract is [`openapi.yaml`](../openapi.yaml) (generated from the app and checked by a test). Everything except `GET /healthz` and `POST /v1/beacons/{token}` needs `Authorization: Bearer <EARSHOT_RELAY_TOKEN>`. `/openapi.json` is served too, behind the same token.
+The machine-readable contract is [`openapi.yaml`](../openapi.yaml) (generated from the app and checked by a test). Everything except `GET /healthz` and `POST /v1/beacons/{token}` needs `Authorization: Bearer <EARSHOT_RELAY_TOKEN>` (the word `Bearer` is case-insensitive). `/openapi.json` is served too, behind the same token.
 
 ## POST /v1/messages
 
@@ -34,6 +34,8 @@ Success is `202`:
 
 `202` means the object is in the bucket (`stored`), not that the phone has played it. Object keys are always random (`<channel>/<32 hex>.<ext>`), never derived from the text, and the message id is the same hex.
 
+**Retries.** Send an `Idempotency-Key` header (1 to 255 printable ASCII characters) to make a send safe to retry. The same key within 24 hours returns the original `202` body, with `Idempotent-Replayed: true`, writes nothing and does not count toward the rate limit. Concurrent requests with one key wait for the first and get its answer. The relay stores only a SHA-256 hash of the key. The first request's body wins: a reused key with a different body still returns the original message. A send that fails (for example `502`) does not use up its key.
+
 ## GET /v1/messages/{id}
 
 `id` is a message id or `latest`. `?wait=N` (0 to 60 seconds) holds the request until the status is final. See [receipts](receipts.md) for the fields and statuses.
@@ -52,7 +54,7 @@ Checks configuration and writes one inert `<default-channel>/relay-doctor-<times
 
 ## POST /v1/beacons/{beacon_token}
 
-For the phone, not for you. Unauthenticated apart from the token in the path (404 on a wrong token). Body at most 4096 bytes. See [receipts](receipts.md).
+For the phone, not for you. Unauthenticated apart from the token in the path (404 on a wrong token). Body at most 4096 bytes. `429` over `EARSHOT_RELAY_BEACON_RATE_LIMIT`. See [receipts](receipts.md).
 
 ## GET /healthz
 
@@ -74,8 +76,8 @@ Every error has the same shape:
 | 404 | `not_found` |
 | 413 | `too_large` |
 | 415 | `unsupported_media_type` |
-| 422 | `empty_text`, `text_too_long`, `invalid_text`, `invalid_field`, `unknown_field`, `invalid_channel`, `invalid_speech`, `invalid_voice`, `tts_not_configured`, `empty_file`, `missing_file` |
-| 429 | `rate_limited` (with `Retry-After`) |
+| 422 | `empty_text`, `text_too_long`, `invalid_text`, `invalid_field` (including a bad `Idempotency-Key`), `unknown_field`, `invalid_channel` (including an empty `channel`), `invalid_speech`, `invalid_voice`, `tts_not_configured`, `empty_file`, `missing_file` |
+| 429 | `rate_limited` (with `Retry-After`); sends and beacons have separate limits, and a failed send is not counted |
 | 502 | `storage_error` (the message carries a hint such as AccessDenied or NoSuchBucket), `tts_failed` |
 | 504 | `tts_timeout` |
 

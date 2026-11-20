@@ -29,19 +29,23 @@ The token is part of the URL, so it lives in the phone's settings and in your pr
 | `finished` | Playback finished. If the person skipped it, the status is `skipped` instead. |
 | `skipped` | The phone reported `finished` with the error `skipped`. |
 | `failed` | The phone tried and could not play it (`error` says why). |
-| `missed` | The message was already too old when the phone could play it (the app's freshness limit, 30 minutes by default), so it was not played. |
+| `missed` | The phone did not play it: it went stale (older than the app's freshness limit, 30 minutes by default, for example after being held for a call), audio was unavailable, or the bucket changed. The hop's `error` says which. |
 | `unconfirmed` | No beacon arrived within `EARSHOT_RELAY_RECEIPT_WAIT_MIN` minutes. A late beacon still corrects it. |
 
 With several phones, the status is the furthest any device got. If devices end in different final states, the order of preference is `finished`, `skipped`, `failed`, `missed`. `devices[]` shows each phone.
 
+`?wait=N` (and `earshot-relay receipt --wait`) stops early only when waiting longer cannot change the answer: at once on `finished`, and on `skipped`, `failed` or `missed` only when every device that has reported is in a final state. With two phones, one can report `missed` while the other is still playing; the wait keeps going, and a moment later the message reads `finished`. The CLI exits 3 only for a final not-played status; a status that could still change at the deadline exits 4.
+
 ## Receipt fields
 
-`GET /v1/messages/{id}` returns `id`, `type`, `speech`, `channel`, `key`, `created_at`, `status`, `status_at`, `object_last_modified`, `devices`, `hint` and `hops`. Each hop has `phase`, `device`, `app_version`, `at` (the phone's clock), `at_server` (corrected to the relay's clock), `since_upload_ms`, `clock_skew_ms` and, when present, `error`.
+`GET /v1/messages/{id}` returns `id`, `type`, `speech`, `channel`, `key`, `created_at`, `status`, `status_at`, `object_last_modified`, `devices`, `hint` and `hops`. Each hop has `phase`, `device`, `at` (the phone's clock), `at_server` (moved onto the S3 server clock: the bucket's clock, the same one `LastModified` uses), `received_at` (the relay's clock when the beacon arrived), `clock_skew_ms`, `since_upload_ms` and `error` (null unless the phone sent one). The app version is on each entry of `devices[]`, not on hops.
 
-Clock skew: the app sends `clock_skew_ms` (phone clock minus server clock) when it knows it, and the relay subtracts it. `since_upload_ms` is the time from the object's `LastModified` (as the phone saw it) to that hop. Treat it as a rough figure.
+Clock skew: the app sends `clock_skew_ms` (phone clock minus the S3 server clock, from the listing's `Date` header) when it knows it, and the relay computes `at_server = at - clock_skew_ms`. `since_upload_ms` is the time from the object's `LastModified` (as the phone saw it) to that hop, both on the server clock. Treat it as a rough figure.
 
 Heartbeat beacons update device state in `GET /v1/status` and are never hops. Replayed or duplicate beacons are ignored. Beacons parked on a phone that was offline arrive later and still flip `unconfirmed` to the real status.
 
 ## The beacon wire format
 
 `POST /v1/beacons/<token>` with JSON, at most 4096 bytes: `channel`, `key`, `phase` (`detected`, `started`, `finished`, `failed`, `missed`, `heartbeat`), `at`, `last_modified`, `device`, `app_version`, and optionally `clock_skew_ms` and `error`. A valid beacon returns `200` with an empty body; a malformed one returns `400`. The relay ignores fields it does not know. A beacon whose key it never sent is stored but belongs to no message.
+
+Limits, so a leaked beacon URL can forge receipts but not flood the relay: timestamps must fall between 2000 and 2100, `device` and `app_version` may not contain control characters, one key accepts beacons from at most 16 devices (a 17th is `400`), and over `EARSHOT_RELAY_BEACON_RATE_LIMIT` (default 600 per minute) the answer is `429` with `Retry-After`, which the phone keeps and retries. `GET /v1/status` lists the 20 most recent devices.
