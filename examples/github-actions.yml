@@ -1,0 +1,24 @@
+# Status: untested. This workflow has not been run; it was written from the API contract.
+# GitHub Actions step: tell your phone when a job finishes or fails.
+# Needs a relay the runner can reach (a tunnel hostname). Store the URL and token as repository secrets.
+# Note: this sends the text below to your bucket. Keep it short and free of secrets.
+name: notify-phone
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+jobs:
+  speak:
+    runs-on: ubuntu-latest   # public repos only; on a private repo use your self-hosted runner labels
+    steps:
+      - name: Say it on the phone
+        env:
+          EARSHOT_API_URL: ${{ secrets.EARSHOT_API_URL }}
+          EARSHOT_API_TOKEN: ${{ secrets.EARSHOT_API_TOKEN }}
+          RESULT: ${{ github.event.workflow_run.conclusion }}
+          REPO: ${{ github.repository }}
+        run: |
+          curl -fsS -X POST "$EARSHOT_API_URL/v1/messages" \
+            -H "Authorization: Bearer $EARSHOT_API_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"text\": \"CI ${RESULT} for ${REPO##*/}\"}"
