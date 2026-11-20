@@ -1,0 +1,56 @@
+{
+ "client": "Uptime Kuma 1.23 ntfy provider (Test), server URL = /compat/ntfy",
+ "versions": {
+  "curl": "curl 8.14.1 (x86_64-pc-linux-gnu) libcurl/8.14.1 OpenSSL/3.5.3 zlib/1.3.1 brotli",
+  "apprise": "Apprise v2.3.0",
+  "ntfy": "ntfy 2.22.0 (5ad2431), runtime go1.25.9, built at 2026-04-21T15:06:46Z",
+  "go": "go version go1.26.7 linux/amd64",
+  "gotify-cli": "Version:   2.4.0"
+ },
+ "listener": "main",
+ "request": {
+  "method": "POST",
+  "path": "/compat/ntfy",
+  "query": "",
+  "headers": [
+   [
+    "accept",
+    "application/json, text/plain, */*"
+   ],
+   [
+    "content-type",
+    "application/json"
+   ],
+   [
+    "authorization",
+    "Bearer tttttttttttttttttttttttttttttttttttttttt"
+   ],
+   [
+    "user-agent",
+    "axios/0.28.1"
+   ]
+  ],
+  "body_b64": "eyJ0b3BpYyI6InBob25lIiwidGl0bGUiOiJwaG9uZSBbVXB0aW1lLUt1bWFdIiwibWVzc2FnZSI6IkVhcnNob3QgVGVzdGluZyIsInByaW9yaXR5Ijo1LCJ0YWdzIjpbInRlc3RfdHViZSJdfQ=="
+ },
+ "response_status": 200,
+ "response": {
+  "id": "msg_9d5d9a7fdc8b45e4a34b2e322c19c45f",
+  "time": 1795205836,
+  "expires": 1795249036,
+  "event": "message",
+  "topic": "phone",
+  "message": "Earshot Testing",
+  "title": "phone [Uptime-Kuma]",
+  "priority": 5,
+  "tags": [
+   "test_tube"
+  ]
+ },
+ "response_headers": {
+  "x-earshot-downgraded": "alarm",
+  "x-earshot-ignored": "tags"
+ },
+ "expect_channel": "phone",
+ "expect_text": "phone [Uptime-Kuma]. Earshot Testing",
+ "expect_audio_b64": null
+}

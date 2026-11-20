@@ -1,0 +1,56 @@
+{
+ "client": "apprise gotify:// with a path prefix (main listener)",
+ "versions": {
+  "curl": "curl 8.14.1 (x86_64-pc-linux-gnu) libcurl/8.14.1 OpenSSL/3.5.3 zlib/1.3.1 brotli",
+  "apprise": "Apprise v2.3.0",
+  "ntfy": "ntfy 2.22.0 (5ad2431), runtime go1.25.9, built at 2026-04-21T15:06:46Z",
+  "go": "go version go1.26.7 linux/amd64",
+  "gotify-cli": "Version:   2.4.0"
+ },
+ "listener": "main",
+ "request": {
+  "method": "POST",
+  "path": "/compat/gotify/message",
+  "query": "",
+  "headers": [
+   [
+    "user-agent",
+    "Apprise"
+   ],
+   [
+    "accept",
+    "*/*"
+   ],
+   [
+    "content-type",
+    "application/json"
+   ],
+   [
+    "x-gotify-key",
+    "tttttttttttttttttttttttttttttttttttttttt"
+   ]
+  ],
+  "body_b64": "eyJwcmlvcml0eSI6IDgsICJ0aXRsZSI6ICJCYWNrdXAiLCAibWVzc2FnZSI6ICJkb25lIn0="
+ },
+ "response_status": 200,
+ "response": {
+  "id": 10,
+  "appid": 1,
+  "message": "done",
+  "title": "Backup",
+  "priority": 8,
+  "date": "2026-11-20T20:17:14.553Z",
+  "extras": {
+   "earshot::message": {
+    "id": "msg_53d8cf86e4be421abdd7d0453dec77e7",
+    "receipt_url": "/v1/messages/msg_53d8cf86e4be421abdd7d0453dec77e7"
+   }
+  }
+ },
+ "response_headers": {
+  "x-earshot-downgraded": "alarm"
+ },
+ "expect_channel": "phone",
+ "expect_text": "Backup. done",
+ "expect_audio_b64": null
+}

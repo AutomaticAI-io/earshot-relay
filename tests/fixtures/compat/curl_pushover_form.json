@@ -1,0 +1,43 @@
+{
+ "client": "curl: Pushover form (--form-string, as Pushover's FAQ)",
+ "versions": {
+  "curl": "curl 8.14.1 (x86_64-pc-linux-gnu) libcurl/8.14.1 OpenSSL/3.5.3 zlib/1.3.1 brotli",
+  "apprise": "Apprise v2.3.0",
+  "ntfy": "ntfy 2.22.0 (5ad2431), runtime go1.25.9, built at 2026-04-21T15:06:46Z",
+  "go": "go version go1.26.7 linux/amd64",
+  "gotify-cli": "Version:   2.4.0"
+ },
+ "listener": "main",
+ "request": {
+  "method": "POST",
+  "path": "/compat/pushover/1/messages.json",
+  "query": "",
+  "headers": [
+   [
+    "user-agent",
+    "curl/8.14.1"
+   ],
+   [
+    "accept",
+    "*/*"
+   ],
+   [
+    "content-type",
+    "multipart/form-data; boundary=------------------------zJyhd9sOW0cO7GZpthDugm"
+   ]
+  ],
+  "body_b64": "LS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS16SnloZDlzT1cwY083R1pwdGhEdWdtDQpDb250ZW50LURpc3Bvc2l0aW9uOiBmb3JtLWRhdGE7IG5hbWU9InRva2VuIg0KDQp0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0DQotLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLXpKeWhkOXNPVzBjTzdHWnB0aER1Z20NCkNvbnRlbnQtRGlzcG9zaXRpb246IGZvcm0tZGF0YTsgbmFtZT0idXNlciINCg0KdXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1DQotLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLXpKeWhkOXNPVzBjTzdHWnB0aER1Z20NCkNvbnRlbnQtRGlzcG9zaXRpb246IGZvcm0tZGF0YTsgbmFtZT0ibWVzc2FnZSINCg0KRnJvbnQgZG9vciBvcGVuZWQNCi0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tekp5aGQ5c09XMGNPN0dacHRoRHVnbQ0KQ29udGVudC1EaXNwb3NpdGlvbjogZm9ybS1kYXRhOyBuYW1lPSJ0aXRsZSINCg0KU2VjdXJpdHkNCi0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tekp5aGQ5c09XMGNPN0dacHRoRHVnbQ0KQ29udGVudC1EaXNwb3NpdGlvbjogZm9ybS1kYXRhOyBuYW1lPSJwcmlvcml0eSINCg0KMg0KLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS16SnloZDlzT1cwY083R1pwdGhEdWdtDQpDb250ZW50LURpc3Bvc2l0aW9uOiBmb3JtLWRhdGE7IG5hbWU9InNvdW5kIg0KDQpzaXJlbg0KLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS16SnloZDlzT1cwY083R1pwdGhEdWdtLS0NCg=="
+ },
+ "response_status": 200,
+ "response": {
+  "status": 1,
+  "request": "msg_aa516534143d437a93a34fd4e9006252"
+ },
+ "response_headers": {
+  "x-earshot-downgraded": "alarm",
+  "x-earshot-ignored": "sound"
+ },
+ "expect_channel": "phone",
+ "expect_text": "Security. Front door opened",
+ "expect_audio_b64": null
+}

@@ -82,6 +82,11 @@ class SlidingWindow:
         except ValueError:
             pass  # already slid out of the window
 
+    def remaining(self) -> int:
+        """Sends still allowed in the current window (what Pushover clients read from X-Limit-App-Remaining)."""
+        self.retry_after()  # slides the window
+        return max(0, self.limit.count - len(self.events))
+
 
 class RateLimiter:
     def __init__(self, settings: Settings, clock=time.monotonic):
@@ -524,6 +529,20 @@ class Relay:
                 "receipt_wait_min": s.receipt_wait_min,
                 "retention_days": s.retention_days,
             },
+            "compat": self.compat_status(),
+        }
+
+    def compat_status(self) -> dict:
+        from .compat import PREFIXES
+
+        s = self.settings
+        return {
+            "enabled": list(s.compat),
+            "paths": {p: PREFIXES[p] for p in s.compat},
+            "port": s.compat_port,
+            "alarm": s.compat_alarm_allowed,
+            "ntfy_topics": s.ntfy_topics if "ntfy" in s.compat else {},
+            "pushover_token": s.compat_pushover_token is not None,
         }
 
     async def doctor(self) -> dict:
@@ -547,6 +566,13 @@ class Relay:
                       "use https://<your public host> + receipts.beacon_path")
         else:
             check("receipts", False, "EARSHOT_RELAY_BEACON_TOKEN is unset: messages send, but no receipts")
+        if s.compat:
+            c = self.compat_status()
+            where = ", ".join(f"{p} at {c['paths'][p]}" for p in s.compat)
+            port = f"; also at the root of port {s.compat_port}" if s.compat_port else ""
+            alarm = ("top priority plays on the alarm channel" if c["alarm"]
+                     else "top priority plays as a normal item (X-Earshot-Downgraded: alarm)")
+            check("compat", True, f"{where}{port}; {alarm}")
         if s.beacon_port:
             check("beacon_port", True, f"beacons are served only on port {s.beacon_port}, not on {s.port}: publish it "
                   f"too (docker: -p 127.0.0.1:{s.beacon_port}:{s.beacon_port}) and point the tunnel at it")

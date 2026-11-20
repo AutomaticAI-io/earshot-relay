@@ -1,0 +1,36 @@
+{
+ "client": "gregdel/pushover (Go) with APIEndpoint overridden, 30-char token",
+ "versions": {
+  "curl": "curl 8.14.1 (x86_64-pc-linux-gnu) libcurl/8.14.1 OpenSSL/3.5.3 zlib/1.3.1 brotli",
+  "apprise": "Apprise v2.3.0",
+  "ntfy": "ntfy 2.22.0 (5ad2431), runtime go1.25.9, built at 2026-04-21T15:06:46Z",
+  "go": "go version go1.26.7 linux/amd64",
+  "gotify-cli": "Version:   2.4.0"
+ },
+ "listener": "main",
+ "request": {
+  "method": "POST",
+  "path": "/compat/pushover/1/messages.json",
+  "query": "",
+  "headers": [
+   [
+    "user-agent",
+    "Go-http-client/1.1"
+   ],
+   [
+    "content-type",
+    "application/x-www-form-urlencoded"
+   ]
+  ],
+  "body_b64": "bWVzc2FnZT1Gcm9udCtkb29yK29wZW5lZCZwcmlvcml0eT0wJnRpdGxlPVNlY3VyaXR5JnRva2VuPXBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcCZ1c2VyPXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dQ=="
+ },
+ "response_status": 200,
+ "response": {
+  "status": 1,
+  "request": "msg_bc9d9569edf84ef587d627e812dc81cc"
+ },
+ "response_headers": {},
+ "expect_channel": "phone",
+ "expect_text": "Security. Front door opened",
+ "expect_audio_b64": null
+}

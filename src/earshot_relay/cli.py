@@ -71,7 +71,7 @@ def setup_logging(level: int = logging.INFO) -> None:
 def cmd_serve(_args) -> int:
     import uvicorn
 
-    from .api import create_app, create_beacon_app
+    from .api import create_app, create_beacon_app, create_compat_app
     from .config import load_settings
     from .service import Relay
     from .storage import S3Writer
@@ -102,9 +102,13 @@ def cmd_serve(_args) -> int:
     servers = [_Server(config(create_app(relay), settings.port, "on"))]
     if settings.beacon_port:
         servers.append(_Server(config(create_beacon_app(relay), settings.beacon_port, "off")))
+    if settings.compat_port:
+        servers.append(_Server(config(create_compat_app(relay), settings.compat_port, "off")))
     log.info(json.dumps({
         "event": "start", "version": __version__, "listen": f"{settings.host}:{settings.port}",
         "beacon_listener": f"{settings.host}:{settings.beacon_port}" if settings.beacon_port else None,
+        "compat": list(settings.compat),
+        "compat_listener": f"{settings.host}:{settings.compat_port}" if settings.compat_port else None,
         "bucket_host": settings.endpoint_host, "channels": list(settings.channels),
         "receipts": settings.beacon_token is not None, "server_tts": settings.tts is not None,
     }))
@@ -152,8 +156,15 @@ def _print_sent(result: dict, args) -> None:
     print(json.dumps(result, indent=2) if args.json else result["id"])
 
 
-def cmd_token(_args) -> int:
-    print(secrets.token_urlsafe(32))
+PUSHOVER_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+
+
+def cmd_token(args) -> int:
+    if getattr(args, "pushover", False):
+        # 30 letters and digits: the shape Pushover clients check before they send (EARSHOT_RELAY_COMPAT_PUSHOVER_TOKEN)
+        print("".join(secrets.choice(PUSHOVER_ALPHABET) for _ in range(30)))
+    else:
+        print(secrets.token_urlsafe(32))
     return EXIT_OK
 
 
@@ -250,6 +261,11 @@ def cmd_status(args) -> int:
             skew = f", skew {d['clock_skew_ms']}ms" if d.get("clock_skew_ms") is not None else ""
             print(safe(f"           device {d['device']}  app {d['app_version']}  last {d['last_phase']} at "
                        f"{d['last_seen']}{skew}"))
+    c = s.get("compat") or {}
+    if c.get("enabled"):
+        port = f"; root of port {c['port']}" if c.get("port") else ""
+        where = ", ".join(f"{p} {c['paths'][p]}" for p in c["enabled"])
+        print(f"compat     {where}{port}; top priority -> {'alarm' if c.get('alarm') else 'normal (downgraded)'}")
     print(f"note       {RECEIPT_WORDING}")
     return EXIT_OK
 
@@ -300,7 +316,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub.required = True
 
     sub.add_parser("serve", help="run the relay service (the container entrypoint)").set_defaults(fn=cmd_serve)
-    sub.add_parser("token", help="print a random 32-byte URL-safe token").set_defaults(fn=cmd_token)
+    sp = sub.add_parser("token", help="print a random 32-byte URL-safe token")
+    sp.add_argument("--pushover", action="store_true",
+                    help="print 30 random letters and digits instead, for EARSHOT_RELAY_COMPAT_PUSHOVER_TOKEN")
+    sp.set_defaults(fn=cmd_token)
 
     def out_flags(sp):
         sp.add_argument("--json", action="store_true", help="print the full JSON response")

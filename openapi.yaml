@@ -439,6 +439,598 @@ paths:
               - app_version
               title: Beacon
               type: object
+  /compat/gotify/message:
+    post:
+      tags:
+      - compat
+      summary: 'Gotify: create a message (Apprise gotify://, gotify CLI, Uptime Kuma, Healthchecks)'
+      description: 'Gotify''s POST /message: JSON or form `{title, message, priority, extras}`; the token
+        in X-Gotify-Key, ?token= or Authorization: Bearer. Priority 8 and above is Gotify''s top band.
+        Answers Gotify''s message JSON with 200 (a numeric id, plus extras.earshot::message.id for the
+        receipt): stored, not played. Off unless EARSHOT_RELAY_COMPAT lists gotify.'
+      operationId: compat_gotify_create_message_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              properties:
+                message:
+                  type: string
+                title:
+                  type: string
+                priority:
+                  type: integer
+                extras:
+                  type: object
+              type: object
+              required:
+              - message
+        required: false
+      responses:
+        '200':
+          description: Stored in the bucket (the protocol's success body)
+          headers:
+            X-Earshot-Message-Id:
+              description: The relay message id (GET /v1/messages/{id} reads its receipt)
+              schema:
+                type: string
+            Location:
+              description: /v1/messages/{id}
+              schema:
+                type: string
+            X-Earshot-Ignored:
+              description: Comma-separated request fields Earshot did not honour (attachments, actions,
+                click, sound, markdown, ...)
+              schema:
+                type: string
+            X-Earshot-Downgraded:
+              description: '''alarm'' when the top priority was delivered as a normal item because EARSHOT_RELAY_COMPAT_ALARM
+                is off or alarm is not in EARSHOT_RELAY_CHANNELS'
+              schema:
+                type: string
+          content:
+            application/json:
+              schema: {}
+  /compat/pushover/1/messages.json:
+    post:
+      tags:
+      - compat
+      summary: 'Pushover: send a message (scripts and clients with a configurable API URL)'
+      description: 'Pushover''s POST /1/messages.json as a urlencoded form, multipart form or JSON: token
+        (the relay token or EARSHOT_RELAY_COMPAT_PUSHOVER_TOKEN), user (accepted, not checked), message,
+        title, priority (-2..2; 2 is the top). Answers `{"status": 1, "request": "<message id>"}` with
+        200 and X-Limit-App-* headers: stored, not played. Off unless EARSHOT_RELAY_COMPAT lists pushover.'
+      operationId: compat_pushover_messages_post
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              properties:
+                token:
+                  type: string
+                user:
+                  type: string
+                message:
+                  type: string
+                title:
+                  type: string
+                priority:
+                  type: integer
+                  maximum: 2.0
+                  minimum: -2.0
+              type: object
+              required:
+              - token
+              - message
+        required: false
+      responses:
+        '200':
+          description: Stored in the bucket (the protocol's success body)
+          headers:
+            X-Earshot-Message-Id:
+              description: The relay message id (GET /v1/messages/{id} reads its receipt)
+              schema:
+                type: string
+            Location:
+              description: /v1/messages/{id}
+              schema:
+                type: string
+            X-Earshot-Ignored:
+              description: Comma-separated request fields Earshot did not honour (attachments, actions,
+                click, sound, markdown, ...)
+              schema:
+                type: string
+            X-Earshot-Downgraded:
+              description: '''alarm'' when the top priority was delivered as a normal item because EARSHOT_RELAY_COMPAT_ALARM
+                is off or alarm is not in EARSHOT_RELAY_CHANNELS'
+              schema:
+                type: string
+          content:
+            application/json:
+              schema: {}
+  /compat/join/_ah/api/messaging/v1/sendPush:
+    get:
+      tags:
+      - compat
+      summary: 'Join: sendPush (Tasker HTTP Request, scripts)'
+      description: 'Join''s sendPush with query parameters, a form or JSON: apikey (the relay token),
+        text, title, say (spoken instead of title and text when present); deviceId and the rest are ignored
+        and named. Answers `{"success": true}` with 200: stored, not played. Off unless EARSHOT_RELAY_COMPAT
+        lists join.'
+      operationId: compat_join_send_push_get
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              properties:
+                apikey:
+                  type: string
+                text:
+                  type: string
+                title:
+                  type: string
+                say:
+                  type: string
+              type: object
+              required:
+              - apikey
+        required: false
+      responses:
+        '200':
+          description: Stored in the bucket (the protocol's success body)
+          headers:
+            X-Earshot-Message-Id:
+              description: The relay message id (GET /v1/messages/{id} reads its receipt)
+              schema:
+                type: string
+            Location:
+              description: /v1/messages/{id}
+              schema:
+                type: string
+            X-Earshot-Ignored:
+              description: Comma-separated request fields Earshot did not honour (attachments, actions,
+                click, sound, markdown, ...)
+              schema:
+                type: string
+            X-Earshot-Downgraded:
+              description: '''alarm'' when the top priority was delivered as a normal item because EARSHOT_RELAY_COMPAT_ALARM
+                is off or alarm is not in EARSHOT_RELAY_CHANNELS'
+              schema:
+                type: string
+          content:
+            application/json:
+              schema: {}
+    post:
+      tags:
+      - compat
+      summary: 'Join: sendPush (Tasker HTTP Request, scripts)'
+      description: 'Join''s sendPush with query parameters, a form or JSON: apikey (the relay token),
+        text, title, say (spoken instead of title and text when present); deviceId and the rest are ignored
+        and named. Answers `{"success": true}` with 200: stored, not played. Off unless EARSHOT_RELAY_COMPAT
+        lists join.'
+      operationId: compat_join_send_push_post
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              properties:
+                apikey:
+                  type: string
+                text:
+                  type: string
+                title:
+                  type: string
+                say:
+                  type: string
+              type: object
+              required:
+              - apikey
+        required: false
+      responses:
+        '200':
+          description: Stored in the bucket (the protocol's success body)
+          headers:
+            X-Earshot-Message-Id:
+              description: The relay message id (GET /v1/messages/{id} reads its receipt)
+              schema:
+                type: string
+            Location:
+              description: /v1/messages/{id}
+              schema:
+                type: string
+            X-Earshot-Ignored:
+              description: Comma-separated request fields Earshot did not honour (attachments, actions,
+                click, sound, markdown, ...)
+              schema:
+                type: string
+            X-Earshot-Downgraded:
+              description: '''alarm'' when the top priority was delivered as a normal item because EARSHOT_RELAY_COMPAT_ALARM
+                is off or alarm is not in EARSHOT_RELAY_CHANNELS'
+              schema:
+                type: string
+          content:
+            application/json:
+              schema: {}
+  /compat/ntfy:
+    put:
+      tags:
+      - compat
+      summary: 'ntfy: publish as JSON (Apprise ntfy://, Uptime Kuma, Healthchecks)'
+      description: 'ntfy''s JSON publish: `{"topic", "message", "title", "priority"}` POSTed to the server
+        base. The topic must be listed in EARSHOT_RELAY_COMPAT_NTFY_TOPICS (unknown topic: 404). Answers
+        ntfy''s message JSON with 200, which means stored in the bucket, not played. Off unless EARSHOT_RELAY_COMPAT
+        lists ntfy.'
+      operationId: compat_ntfy_publish_json_put
+      requestBody:
+        content:
+          application/json:
+            schema:
+              properties:
+                topic:
+                  type: string
+                message:
+                  type: string
+                title:
+                  type: string
+                priority:
+                  type: integer
+                  maximum: 5.0
+                  minimum: 1.0
+              type: object
+              required:
+              - topic
+        required: false
+      responses:
+        '200':
+          description: Stored in the bucket (the protocol's success body)
+          headers:
+            X-Earshot-Message-Id:
+              description: The relay message id (GET /v1/messages/{id} reads its receipt)
+              schema:
+                type: string
+            Location:
+              description: /v1/messages/{id}
+              schema:
+                type: string
+            X-Earshot-Ignored:
+              description: Comma-separated request fields Earshot did not honour (attachments, actions,
+                click, sound, markdown, ...)
+              schema:
+                type: string
+            X-Earshot-Downgraded:
+              description: '''alarm'' when the top priority was delivered as a normal item because EARSHOT_RELAY_COMPAT_ALARM
+                is off or alarm is not in EARSHOT_RELAY_CHANNELS'
+              schema:
+                type: string
+          content:
+            application/json:
+              schema: {}
+    post:
+      tags:
+      - compat
+      summary: 'ntfy: publish as JSON (Apprise ntfy://, Uptime Kuma, Healthchecks)'
+      description: 'ntfy''s JSON publish: `{"topic", "message", "title", "priority"}` POSTed to the server
+        base. The topic must be listed in EARSHOT_RELAY_COMPAT_NTFY_TOPICS (unknown topic: 404). Answers
+        ntfy''s message JSON with 200, which means stored in the bucket, not played. Off unless EARSHOT_RELAY_COMPAT
+        lists ntfy.'
+      operationId: compat_ntfy_publish_json_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              properties:
+                topic:
+                  type: string
+                message:
+                  type: string
+                title:
+                  type: string
+                priority:
+                  type: integer
+                  maximum: 5.0
+                  minimum: 1.0
+              type: object
+              required:
+              - topic
+        required: false
+      responses:
+        '200':
+          description: Stored in the bucket (the protocol's success body)
+          headers:
+            X-Earshot-Message-Id:
+              description: The relay message id (GET /v1/messages/{id} reads its receipt)
+              schema:
+                type: string
+            Location:
+              description: /v1/messages/{id}
+              schema:
+                type: string
+            X-Earshot-Ignored:
+              description: Comma-separated request fields Earshot did not honour (attachments, actions,
+                click, sound, markdown, ...)
+              schema:
+                type: string
+            X-Earshot-Downgraded:
+              description: '''alarm'' when the top priority was delivered as a normal item because EARSHOT_RELAY_COMPAT_ALARM
+                is off or alarm is not in EARSHOT_RELAY_CHANNELS'
+              schema:
+                type: string
+          content:
+            application/json:
+              schema: {}
+  /compat/ntfy/{topic}:
+    post:
+      tags:
+      - compat
+      summary: 'ntfy: publish to a topic (curl -d, the ntfy CLI)'
+      description: 'The body is the message; Title/X-Title/t, Priority/X-Priority/p (1-5, min/low/default/high/max/urgent)
+        and the other ntfy headers or query parameters as ntfy reads them. A body with a Filename ending
+        in an audio extension is sent as audio. Answers ntfy''s message JSON with 200: stored, not played.
+        Off unless EARSHOT_RELAY_COMPAT lists ntfy.'
+      operationId: compat_ntfy_publish_topic_post
+      parameters:
+      - name: topic
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Topic
+      responses:
+        '200':
+          description: Stored in the bucket (the protocol's success body)
+          content:
+            application/json:
+              schema: {}
+          headers:
+            X-Earshot-Message-Id:
+              description: The relay message id (GET /v1/messages/{id} reads its receipt)
+              schema:
+                type: string
+            Location:
+              description: /v1/messages/{id}
+              schema:
+                type: string
+            X-Earshot-Ignored:
+              description: Comma-separated request fields Earshot did not honour (attachments, actions,
+                click, sound, markdown, ...)
+              schema:
+                type: string
+            X-Earshot-Downgraded:
+              description: '''alarm'' when the top priority was delivered as a normal item because EARSHOT_RELAY_COMPAT_ALARM
+                is off or alarm is not in EARSHOT_RELAY_CHANNELS'
+              schema:
+                type: string
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      requestBody:
+        required: false
+        content:
+          text/plain:
+            schema:
+              type: string
+              description: The message
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+              description: Audio, with a Filename header
+    put:
+      tags:
+      - compat
+      summary: 'ntfy: publish to a topic (curl -d, the ntfy CLI)'
+      description: 'The body is the message; Title/X-Title/t, Priority/X-Priority/p (1-5, min/low/default/high/max/urgent)
+        and the other ntfy headers or query parameters as ntfy reads them. A body with a Filename ending
+        in an audio extension is sent as audio. Answers ntfy''s message JSON with 200: stored, not played.
+        Off unless EARSHOT_RELAY_COMPAT lists ntfy.'
+      operationId: compat_ntfy_publish_topic_put
+      parameters:
+      - name: topic
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Topic
+      responses:
+        '200':
+          description: Stored in the bucket (the protocol's success body)
+          content:
+            application/json:
+              schema: {}
+          headers:
+            X-Earshot-Message-Id:
+              description: The relay message id (GET /v1/messages/{id} reads its receipt)
+              schema:
+                type: string
+            Location:
+              description: /v1/messages/{id}
+              schema:
+                type: string
+            X-Earshot-Ignored:
+              description: Comma-separated request fields Earshot did not honour (attachments, actions,
+                click, sound, markdown, ...)
+              schema:
+                type: string
+            X-Earshot-Downgraded:
+              description: '''alarm'' when the top priority was delivered as a normal item because EARSHOT_RELAY_COMPAT_ALARM
+                is off or alarm is not in EARSHOT_RELAY_CHANNELS'
+              schema:
+                type: string
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      requestBody:
+        required: false
+        content:
+          text/plain:
+            schema:
+              type: string
+              description: The message
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+              description: Audio, with a Filename header
+  /compat/ntfy/{topic}/{action}:
+    get:
+      tags:
+      - compat
+      summary: 'ntfy: publish via /publish, /send or /trigger (GET webhooks)'
+      description: 'ntfy''s webhook form: `GET .../{topic}/publish?message=...&title=...&auth=...`. Off
+        unless EARSHOT_RELAY_COMPAT lists ntfy.'
+      operationId: compat_ntfy_publish_action_get
+      parameters:
+      - name: topic
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Topic
+      - name: action
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Action
+      responses:
+        '200':
+          description: Stored in the bucket (the protocol's success body)
+          content:
+            application/json:
+              schema: {}
+          headers:
+            X-Earshot-Message-Id:
+              description: The relay message id (GET /v1/messages/{id} reads its receipt)
+              schema:
+                type: string
+            Location:
+              description: /v1/messages/{id}
+              schema:
+                type: string
+            X-Earshot-Ignored:
+              description: Comma-separated request fields Earshot did not honour (attachments, actions,
+                click, sound, markdown, ...)
+              schema:
+                type: string
+            X-Earshot-Downgraded:
+              description: '''alarm'' when the top priority was delivered as a normal item because EARSHOT_RELAY_COMPAT_ALARM
+                is off or alarm is not in EARSHOT_RELAY_CHANNELS'
+              schema:
+                type: string
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+    post:
+      tags:
+      - compat
+      summary: 'ntfy: publish via /publish, /send or /trigger (GET webhooks)'
+      description: 'ntfy''s webhook form: `GET .../{topic}/publish?message=...&title=...&auth=...`. Off
+        unless EARSHOT_RELAY_COMPAT lists ntfy.'
+      operationId: compat_ntfy_publish_action_post
+      parameters:
+      - name: topic
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Topic
+      - name: action
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Action
+      responses:
+        '200':
+          description: Stored in the bucket (the protocol's success body)
+          content:
+            application/json:
+              schema: {}
+          headers:
+            X-Earshot-Message-Id:
+              description: The relay message id (GET /v1/messages/{id} reads its receipt)
+              schema:
+                type: string
+            Location:
+              description: /v1/messages/{id}
+              schema:
+                type: string
+            X-Earshot-Ignored:
+              description: Comma-separated request fields Earshot did not honour (attachments, actions,
+                click, sound, markdown, ...)
+              schema:
+                type: string
+            X-Earshot-Downgraded:
+              description: '''alarm'' when the top priority was delivered as a normal item because EARSHOT_RELAY_COMPAT_ALARM
+                is off or alarm is not in EARSHOT_RELAY_CHANNELS'
+              schema:
+                type: string
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+    put:
+      tags:
+      - compat
+      summary: 'ntfy: publish via /publish, /send or /trigger (GET webhooks)'
+      description: 'ntfy''s webhook form: `GET .../{topic}/publish?message=...&title=...&auth=...`. Off
+        unless EARSHOT_RELAY_COMPAT lists ntfy.'
+      operationId: compat_ntfy_publish_action_put
+      parameters:
+      - name: topic
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Topic
+      - name: action
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Action
+      responses:
+        '200':
+          description: Stored in the bucket (the protocol's success body)
+          content:
+            application/json:
+              schema: {}
+          headers:
+            X-Earshot-Message-Id:
+              description: The relay message id (GET /v1/messages/{id} reads its receipt)
+              schema:
+                type: string
+            Location:
+              description: /v1/messages/{id}
+              schema:
+                type: string
+            X-Earshot-Ignored:
+              description: Comma-separated request fields Earshot did not honour (attachments, actions,
+                click, sound, markdown, ...)
+              schema:
+                type: string
+            X-Earshot-Downgraded:
+              description: '''alarm'' when the top priority was delivered as a normal item because EARSHOT_RELAY_COMPAT_ALARM
+                is off or alarm is not in EARSHOT_RELAY_CHANNELS'
+              schema:
+                type: string
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
 components:
   schemas:
     DeviceStateModel:
@@ -891,6 +1483,56 @@ components:
       - name
       - last_write_ok_at
       title: StatusBucket
+    StatusCompat:
+      properties:
+        enabled:
+          items:
+            type: string
+            enum:
+            - ntfy
+            - gotify
+            - pushover
+            - join
+          type: array
+          title: Enabled
+          description: 'Producer-compat protocols switched on with EARSHOT_RELAY_COMPAT (empty: off)'
+        paths:
+          additionalProperties:
+            type: string
+          type: object
+          title: Paths
+          description: Base path of each enabled protocol on this listener
+        port:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Port
+          description: 'EARSHOT_RELAY_COMPAT_PORT: the same protocols at the root of a second listener,
+            for clients that take only a host (Apprise ntfy://)'
+        alarm:
+          type: boolean
+          title: Alarm
+          description: A sender's top priority reaches the alarm channel (EARSHOT_RELAY_COMPAT_ALARM=1
+            and alarm in EARSHOT_RELAY_CHANNELS); otherwise it plays as a normal item
+        ntfy_topics:
+          additionalProperties:
+            type: string
+          type: object
+          title: Ntfy Topics
+          description: ntfy topic -> channel; any other topic is 404
+        pushover_token:
+          type: boolean
+          title: Pushover Token
+          description: EARSHOT_RELAY_COMPAT_PUSHOVER_TOKEN is set (the value is never shown)
+      type: object
+      required:
+      - enabled
+      - paths
+      - port
+      - alarm
+      - ntfy_topics
+      - pushover_token
+      title: StatusCompat
     StatusDevice:
       properties:
         device:
@@ -1024,6 +1666,8 @@ components:
           $ref: '#/components/schemas/StatusReceipts'
         limits:
           $ref: '#/components/schemas/StatusLimits'
+        compat:
+          $ref: '#/components/schemas/StatusCompat'
       type: object
       required:
       - relay
@@ -1033,6 +1677,7 @@ components:
       - speech
       - receipts
       - limits
+      - compat
       title: StatusResponse
     StatusSpeech:
       properties:
@@ -1081,3 +1726,6 @@ tags:
   description: 'Messages and status: the portable part of the API.'
 - name: relay
   description: 'Relay-only: the phone''s beacon endpoint and doctor.'
+- name: compat
+  description: 'Producer-compat ingress: ntfy, Gotify, Pushover and Join request shapes, each off unless
+    EARSHOT_RELAY_COMPAT lists it. See docs/compat.md.'

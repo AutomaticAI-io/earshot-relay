@@ -1,0 +1,68 @@
+{
+ "client": "curl: ntfy headers Title/Priority/Tags, Basic (any user)",
+ "versions": {
+  "curl": "curl 8.14.1 (x86_64-pc-linux-gnu) libcurl/8.14.1 OpenSSL/3.5.3 zlib/1.3.1 brotli",
+  "apprise": "Apprise v2.3.0",
+  "ntfy": "ntfy 2.22.0 (5ad2431), runtime go1.25.9, built at 2026-04-21T15:06:46Z",
+  "go": "go version go1.26.7 linux/amd64",
+  "gotify-cli": "Version:   2.4.0"
+ },
+ "listener": "main",
+ "request": {
+  "method": "POST",
+  "path": "/compat/ntfy/phone",
+  "query": "",
+  "headers": [
+   [
+    "authorization",
+    "Basic ZWFyc2hvdDp0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0"
+   ],
+   [
+    "user-agent",
+    "curl/8.14.1"
+   ],
+   [
+    "accept",
+    "*/*"
+   ],
+   [
+    "title",
+    "Laundry"
+   ],
+   [
+    "priority",
+    "urgent"
+   ],
+   [
+    "tags",
+    "tada"
+   ],
+   [
+    "content-type",
+    "application/x-www-form-urlencoded"
+   ]
+  ],
+  "body_b64": "V2FzaGVyIGRvbmU="
+ },
+ "response_status": 200,
+ "response": {
+  "id": "msg_5b4fddca4a99480cb7a983f61c6c20f3",
+  "time": 1795205820,
+  "expires": 1795249020,
+  "event": "message",
+  "topic": "phone",
+  "message": "Washer done",
+  "title": "Laundry",
+  "priority": 5,
+  "tags": [
+   "tada"
+  ]
+ },
+ "response_headers": {
+  "x-earshot-downgraded": "alarm",
+  "x-earshot-ignored": "tags"
+ },
+ "expect_channel": "phone",
+ "expect_text": "Laundry. Washer done",
+ "expect_audio_b64": null
+}

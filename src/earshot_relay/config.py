@@ -26,7 +26,17 @@ BUCKET_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{1,254}$")
 # (`earshot-relay token`) never contains them, so a value that does was never filled in.
 PLACEHOLDER_RE = re.compile(r"replace|changeme|change-me|your-token|placeholder", re.IGNORECASE)
 SECRET_VARS = ("EARSHOT_RELAY_TOKEN", "EARSHOT_RELAY_BEACON_TOKEN", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
-               "EARSHOT_RELAY_TTS_API_KEY")
+               "EARSHOT_RELAY_TTS_API_KEY", "EARSHOT_RELAY_COMPAT_PUSHOVER_TOKEN")
+
+# Producer-compat ingress (compat.py): the push APIs a producer may already speak.
+COMPAT_PROTOCOLS = ("ntfy", "gotify", "pushover", "join")
+NTFY_TOPIC_RE = re.compile(r"^[-_A-Za-z0-9]{1,64}$")  # ntfy's own topic grammar
+# Pushover app tokens and user keys are 30 letters and digits, and client libraries check that before sending.
+PUSHOVER_TOKEN_RE = re.compile(r"^[A-Za-z0-9]{30}$")
+# The example token and user key printed in Pushover's API documentation: copied, never generated.
+PUSHOVER_DOC_EXAMPLES = ("azGDORePK8gMaC0QOYAMyEEuzJnyUi", "uQiRzpo4DXghDmr9QzzfQu27cmVRsG")
+# On the compat listener ntfy topics sit at the root, so these paths are not topics.
+RESERVED_ROOT_TOPICS = ("healthz", "v1", "compat", "mcp")
 
 
 class ConfigError(Exception):
@@ -126,6 +136,11 @@ class Settings:
     default_speech: str = "device"
     tts: TtsSettings | None = None
     allow_http_s3: bool = False
+    compat: tuple[str, ...] = ()
+    compat_alarm: bool = False
+    compat_port: int | None = None
+    compat_ntfy_topics: tuple[tuple[str, str], ...] = ()
+    compat_pushover_token: str | None = field(default=None, repr=False)
 
     @property
     def endpoint_host(self) -> str:
@@ -134,6 +149,15 @@ class Settings:
     @property
     def alarm_allowed(self) -> bool:
         return "alarm" in self.channels
+
+    @property
+    def ntfy_topics(self) -> dict[str, str]:
+        return dict(self.compat_ntfy_topics)
+
+    @property
+    def compat_alarm_allowed(self) -> bool:
+        """A compat sender's top priority may reach the alarm channel only when both switches are on."""
+        return self.compat_alarm and self.alarm_allowed
 
     @property
     def db_path(self) -> str:
@@ -288,6 +312,8 @@ def load_settings(environ: dict[str, str] | None = None, *, check_ffmpeg: bool =
     if default_speech == "server" and not tts_url:
         problems.append("EARSHOT_RELAY_DEFAULT_SPEECH=server needs EARSHOT_RELAY_TTS_URL")
 
+    compat = _compat_settings(e, take, problems, channels=channels, port=port, beacon_port=beacon_port)
+
     if problems:
         raise ConfigError("\n".join(dict.fromkeys(problems)))
     return Settings(
@@ -296,5 +322,77 @@ def load_settings(environ: dict[str, str] | None = None, *, check_ffmpeg: bool =
         public_url=public_url, data_dir=data_dir, host=host, port=port, beacon_port=beacon_port,
         retention_days=retention, receipt_wait_min=wait_min, max_audio_bytes=max_audio, rate_limit=rate,
         alarm_rate_limit=alarm_rate, beacon_rate_limit=beacon_rate, default_speech=default_speech, tts=tts,
-        allow_http_s3=allow_http,
+        allow_http_s3=allow_http, **compat,
     )
+
+
+def _compat_settings(e, take, problems: list[str], *, channels: list[str], port, beacon_port) -> dict:
+    """EARSHOT_RELAY_COMPAT and friends. Everything is off unless EARSHOT_RELAY_COMPAT names a protocol."""
+    raw = (take(env, "EARSHOT_RELAY_COMPAT", e) or "").strip().lower()
+    names = [n for n in re.split(r"[\s,;]+", raw) if n] if raw not in ("", "off", "none", "0") else []
+    if names == ["all"]:
+        names = list(COMPAT_PROTOCOLS)
+    enabled: list[str] = []
+    for n in names:
+        if n not in COMPAT_PROTOCOLS:
+            problems.append(f"EARSHOT_RELAY_COMPAT has an unknown protocol {n!r} (use any of: {', '.join(COMPAT_PROTOCOLS)}, or all)")
+        elif n not in enabled:
+            enabled.append(n)
+    alarm = _flag(take(env, "EARSHOT_RELAY_COMPAT_ALARM", e))
+    raw_port = take(env, "EARSHOT_RELAY_COMPAT_PORT", e)
+    compat_port = take(_int, "EARSHOT_RELAY_COMPAT_PORT", raw_port, 0, 1, 65535) if raw_port else None
+    raw_topics = take(env, "EARSHOT_RELAY_COMPAT_NTFY_TOPICS", e)
+    pushover_token = take(env, "EARSHOT_RELAY_COMPAT_PUSHOVER_TOKEN", e)
+
+    if not enabled:
+        for var, value in (("EARSHOT_RELAY_COMPAT_PORT", raw_port), ("EARSHOT_RELAY_COMPAT_ALARM", alarm),
+                           ("EARSHOT_RELAY_COMPAT_NTFY_TOPICS", raw_topics),
+                           ("EARSHOT_RELAY_COMPAT_PUSHOVER_TOKEN", pushover_token)):
+            if value:
+                problems.append(f"{var} is set but EARSHOT_RELAY_COMPAT names no protocol")
+        return {}
+    if compat_port is not None and compat_port in (port, beacon_port):
+        problems.append("EARSHOT_RELAY_COMPAT_PORT must differ from EARSHOT_RELAY_PORT and EARSHOT_RELAY_BEACON_PORT")
+    if alarm and "alarm" not in channels:
+        problems.append("EARSHOT_RELAY_COMPAT_ALARM=1 needs alarm in EARSHOT_RELAY_CHANNELS")
+
+    topics: dict[str, str] = {}
+    if "ntfy" in enabled:
+        if raw_topics:
+            for entry in re.split(r"[\s,;]+", raw_topics.strip()):
+                if not entry:
+                    continue
+                topic, _, chan = entry.partition("=")
+                topic, chan = topic.strip(), (chan.strip() or topic.strip())
+                if not NTFY_TOPIC_RE.fullmatch(topic):
+                    problems.append(f"EARSHOT_RELAY_COMPAT_NTFY_TOPICS has an invalid topic {topic!r} "
+                                    "(letters, digits, - and _, 1-64 chars, as ntfy allows)")
+                elif chan not in channels:
+                    problems.append(f"EARSHOT_RELAY_COMPAT_NTFY_TOPICS maps topic {topic!r} to {chan!r}, "
+                                    "which is not in EARSHOT_RELAY_CHANNELS")
+                elif chan == "alarm" and not alarm:
+                    problems.append(f"EARSHOT_RELAY_COMPAT_NTFY_TOPICS maps topic {topic!r} to alarm, which also "
+                                    "needs EARSHOT_RELAY_COMPAT_ALARM=1")
+                elif topic in topics and topics[topic] != chan:
+                    problems.append(f"EARSHOT_RELAY_COMPAT_NTFY_TOPICS maps topic {topic!r} twice")
+                else:
+                    topics[topic] = chan
+        else:  # default: every quiet channel is a topic of the same name; alarm never is
+            topics = {c: c for c in channels if c != "alarm"}
+        for topic in topics:
+            if compat_port is not None and (topic in RESERVED_ROOT_TOPICS or (topic == "message" and "gotify" in enabled)):
+                problems.append(f"ntfy topic {topic!r} collides with a path on EARSHOT_RELAY_COMPAT_PORT; rename it")
+    elif raw_topics:
+        problems.append("EARSHOT_RELAY_COMPAT_NTFY_TOPICS is set but EARSHOT_RELAY_COMPAT does not include ntfy")
+
+    if pushover_token:
+        if "pushover" not in enabled:
+            problems.append("EARSHOT_RELAY_COMPAT_PUSHOVER_TOKEN is set but EARSHOT_RELAY_COMPAT does not include pushover")
+        elif not PUSHOVER_TOKEN_RE.fullmatch(pushover_token):
+            problems.append("EARSHOT_RELAY_COMPAT_PUSHOVER_TOKEN must be exactly 30 letters and digits, the shape "
+                            "Pushover clients check (generate one with: earshot-relay token --pushover)")
+        elif pushover_token in PUSHOVER_DOC_EXAMPLES:
+            problems.append("EARSHOT_RELAY_COMPAT_PUSHOVER_TOKEN is the example from Pushover's documentation; "
+                            "generate one with: earshot-relay token --pushover")
+    return {"compat": tuple(enabled), "compat_alarm": alarm, "compat_port": compat_port,
+            "compat_ntfy_topics": tuple(topics.items()), "compat_pushover_token": pushover_token}

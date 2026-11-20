@@ -19,8 +19,11 @@ from starlette.datastructures import UploadFile
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from . import RECEIPT_WORDING, __version__
+from . import compat
 from .beacons import MAX_BODY_BYTES as BEACON_MAX_BYTES
 from .beacons import validate_beacon
+from .compat import read_capped
+from .config import COMPAT_PROTOCOLS
 from .keys import AUDIO_EXTENSIONS, ApiError, audio_extension
 from .service import Relay
 
@@ -186,6 +189,18 @@ class StatusLimits(BaseModel):
     retention_days: int
 
 
+class StatusCompat(BaseModel):
+    enabled: list[Literal["ntfy", "gotify", "pushover", "join"]] = Field(
+        description="Producer-compat protocols switched on with EARSHOT_RELAY_COMPAT (empty: off)")
+    paths: dict[str, str] = Field(description="Base path of each enabled protocol on this listener")
+    port: int | None = Field(description="EARSHOT_RELAY_COMPAT_PORT: the same protocols at the root of a second "
+                                         "listener, for clients that take only a host (Apprise ntfy://)")
+    alarm: bool = Field(description="A sender's top priority reaches the alarm channel (EARSHOT_RELAY_COMPAT_ALARM=1 "
+                                    "and alarm in EARSHOT_RELAY_CHANNELS); otherwise it plays as a normal item")
+    ntfy_topics: dict[str, str] = Field(description="ntfy topic -> channel; any other topic is 404")
+    pushover_token: bool = Field(description="EARSHOT_RELAY_COMPAT_PUSHOVER_TOKEN is set (the value is never shown)")
+
+
 class StatusResponse(BaseModel):
     relay: StatusRelay
     bucket: StatusBucket
@@ -194,6 +209,7 @@ class StatusResponse(BaseModel):
     speech: StatusSpeech
     receipts: StatusReceipts
     limits: StatusLimits
+    compat: StatusCompat
 
 
 class DoctorCheck(BaseModel):
@@ -256,9 +272,11 @@ class BearerAuth:
     low-code tools that send `bearer <token>` work. The token itself is compared in constant time.
     """
 
-    def __init__(self, app, token: str):
+    def __init__(self, app, token: str, exempt_prefixes: tuple[str, ...] = ()):
         self.app = app
         self.token = token.encode()
+        # Compat routes (compat.py) check their protocol's own token placement (Basic password, X-Gotify-Key, ...).
+        self.exempt_prefixes = exempt_prefixes
 
     def _accepts(self, header: bytes) -> bool:
         parts = header.strip().split(None, 1)
@@ -272,6 +290,8 @@ class BearerAuth:
             return await self.app(scope, receive, send)
         path = scope.get("path", "")
         if path == "/healthz" or BEACON_PATH_RE.match(path):
+            return await self.app(scope, receive, send)
+        if any(path == p or path.startswith(p + "/") for p in self.exempt_prefixes):
             return await self.app(scope, receive, send)
         presented = b""
         for name, value in scope.get("headers", []):
@@ -316,9 +336,13 @@ class AccessLog:
                                                        else "<unmatched>")
             entry = {"event": "http", "method": scope.get("method"), "path": path, "status": status["code"],
                      "ms": round((time.perf_counter() - start) * 1000, 1)}
-            message_id = scope.get("state", {}).get("message_id")
-            if message_id:
-                entry["message_id"] = message_id
+            state = scope.get("state", {})
+            if state.get("message_id"):
+                entry["message_id"] = state["message_id"]
+            # Compat sends: the protocol, the field names Earshot ignored and a priority downgrade (never values).
+            for name in ("compat", "ignored", "downgraded"):
+                if state.get(name):
+                    entry[name] = state[name]
             log.info(json.dumps(entry, separators=(",", ":")))
 
 
@@ -327,19 +351,6 @@ class AccessLog:
 
 class _BodyTooLarge(Exception):
     pass
-
-
-async def read_capped(request: Request, cap: int) -> bytes:
-    declared = request.headers.get("content-length")
-    if declared and declared.isdigit() and int(declared) > cap:
-        raise ApiError(413, "too_large", f"request body is over {cap} bytes")
-    chunks, total = [], 0
-    async for chunk in request.stream():
-        total += len(chunk)
-        if total > cap:
-            raise ApiError(413, "too_large", f"request body is over {cap} bytes")
-        chunks.append(chunk)
-    return b"".join(chunks)
 
 
 def _install_error_handlers(app: FastAPI) -> None:
@@ -603,6 +614,9 @@ def _base_app(title: str, lifespan=None, with_openapi: bool = True) -> FastAPI:
         openapi_tags=[
             {"name": "core", "description": "Messages and status: the portable part of the API."},
             {"name": "relay", "description": "Relay-only: the phone's beacon endpoint and doctor."},
+            {"name": "compat", "description": "Producer-compat ingress: ntfy, Gotify, Pushover and Join request "
+                                              "shapes, each off unless EARSHOT_RELAY_COMPAT lists it. See "
+                                              "docs/compat.md."},
         ],
         docs_url=None,
         redoc_url=None,
@@ -611,12 +625,16 @@ def _base_app(title: str, lifespan=None, with_openapi: bool = True) -> FastAPI:
     )
 
 
-def create_app(relay: Relay, *, serve_beacons: bool | None = None, mcp: bool = True) -> FastAPI:
-    """The main app. `serve_beacons` defaults to True unless a separate beacon port is configured."""
+def create_app(relay: Relay, *, serve_beacons: bool | None = None, mcp: bool = True,
+               compat_protocols: tuple[str, ...] | None = None) -> FastAPI:
+    """The main app. `serve_beacons` defaults to True unless a separate beacon port is configured; compat routes
+    default to the protocols EARSHOT_RELAY_COMPAT lists."""
     from .mcp_server import build_http_mcp
 
     if serve_beacons is None:
         serve_beacons = relay.settings.beacon_port is None
+    if compat_protocols is None:
+        compat_protocols = relay.settings.compat
     mcp_server = None
 
     @asynccontextmanager
@@ -636,10 +654,11 @@ def create_app(relay: Relay, *, serve_beacons: bool | None = None, mcp: bool = T
     _api_routes(app, relay)
     if serve_beacons:
         _beacon_route(app, relay)
+    compat.install(app, relay, compat_protocols, root=False)
     if mcp:
         mcp_server, mcp_routes = build_http_mcp(app, relay)
         app.router.routes.extend(mcp_routes)
-    app.add_middleware(BearerAuth, token=relay.settings.token)
+    app.add_middleware(BearerAuth, token=relay.settings.token, exempt_prefixes=compat.exempt_prefixes(compat_protocols))
     app.add_middleware(AccessLog)
     app.state.relay = relay
     return app
@@ -655,8 +674,20 @@ def create_beacon_app(relay: Relay) -> FastAPI:
     return app
 
 
+def create_compat_app(relay: Relay) -> FastAPI:
+    """The compat listener (EARSHOT_RELAY_COMPAT_PORT): the enabled protocols at the server root, as their clients
+    expect (Apprise ntfy:// posts to the root and reads every path segment as a topic), plus /healthz. Each route
+    checks its protocol's own token placement; nothing else is served here."""
+    app = _base_app("earshot-relay compat", with_openapi=False)
+    _install_error_handlers(app)
+    _health_route(app)
+    compat.install(app, relay, relay.settings.compat, root=True)
+    app.add_middleware(AccessLog)
+    return app
+
+
 def openapi_document(relay: Relay) -> dict:
-    return create_app(relay, serve_beacons=True, mcp=False).openapi()
+    return create_app(relay, serve_beacons=True, mcp=False, compat_protocols=COMPAT_PROTOCOLS).openapi()
 
 
 async def _prune_loop(relay: Relay) -> None:
