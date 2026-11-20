@@ -74,11 +74,11 @@ holds the text before writing and writes once. The consequences are all delibera
 - The window delays delivery by up to `coalesce_window_s`. Do not coalesce anything urgent (an `alarm` message you
   tagged would wait out its window too).
 - One send is counted against the rate limit per window, when it opens. Updates merged into an open window are free.
-- A write that fails is retried after 10, 30 and 60 seconds, then dropped with a log line (`coalesce_dropped`); the
-  receipt for that id is then a 404. Nothing is retried forever.
+- A failed write retries after 10, 30 and 60 seconds. The accepted id must retain a sanitized terminal
+  `write_failed` receipt after the owner workflow is integrated; do not treat this branch alone as that proof.
 - `Idempotency-Key` works across merges: a retried request replays the same `202`.
-- Coalescing is for text. The audio upload has no such fields; on the compat routes, hygiene options sent with an
-  audio file are ignored and listed in `X-Earshot-Ignored`.
+- Coalescing is for text. The native audio upload has no hygiene fields; compat attachments are unsupported
+  (ignored and named when separate message text is present, rejected otherwise).
 
 ntfy's sequence id and Gotify's extras are **not** mapped: they promise to replace a delivered notification, which
 this relay cannot do, and mapping them would claim more than it does. Producers on those routes use the

@@ -151,7 +151,7 @@ def check_tag(tag: object) -> str | None:
 
 
 def check_seconds(name: str, value: object, maximum: float) -> float | None:
-    """coalesce_s and cooldown_s: a number of seconds above 0 and at most `maximum`. null and 0 mean off."""
+    """coalesce_window_s and cooldown_s: positive seconds up to `maximum`; null and 0 mean off."""
     if value is None:
         return None
     if isinstance(value, bool) or not isinstance(value, (int, float)):

@@ -236,6 +236,8 @@ class StatusHygiene(BaseModel):
 
 class StatusWatchdog(BaseModel):
     enabled: bool = Field(description="EARSHOT_RELAY_WATCHDOG_S is set (it needs receipts and a notice URL)")
+    reason: Literal["beacon_token_missing", "not_configured"] | None = Field(
+        None, description="Why the watchdog is disabled, when enabled=false")
     after_s: int | None = None
     cooldown_s: int | None = None
     format: Literal["json", "text"] | None = Field(None, description="Body of the notice: JSON webhook, or plain "
@@ -760,10 +762,11 @@ async def _flush_loop(relay: Relay) -> None:
     """Flush at the earliest persisted due time, or wake when a send changes the queue."""
     while True:
         try:
+            version = relay.signal.version
             await relay.flush_due()
             due = relay.store.next_pending_at()
             seconds = max(0.01, ((parse_rfc3339(due) or relay.clock()) - relay.clock()).total_seconds()) if due else None
-            await relay.signal.wait(seconds)
+            await relay.signal.wait(seconds, since=version)
         except Exception as exc:  # noqa: BLE001 - flushing must never take the relay down
             log.warning(json.dumps({"event": "flush_failed", "error": type(exc).__name__}))
             await relay.signal.wait(30)

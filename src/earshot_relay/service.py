@@ -282,6 +282,7 @@ class BeaconSignal:
     def __init__(self) -> None:
         self._event: asyncio.Event | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
+        self.version = 0
 
     def _current(self) -> asyncio.Event:
         loop = asyncio.get_running_loop()
@@ -290,6 +291,7 @@ class BeaconSignal:
         return self._event
 
     def notify(self) -> None:
+        self.version += 1
         event, loop = self._event, self._loop
         self._event = None
         if event is None or loop is None or loop.is_closed():
@@ -303,12 +305,15 @@ class BeaconSignal:
         else:
             loop.call_soon_threadsafe(event.set)
 
-    async def wait(self, timeout: float | None = None) -> None:
+    async def wait(self, timeout: float | None = None, *, since: int | None = None) -> None:
+        event = self._current()
+        if since is not None and since != self.version:
+            return
         if timeout is None:
-            await self._current().wait()
+            await event.wait()
             return
         try:
-            await asyncio.wait_for(self._current().wait(), timeout)
+            await asyncio.wait_for(event.wait(), timeout)
         except TimeoutError:
             pass
 
@@ -498,7 +503,7 @@ class Relay:
             if pending and coalesce:
                 # Inside an open window: the latest text replaces what will be written. Same id, same window.
                 self.store.update_pending(pending.id, text=text, speech=mode, voice=voice, normalized=normalized,
-                                          truncated=truncated)
+                                          truncated=truncated, compat=compat)
                 if idem_key:
                     self.store.add_alias(idem_key, pending.id, iso_ms(now))
                 return self._accepted_pending(self.store.get_pending_by_id(pending.id) or pending)
@@ -745,7 +750,8 @@ class Relay:
             "compat": self.compat_status(),
             "hygiene": {"normalize": s.normalize, "max_words": s.max_words,
                         "coalescing_pending": self.store.pending_count()},
-            "watchdog": self.watchdog.status() if self.watchdog else {"enabled": False},
+            "watchdog": self.watchdog.status() if self.watchdog else {
+                "enabled": False, "reason": "beacon_token_missing" if s.watchdog_s and not s.beacon_token else "not_configured"},
         }
 
     def compat_status(self) -> dict:

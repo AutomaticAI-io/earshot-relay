@@ -353,7 +353,7 @@ def test_alarm_requires_both_switches(compat_relay, flag, allowlist, expect_alar
         assert r.status_code == 200
         assert bool(r.headers.get("x-earshot-downgraded")) is not expect_alarm
         msg = relay.store.get_message(r.headers["x-earshot-message-id"])
-        assert msg.channel == ("alarm" if expect_alarm else "phone")
+        assert msg is not None and msg.channel == ("alarm" if expect_alarm else "phone")
 
 
 def test_top_priority_goes_to_alarm_only_when_both_switches_are_on(compat_relay, s3_admin):

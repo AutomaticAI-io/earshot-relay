@@ -182,7 +182,7 @@ async def read_capped(request: Request, cap: int) -> bytes:
 
 
 async def spool_capped(request: Request, cap: int) -> tuple[IO[bytes], int]:
-    """The body in a temporary file (memory up to 1 MiB), for a body that may be an audio attachment."""
+    """The body in a temporary file (memory up to 1 MiB), capped even for unsupported attachments."""
     declared = request.headers.get("content-length")
     if declared and declared.isdigit() and int(declared) > cap:
         raise ApiError(413, "too_large", f"request body is over {cap} bytes")
@@ -565,7 +565,7 @@ def _ntfy_routes(app: FastAPI, relay: Relay, prefix: str, include_in_schema: boo
             incoming.title = params.get("title")
             param_message = params.get("message")
             filename = params.get("filename")
-            cap = max(relay.settings.max_audio_bytes, MAX_TEXT_UTF8_BYTES)
+            cap = max(MAX_TEXT_UTF8_BYTES, min(relay.settings.max_audio_bytes, 1024 * 1024))
             body_file, size = await spool_capped(request, cap)
             media = _media(request)
             message = param_message

@@ -203,8 +203,11 @@ class Watchdog:
     def next_check_at(self) -> datetime | None:
         st, now = self.state, self.relay.clock()
         if st.incident_since:
+            first = self.relay.store.undetected_message(st.enabled_since, iso_ms(now))
+            if first is not None and first.id != st.incident_message:
+                return (parse_rfc3339(first.created_at) or now) + timedelta(seconds=self.settings.watchdog_s)
             if st.notified:
-                return None  # only new sends or matching receipts can change this incident
+                return None
             due = now
             if st.next_attempt_at:
                 due = max(due, parse_rfc3339(st.next_attempt_at) or now)
@@ -221,9 +224,11 @@ class Watchdog:
         """Wake on a send/receipt or the next outstanding deadline; no idle timer."""
         while True:
             try:
+                version = self.relay.signal.version
                 await self.check()
                 due = self.next_check_at()
-                await self.relay.signal.wait(max(0.01, (due - self.relay.clock()).total_seconds()) if due else None)
+                await self.relay.signal.wait(max(0.01, (due - self.relay.clock()).total_seconds()) if due else None,
+                                             since=version)
             except Exception as exc:  # noqa: BLE001 - watchdog failures cannot take the API down
                 log.warning(json.dumps({"event": "watchdog_failed", "error": type(exc).__name__}))
                 await self.relay.signal.wait(30)

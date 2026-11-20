@@ -289,12 +289,13 @@ class Store:
                  row.window_end_at or row.due_at))
 
     def update_pending(self, message_id: str, *, text: str, speech: str, voice: str | None, normalized: bool,
-                       truncated: bool) -> None:
-        """The latest message wins: replace what will be written, keep the id and the window."""
+                       truncated: bool, compat: bool = False) -> None:
+        """Latest text wins; retain compat provenance if any merged send used the compat alarm gate."""
         with self._lock:
             self._db.execute(
-                "UPDATE pending SET text=?, speech=?, voice=?, normalized=?, truncated=?, merged=merged+1 WHERE id=?",
-                (text, speech, voice, int(normalized), int(truncated), message_id))
+                "UPDATE pending SET text=?, speech=?, voice=?, normalized=?, truncated=?, compat=MAX(compat, ?), "
+                "merged=merged+1 WHERE id=?",
+                (text, speech, voice, int(normalized), int(truncated), int(compat), message_id))
 
     def retry_pending(self, message_id: str, attempts: int, due_at: str) -> None:
         with self._lock:

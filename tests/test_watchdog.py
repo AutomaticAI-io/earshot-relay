@@ -331,7 +331,7 @@ def test_watchdog_url_uses_default_threshold_and_missing_beacons_disable_it(make
     s = load_settings(base_env(moto_endpoint, str(tmp_path), EARSHOT_RELAY_WATCHDOG_URL=HOOK), check_ffmpeg=False)
     assert s.watchdog_s == 120
     disabled = make_relay(EARSHOT_RELAY_WATCHDOG_URL=HOOK, EARSHOT_RELAY_BEACON_TOKEN=None)
-    assert disabled.watchdog is None
+    assert disabled.watchdog is None and disabled.status()["watchdog"]["reason"] == "beacon_token_missing"
 
 
 def test_unrelated_detection_never_clears_missing_key(setup, auth):

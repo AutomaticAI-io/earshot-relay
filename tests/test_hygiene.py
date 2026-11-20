@@ -413,7 +413,7 @@ def test_pending_compat_alarm_revalidated_after_restart(moto_endpoint, tmp_path,
                   headers={**auth, "Priority": "5"})
     assert held.status_code == 200 and held.headers["x-earshot-status"] == "coalescing"
     mid = held.headers["x-earshot-message-id"]
-    assert first_store.get_pending_by_id(mid).compat
+    assert (pending := first_store.get_pending_by_id(mid)) is not None and pending.compat
     first_store.close()
 
     env["EARSHOT_RELAY_COMPAT_ALARM"] = "0"
@@ -424,7 +424,7 @@ def test_pending_compat_alarm_revalidated_after_restart(moto_endpoint, tmp_path,
         clock.advance(6)
         assert run(restarted.flush_due()) == 0
         assert set(objects(s3_admin, "alarm")) == before
-        assert new_store.get_pending_by_id(mid).attempts == 1
+        assert (pending := new_store.get_pending_by_id(mid)) is not None and pending.attempts == 1
     finally:
         new_store.close()
 

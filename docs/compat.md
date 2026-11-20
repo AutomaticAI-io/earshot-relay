@@ -125,10 +125,9 @@ Success is ntfy's JSON: `id`, `time`, `expires`, `event: "message"`, `topic`, `m
 and `tags` when sent). The id is the relay message id, so `GET /v1/messages/{id}` works with it. Errors use ntfy's
 shape (`{"code": 40101, "http": 401, "error": "..."}`).
 
-**Audio.** An ntfy attachment upload whose `Filename` (or `X-Filename`) has an audio extension, or whose
-`Content-Type` is audio, is stored as audio and played as audio: `ntfy publish --file ding.wav <topic>` plays the
-file. This goes beyond ntfy's own behavior and is capped by `EARSHOT_RELAY_MAX_AUDIO_BYTES`. `title` and `message`
-are then ignored and named in `X-Earshot-Ignored`.
+**Attachments.** Compat ingress is text-only. Binary/audio attachments are ignored and reported in
+`X-Earshot-Ignored: attachment` when a separate title/message is present. An attachment-only upload returns a
+protocol-shaped 400, writes nothing, and never plays audio. Send audio through the native `/v1/messages` upload API.
 
 Unsupported and ignored (named in `X-Earshot-Ignored` when sent): `tags`, `click`, `icon`, `attach`, `actions`,
 `markdown`, `email`, `call`, `template`, `sequence_id`, and `cache`, `firebase` or `unifiedpush` when set to anything

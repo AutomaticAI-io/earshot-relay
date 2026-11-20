@@ -1964,6 +1964,15 @@ components:
           type: boolean
           title: Enabled
           description: EARSHOT_RELAY_WATCHDOG_S is set (it needs receipts and a notice URL)
+        reason:
+          anyOf:
+          - type: string
+            enum:
+            - beacon_token_missing
+            - not_configured
+          - type: 'null'
+          title: Reason
+          description: Why the watchdog is disabled, when enabled=false
         after_s:
           anyOf:
           - type: integer
