@@ -1,0 +1,16 @@
+services:
+  earshot-relay:
+    # Build locally until an image is published: `docker compose up -d --build`
+    build: .
+    image: earshot-relay:local
+    init: true
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      # Loopback only. Put a tunnel (Tailscale, Cloudflare Tunnel) in front; never publish this to the internet raw.
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - relay-data:/data
+
+volumes:
+  relay-data:
