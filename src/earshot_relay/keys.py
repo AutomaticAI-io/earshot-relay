@@ -143,9 +143,14 @@ class NewKey:
     key: str
 
 
-def new_key(channel: str, ext: str) -> NewKey:
+def new_id() -> str:
+    """A message id, `msg_<32 hex>`. Coalescing hands this out before the object exists; the key reuses the hex."""
+    return f"msg_{uuid.uuid4().hex}"
+
+
+def new_key(channel: str, ext: str, message_id: str | None = None) -> NewKey:
     """Opaque key `<channel>/<32 hex>.<ext>`: no text ever leaks into an object name. Id is `msg_<same hex>`."""
     if not is_valid_channel(channel):
         raise ValueError("invalid channel")
-    hex_id = uuid.uuid4().hex
+    hex_id = message_id[4:] if message_id else uuid.uuid4().hex
     return NewKey(message_id=f"msg_{hex_id}", key=f"{channel}/{hex_id}.{ext}")

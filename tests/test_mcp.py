@@ -12,6 +12,7 @@ import threading
 import pytest
 from starlette.testclient import TestClient
 
+from earshot_relay import __version__
 from earshot_relay.api import create_app
 
 from .conftest import BUCKET, TOKEN
@@ -43,7 +44,7 @@ def mcp_client(relay):
 def test_initialize(mcp_client):
     res = rpc(mcp_client, "initialize", INIT["params"], id_=1)["result"]
     assert res["serverInfo"]["name"] == "earshot"
-    assert res["serverInfo"]["version"] == "1.0.0"
+    assert res["serverInfo"]["version"] == __version__
     assert "not proof that a person heard it" in res["instructions"]
     assert "Never put secrets" in res["instructions"]
 

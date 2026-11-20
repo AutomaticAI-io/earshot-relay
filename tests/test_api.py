@@ -12,6 +12,7 @@ from datetime import timedelta
 import pytest
 from starlette.testclient import TestClient
 
+from earshot_relay import __version__
 from earshot_relay.api import create_app, create_beacon_app
 from earshot_relay.beacons import iso_ms
 from earshot_relay.store import now_utc
@@ -326,7 +327,7 @@ def test_list_messages(make_relay, auth):
 
 def test_status(client, auth):
     s = client.get("/v1/status", headers=auth).json()
-    assert s["relay"]["version"] == "1.0.0"
+    assert s["relay"]["version"] == __version__
     assert s["bucket"]["name"] == BUCKET and s["bucket"]["last_write_ok_at"] is None
     assert s["channels"] == ["phone"]
     assert s["speech"] == {"default": "device", "server_configured": False}

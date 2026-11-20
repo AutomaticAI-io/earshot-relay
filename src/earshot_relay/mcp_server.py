@@ -30,7 +30,12 @@ SAY_DESCRIPTION = (
     "bucket; if the Earshot app is listening it should speak it within seconds (Android text-to-speech by default, at "
     "the phone's media volume; held while the phone is on a call). A successful call means stored, not played. Keep "
     "it to one or two plain sentences. Returns the message id; call receipt with it to learn whether the phone played "
-    "it. Not for the alarm channel: urgent alerts use the alarm tool, which exists only when the user enabled it."
+    "it. Not for the alarm channel: urgent alerts use the alarm tool, which exists only when the user enabled it. "
+    "Hygiene options: normalize=true strips emoji, markdown and URLs before storing (links become the word 'link'). "
+    "tag with coalesce_s holds the write that many seconds and writes only the latest text sent under that tag, so a "
+    "burst of updates is spoken once (status 'coalescing' until it is written; the id is the one the message will have). "
+    "tag with cooldown_s drops a repeat of the tag inside the cooldown (status 'suppressed', nothing written). Use "
+    "them for progress updates and flapping alerts, not for one-off messages."
 )
 
 ALARM_DESCRIPTION = (
@@ -45,13 +50,14 @@ ALARM_DESCRIPTION = (
 
 RECEIPT_DESCRIPTION = (
     "Did the phone play it? Returns the device-playback receipt of a message (id from say or alarm, or 'latest'): "
-    "stored, detected, started, finished, skipped (the user skipped it), failed, missed (not played: it went stale, the "
+    "coalescing (held, not yet written), stored, detected, started, finished, skipped (the user skipped it), failed, missed (not played: it went stale, the "
     "bucket changed or audio was unavailable) or unconfirmed (no device report yet). wait_seconds (0-60) waits for a final status; "
     "`final` says whether waiting longer could still change it. A finished receipt means the phone finished playing "
     "it, not that a person heard it."
 )
 
 SUMMARIES = {
+    "coalescing": "Held for coalescing: nothing is in the bucket yet; it is written when the window closes.",
     "stored": "Stored in the bucket; no device has reported it yet.",
     "detected": "The phone saw the message and queued it.",
     "started": "The phone started playing it.",
@@ -108,13 +114,31 @@ class Backend:
 
 
 def _sent(result: dict) -> dict[str, Any]:
-    return {
+    status = result["status"]
+    out: dict[str, Any] = {
         "id": result["id"],
-        "status": result["status"],
+        "status": status,
         "channel": result["channel"],
         "speech": result.get("speech"),
-        "next": f"call receipt with id {result['id']} (wait_seconds up to 60) to see whether the phone played it",
     }
+    for name in ("tag", "write_at", "cooldown_until"):
+        if result.get(name):
+            out[name] = result[name]
+    if result.get("normalized"):
+        out["normalized"] = True
+    if result.get("truncated"):
+        out["truncated"] = True
+    if status == "coalescing":
+        out["next"] = (f"held until {result.get('write_at')} and then written with the latest text sent under tag "
+                       f"'{result.get('tag')}'; nothing is in the bucket yet. Call receipt with id {result['id']} "
+                       "afterwards to see whether the phone played it")
+    elif status == "suppressed":
+        out["next"] = (f"nothing was written: tag '{result.get('tag')}' is in its cooldown until "
+                       f"{result.get('cooldown_until')}. The id is the earlier message's; its receipt shows what the "
+                       "phone did with that one")
+    else:
+        out["next"] = f"call receipt with id {result['id']} (wait_seconds up to 60) to see whether the phone played it"
+    return out
 
 
 def build_mcp(backend: Backend, *, alarm_allowed: bool) -> MCPServer:
@@ -124,12 +148,18 @@ def build_mcp(backend: Backend, *, alarm_allowed: bool) -> MCPServer:
     @mcp.tool(description=SAY_DESCRIPTION,
               annotations=ToolAnnotations(title="Say on phone", readOnlyHint=False, destructiveHint=False,
                                           idempotentHint=False, openWorldHint=True))
-    async def say(text: str, channel: str | None = None, speech: str | None = None, voice: str | None = None) -> dict[str, Any]:
-        """text: what to speak. channel: optional, default the relay's default. speech: device or server. voice: server only."""
+    async def say(text: str, channel: str | None = None, speech: str | None = None, voice: str | None = None,
+                   normalize: bool | None = None, tag: str | None = None, coalesce_s: float | None = None,
+                   cooldown_s: float | None = None) -> dict[str, Any]:
+        """text: what to speak. channel: optional, default the relay's default. speech: device or server. voice: server
+        only. normalize: strip emoji, markdown and URLs. tag + coalesce_s: write only the latest text sent under the tag
+        within that many seconds. tag + cooldown_s: drop a repeat of the tag inside that many seconds."""
         if channel == "alarm":
             hint = "use the alarm tool" if alarm_allowed else "alarm is not enabled on this relay"
             raise ToolError(f"say does not send to the alarm channel; {hint}")
-        return _sent(await backend.send({"text": text, "channel": channel, "speech": speech, "voice": voice}))
+        return _sent(await backend.send({"text": text, "channel": channel, "speech": speech, "voice": voice,
+                                         "normalize": normalize, "tag": tag, "coalesce_s": coalesce_s,
+                                         "cooldown_s": cooldown_s}))
 
     if alarm_allowed:
         @mcp.tool(description=ALARM_DESCRIPTION,

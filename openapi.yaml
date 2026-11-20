@@ -8,7 +8,7 @@ info:
   license:
     name: MIT
     identifier: MIT
-  version: 1.0.0
+  version: 1.1.0
 paths:
   /healthz:
     get:
@@ -32,7 +32,10 @@ paths:
         speech=server). multipart/form-data: an audio file. The relay finishes PutObject (and TTS) before
         it answers, so 202 means stored in the bucket; delivery to the phone is asynchronous. Location
         points at the receipt. With an Idempotency-Key header, a repeat of the same key within 24 hours
-        returns the original 202 body (with Idempotent-Replayed: true) and writes nothing.'
+        returns the original 202 body (with Idempotent-Replayed: true) and writes nothing. Text can also
+        carry tag with coalesce_s (hold the write, write only the latest text: 202 status=coalescing)
+        or cooldown_s (drop a repeat: 200 status=suppressed), and normalize (strip emoji, markdown and
+        URLs before storing).'
       operationId: post_message_v1_messages_post
       parameters:
       - name: Idempotency-Key
@@ -49,7 +52,7 @@ paths:
           202 body instead of sending again, so a retried request never plays twice.
       responses:
         '202':
-          description: Stored in the bucket
+          description: Stored in the bucket (status=stored), or held for coalesce_s (status=coalescing)
           content:
             application/json:
               schema:
@@ -64,6 +67,12 @@ paths:
                 Idempotency-Key
               schema:
                 type: string
+        '200':
+          description: 'Suppressed by cooldown_s: nothing was written (status=suppressed)'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageAccepted'
         '400':
           description: Malformed request
           content:
@@ -153,6 +162,38 @@ paths:
                   - type: 'null'
                   description: Server TTS voice (speech=server only).
                   title: Voice
+                normalize:
+                  anyOf:
+                  - type: boolean
+                  - type: 'null'
+                  description: 'true: strip emoji and markdown, say URLs as ''link'', collapse whitespace
+                    and cut at EARSHOT_RELAY_MAX_WORDS (at a sentence end). false: send the text as given.
+                    Omitted: the relay''s EARSHOT_RELAY_NORMALIZE default. Text only; audio is never touched.'
+                  title: Normalize
+                tag:
+                  anyOf:
+                  - type: string
+                  - type: 'null'
+                  description: 'A label for coalesce_s and cooldown_s: letters, digits and . _ : -, up
+                    to 64, unique per channel. Alone it only labels the message.'
+                  title: Tag
+                coalesce_s:
+                  anyOf:
+                  - type: number
+                  - type: 'null'
+                  description: 'Needs tag. Hold the write for this many seconds (up to 3600) from the
+                    first message under the tag; only the latest text sent in the window is written, once.
+                    Answers 202 status=coalescing with the id the object will have. Pre-write only: an
+                    object already written cannot be replaced.'
+                  title: Coalesce S
+                cooldown_s:
+                  anyOf:
+                  - type: number
+                  - type: 'null'
+                  description: 'Needs tag. Drop this message if the tag was written (or is being held)
+                    within this many seconds (up to 86400): answers 200 status=suppressed with the id
+                    of the message that started the cooldown, and writes nothing.'
+                  title: Cooldown S
               required:
               - text
               title: TextMessageRequest
@@ -242,9 +283,9 @@ paths:
       - core
       summary: 'The receipt: did the phone play it?'
       description: message_id may be 'latest'. wait=1..60 long-polls until the status is finished, skipped,
-        failed or missed, or the time is up. stored | detected | started | finished | skipped | failed
-        | missed | unconfirmed. A receipt records what the phone did (device playback); it is never proof
-        that a person heard the message. A message with no beacon after EARSHOT_RELAY_RECEIPT_WAIT_MIN
+        failed or missed, or the time is up. stored | coalescing | detected | started | finished | skipped
+        | failed | missed | unconfirmed. A receipt records what the phone did (device playback); it is
+        never proof that a person heard the message. A message with no beacon after EARSHOT_RELAY_RECEIPT_WAIT_MIN
         reads unconfirmed, which can still change if a beacon the phone parked while offline arrives.
       operationId: get_message_v1_messages__message_id__get
       parameters:
@@ -483,6 +524,19 @@ paths:
                 click, sound, markdown, ...)
               schema:
                 type: string
+            X-Earshot-Status:
+              description: 'coalescing (held until the window closes) or suppressed (dropped by cooldown):
+                the 200 means accepted, not written'
+              schema:
+                type: string
+            X-Earshot-Normalized:
+              description: '''true'' when the normalizer changed the text'
+              schema:
+                type: string
+            X-Earshot-Truncated:
+              description: '''true'' when the text was cut at EARSHOT_RELAY_MAX_WORDS'
+              schema:
+                type: string
             X-Earshot-Downgraded:
               description: '''alarm'' when the top priority was delivered as a normal item because EARSHOT_RELAY_COMPAT_ALARM
                 is off or alarm is not in EARSHOT_RELAY_CHANNELS'
@@ -540,6 +594,19 @@ paths:
                 click, sound, markdown, ...)
               schema:
                 type: string
+            X-Earshot-Status:
+              description: 'coalescing (held until the window closes) or suppressed (dropped by cooldown):
+                the 200 means accepted, not written'
+              schema:
+                type: string
+            X-Earshot-Normalized:
+              description: '''true'' when the normalizer changed the text'
+              schema:
+                type: string
+            X-Earshot-Truncated:
+              description: '''true'' when the text was cut at EARSHOT_RELAY_MAX_WORDS'
+              schema:
+                type: string
             X-Earshot-Downgraded:
               description: '''alarm'' when the top priority was delivered as a normal item because EARSHOT_RELAY_COMPAT_ALARM
                 is off or alarm is not in EARSHOT_RELAY_CHANNELS'
@@ -592,6 +659,19 @@ paths:
                 click, sound, markdown, ...)
               schema:
                 type: string
+            X-Earshot-Status:
+              description: 'coalescing (held until the window closes) or suppressed (dropped by cooldown):
+                the 200 means accepted, not written'
+              schema:
+                type: string
+            X-Earshot-Normalized:
+              description: '''true'' when the normalizer changed the text'
+              schema:
+                type: string
+            X-Earshot-Truncated:
+              description: '''true'' when the text was cut at EARSHOT_RELAY_MAX_WORDS'
+              schema:
+                type: string
             X-Earshot-Downgraded:
               description: '''alarm'' when the top priority was delivered as a normal item because EARSHOT_RELAY_COMPAT_ALARM
                 is off or alarm is not in EARSHOT_RELAY_CHANNELS'
@@ -641,6 +721,19 @@ paths:
             X-Earshot-Ignored:
               description: Comma-separated request fields Earshot did not honour (attachments, actions,
                 click, sound, markdown, ...)
+              schema:
+                type: string
+            X-Earshot-Status:
+              description: 'coalescing (held until the window closes) or suppressed (dropped by cooldown):
+                the 200 means accepted, not written'
+              schema:
+                type: string
+            X-Earshot-Normalized:
+              description: '''true'' when the normalizer changed the text'
+              schema:
+                type: string
+            X-Earshot-Truncated:
+              description: '''true'' when the text was cut at EARSHOT_RELAY_MAX_WORDS'
               schema:
                 type: string
             X-Earshot-Downgraded:
@@ -697,6 +790,19 @@ paths:
                 click, sound, markdown, ...)
               schema:
                 type: string
+            X-Earshot-Status:
+              description: 'coalescing (held until the window closes) or suppressed (dropped by cooldown):
+                the 200 means accepted, not written'
+              schema:
+                type: string
+            X-Earshot-Normalized:
+              description: '''true'' when the normalizer changed the text'
+              schema:
+                type: string
+            X-Earshot-Truncated:
+              description: '''true'' when the text was cut at EARSHOT_RELAY_MAX_WORDS'
+              schema:
+                type: string
             X-Earshot-Downgraded:
               description: '''alarm'' when the top priority was delivered as a normal item because EARSHOT_RELAY_COMPAT_ALARM
                 is off or alarm is not in EARSHOT_RELAY_CHANNELS'
@@ -750,6 +856,19 @@ paths:
                 click, sound, markdown, ...)
               schema:
                 type: string
+            X-Earshot-Status:
+              description: 'coalescing (held until the window closes) or suppressed (dropped by cooldown):
+                the 200 means accepted, not written'
+              schema:
+                type: string
+            X-Earshot-Normalized:
+              description: '''true'' when the normalizer changed the text'
+              schema:
+                type: string
+            X-Earshot-Truncated:
+              description: '''true'' when the text was cut at EARSHOT_RELAY_MAX_WORDS'
+              schema:
+                type: string
             X-Earshot-Downgraded:
               description: '''alarm'' when the top priority was delivered as a normal item because EARSHOT_RELAY_COMPAT_ALARM
                 is off or alarm is not in EARSHOT_RELAY_CHANNELS'
@@ -793,6 +912,19 @@ paths:
             X-Earshot-Ignored:
               description: Comma-separated request fields Earshot did not honour (attachments, actions,
                 click, sound, markdown, ...)
+              schema:
+                type: string
+            X-Earshot-Status:
+              description: 'coalescing (held until the window closes) or suppressed (dropped by cooldown):
+                the 200 means accepted, not written'
+              schema:
+                type: string
+            X-Earshot-Normalized:
+              description: '''true'' when the normalizer changed the text'
+              schema:
+                type: string
+            X-Earshot-Truncated:
+              description: '''true'' when the text was cut at EARSHOT_RELAY_MAX_WORDS'
               schema:
                 type: string
             X-Earshot-Downgraded:
@@ -852,6 +984,19 @@ paths:
             X-Earshot-Ignored:
               description: Comma-separated request fields Earshot did not honour (attachments, actions,
                 click, sound, markdown, ...)
+              schema:
+                type: string
+            X-Earshot-Status:
+              description: 'coalescing (held until the window closes) or suppressed (dropped by cooldown):
+                the 200 means accepted, not written'
+              schema:
+                type: string
+            X-Earshot-Normalized:
+              description: '''true'' when the normalizer changed the text'
+              schema:
+                type: string
+            X-Earshot-Truncated:
+              description: '''true'' when the text was cut at EARSHOT_RELAY_MAX_WORDS'
               schema:
                 type: string
             X-Earshot-Downgraded:
@@ -918,6 +1063,19 @@ paths:
                 click, sound, markdown, ...)
               schema:
                 type: string
+            X-Earshot-Status:
+              description: 'coalescing (held until the window closes) or suppressed (dropped by cooldown):
+                the 200 means accepted, not written'
+              schema:
+                type: string
+            X-Earshot-Normalized:
+              description: '''true'' when the normalizer changed the text'
+              schema:
+                type: string
+            X-Earshot-Truncated:
+              description: '''true'' when the text was cut at EARSHOT_RELAY_MAX_WORDS'
+              schema:
+                type: string
             X-Earshot-Downgraded:
               description: '''alarm'' when the top priority was delivered as a normal item because EARSHOT_RELAY_COMPAT_ALARM
                 is off or alarm is not in EARSHOT_RELAY_CHANNELS'
@@ -969,6 +1127,19 @@ paths:
                 click, sound, markdown, ...)
               schema:
                 type: string
+            X-Earshot-Status:
+              description: 'coalescing (held until the window closes) or suppressed (dropped by cooldown):
+                the 200 means accepted, not written'
+              schema:
+                type: string
+            X-Earshot-Normalized:
+              description: '''true'' when the normalizer changed the text'
+              schema:
+                type: string
+            X-Earshot-Truncated:
+              description: '''true'' when the text was cut at EARSHOT_RELAY_MAX_WORDS'
+              schema:
+                type: string
             X-Earshot-Downgraded:
               description: '''alarm'' when the top priority was delivered as a normal item because EARSHOT_RELAY_COMPAT_ALARM
                 is off or alarm is not in EARSHOT_RELAY_CHANNELS'
@@ -1018,6 +1189,19 @@ paths:
             X-Earshot-Ignored:
               description: Comma-separated request fields Earshot did not honour (attachments, actions,
                 click, sound, markdown, ...)
+              schema:
+                type: string
+            X-Earshot-Status:
+              description: 'coalescing (held until the window closes) or suppressed (dropped by cooldown):
+                the 200 means accepted, not written'
+              schema:
+                type: string
+            X-Earshot-Normalized:
+              description: '''true'' when the normalizer changed the text'
+              schema:
+                type: string
+            X-Earshot-Truncated:
+              description: '''true'' when the text was cut at EARSHOT_RELAY_MAX_WORDS'
               schema:
                 type: string
             X-Earshot-Downgraded:
@@ -1253,9 +1437,15 @@ components:
           title: Channel
         status:
           type: string
-          const: stored
+          enum:
+          - stored
+          - coalescing
+          - suppressed
           title: Status
-          description: Stored in the bucket; delivery to the phone is asynchronous
+          description: 'stored: in the bucket (delivery to the phone is asynchronous; not played yet).
+            coalescing: held until write_at, then written with the latest text under the tag (202). suppressed:
+            dropped by cooldown_s, nothing written; id and key are those of the message that started the
+            cooldown (200).'
         created_at:
           type: string
           title: Created At
@@ -1264,10 +1454,39 @@ components:
           - type: string
           - type: 'null'
           title: Key
-          description: Object key <channel>/<32 hex>.<ext> (opaque; never derived from the text)
+          description: 'Object key <channel>/<32 hex>.<ext> (opaque; never derived from the text). null
+            while coalescing: the key is <channel>/<hex of id>.<ext> once written.'
         receipt_url:
           type: string
           title: Receipt Url
+        tag:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Tag
+          description: The tag the message was sent with
+        normalized:
+          type: boolean
+          title: Normalized
+          description: The normalizer changed the text
+          default: false
+        truncated:
+          type: boolean
+          title: Truncated
+          description: The text was cut at EARSHOT_RELAY_MAX_WORDS
+          default: false
+        write_at:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Write At
+          description: 'coalescing: when the held message will be written'
+        cooldown_until:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Cooldown Until
+          description: 'suppressed: when the cooldown ends'
       type: object
       required:
       - id
@@ -1331,6 +1550,7 @@ components:
           type: string
           enum:
           - stored
+          - coalescing
           - detected
           - started
           - finished
@@ -1339,9 +1559,9 @@ components:
           - missed
           - unconfirmed
           title: Status
-          description: stored | detected | started | finished | skipped | failed | missed | unconfirmed.
-            A receipt records what the phone did (device playback); it is never proof that a person heard
-            the message.
+          description: stored | coalescing | detected | started | finished | skipped | failed | missed
+            | unconfirmed. A receipt records what the phone did (device playback); it is never proof that
+            a person heard the message.
         status_at:
           anyOf:
           - type: string
@@ -1418,6 +1638,7 @@ components:
           type: string
           enum:
           - stored
+          - coalescing
           - detected
           - started
           - finished
@@ -1426,9 +1647,9 @@ components:
           - missed
           - unconfirmed
           title: Status
-          description: stored | detected | started | finished | skipped | failed | missed | unconfirmed.
-            A receipt records what the phone did (device playback); it is never proof that a person heard
-            the message.
+          description: stored | coalescing | detected | started | finished | skipped | failed | missed
+            | unconfirmed. A receipt records what the phone did (device playback); it is never proof that
+            a person heard the message.
         status_at:
           anyOf:
           - type: string
@@ -1561,6 +1782,32 @@ components:
       - last_phase
       - clock_skew_ms
       title: StatusDevice
+    StatusHygiene:
+      properties:
+        normalize:
+          type: string
+          enum:
+          - 'off'
+          - basic
+          title: Normalize
+          description: 'EARSHOT_RELAY_NORMALIZE: the default for text; a request''s normalize field overrides
+            it'
+        max_words:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Max Words
+          description: EARSHOT_RELAY_MAX_WORDS (applies when text is normalized)
+        coalescing_pending:
+          type: integer
+          title: Coalescing Pending
+          description: Messages held right now for coalesce_s
+      type: object
+      required:
+      - normalize
+      - max_words
+      - coalescing_pending
+      title: StatusHygiene
     StatusLimits:
       properties:
         rate_limit:
@@ -1668,6 +1915,10 @@ components:
           $ref: '#/components/schemas/StatusLimits'
         compat:
           $ref: '#/components/schemas/StatusCompat'
+        hygiene:
+          $ref: '#/components/schemas/StatusHygiene'
+        watchdog:
+          $ref: '#/components/schemas/StatusWatchdog'
       type: object
       required:
       - relay
@@ -1678,6 +1929,8 @@ components:
       - receipts
       - limits
       - compat
+      - hygiene
+      - watchdog
       title: StatusResponse
     StatusSpeech:
       properties:
@@ -1695,6 +1948,89 @@ components:
       - default
       - server_configured
       title: StatusSpeech
+    StatusWatchdog:
+      properties:
+        enabled:
+          type: boolean
+          title: Enabled
+          description: EARSHOT_RELAY_WATCHDOG_S is set (it needs receipts and a notice URL)
+        after_s:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: After S
+        cooldown_s:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Cooldown S
+        format:
+          anyOf:
+          - type: string
+            enum:
+            - json
+            - text
+          - type: 'null'
+          title: Format
+          description: 'Body of the notice: JSON webhook, or plain text for an ntfy-style URL'
+        target_host:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Target Host
+          description: Host of the notice URL. The URL itself is never shown.
+        state:
+          anyOf:
+          - type: string
+            enum:
+            - idle
+            - incident
+            - notified
+          - type: 'null'
+          title: State
+          description: 'idle: nothing wrong. incident: a message got no playback report in time, notice
+            pending. notified: the one notice for this incident was sent (or given up on).'
+        incident_since:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Incident Since
+        incident_message:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Incident Message
+        last_notice_at:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Last Notice At
+        last_notice_ok:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          title: Last Notice Ok
+        last_error:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Last Error
+          description: Why the last notice failed (never contains the URL)
+        notices_sent:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Notices Sent
+        note:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Note
+          description: 'It watches sends, not idle phones: the app sends no heartbeat.'
+      type: object
+      required:
+      - enabled
+      title: StatusWatchdog
     ValidationError:
       properties:
         loc:

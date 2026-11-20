@@ -1,4 +1,6 @@
-"""SQLite index in the data dir (WAL). Holds message metadata and beacons only: never message text, never tokens."""
+"""SQLite index in the data dir (WAL). Holds message metadata and beacons: never message text of a sent message, never
+tokens. The one exception is a message held for coalescing (see `pending`): its text sits here until the window
+closes and the object is written, then the row is deleted (secure_delete is on, so the freed pages are zeroed)."""
 
 from __future__ import annotations
 
@@ -8,7 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from .beacons import iso_ms
+from .beacons import PLAYBACK_PHASES, iso_ms
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages(
@@ -20,7 +22,10 @@ CREATE TABLE IF NOT EXISTS messages(
   key TEXT UNIQUE NOT NULL,
   bytes INTEGER NOT NULL,
   text_chars INTEGER,
-  idem_key TEXT
+  idem_key TEXT,
+  tag TEXT,
+  normalized INTEGER NOT NULL DEFAULT 0,
+  truncated INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS beacons(
   id INTEGER PRIMARY KEY,
@@ -39,10 +44,38 @@ CREATE TABLE IF NOT EXISTS beacons(
 CREATE INDEX IF NOT EXISTS beacons_key ON beacons(key);
 CREATE INDEX IF NOT EXISTS beacons_received ON beacons(received_at);
 CREATE INDEX IF NOT EXISTS messages_created ON messages(created_at);
+CREATE TABLE IF NOT EXISTS pending(
+  id TEXT PRIMARY KEY,
+  channel TEXT NOT NULL,
+  tag TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  due_at TEXT NOT NULL,
+  text TEXT NOT NULL,
+  speech TEXT NOT NULL,
+  voice TEXT,
+  normalized INTEGER NOT NULL DEFAULT 0,
+  truncated INTEGER NOT NULL DEFAULT 0,
+  merged INTEGER NOT NULL DEFAULT 1,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  UNIQUE(channel, tag)
+);
+CREATE INDEX IF NOT EXISTS pending_due ON pending(due_at);
+CREATE TABLE IF NOT EXISTS idem_aliases(
+  idem_key TEXT PRIMARY KEY,
+  message_id TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS meta(
+  k TEXT PRIMARY KEY,
+  v TEXT NOT NULL
+);
 """
+MESSAGE_COLUMNS = {"idem_key": "TEXT", "tag": "TEXT", "normalized": "INTEGER NOT NULL DEFAULT 0",
+                   "truncated": "INTEGER NOT NULL DEFAULT 0"}
+TAG_INDEX = "CREATE INDEX IF NOT EXISTS messages_tag ON messages(channel, tag, created_at)"
 # idem_key holds sha256(Idempotency-Key header), never the raw header. Added in schema version 2.
 IDEM_INDEX = "CREATE UNIQUE INDEX IF NOT EXISTS messages_idem ON messages(idem_key)"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3  # 2: idem_key. 3: tag, normalized, truncated, pending, idem_aliases, meta
 
 
 @dataclass(frozen=True)
@@ -56,6 +89,27 @@ class MessageRow:
     key: str
     bytes: int
     text_chars: int | None
+    tag: str | None = None
+    normalized: bool = False
+    truncated: bool = False
+
+
+@dataclass(frozen=True)
+class PendingRow:
+    """A text message held for coalescing: written when `due_at` passes, with the latest text sent under its tag."""
+
+    id: str
+    channel: str
+    tag: str
+    created_at: str
+    due_at: str
+    text: str
+    speech: str
+    voice: str | None
+    normalized: bool
+    truncated: bool
+    merged: int
+    attempts: int
 
 
 @dataclass(frozen=True)
@@ -92,11 +146,14 @@ class Store:
                 self._db.execute("PRAGMA journal_mode=WAL")
             self._db.execute("PRAGMA synchronous=NORMAL")
             self._db.execute("PRAGMA busy_timeout=5000")
+            self._db.execute("PRAGMA secure_delete=ON")
             self._db.executescript(SCHEMA)
             columns = {r["name"] for r in self._db.execute("PRAGMA table_info(messages)")}
-            if "idem_key" not in columns:  # a version 1 database
-                self._db.execute("ALTER TABLE messages ADD COLUMN idem_key TEXT")
+            for name, decl in MESSAGE_COLUMNS.items():  # a version 1 or 2 database
+                if name not in columns:
+                    self._db.execute(f"ALTER TABLE messages ADD COLUMN {name} {decl}")
             self._db.execute(IDEM_INDEX)
+            self._db.execute(TAG_INDEX)
             self._db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
     def close(self) -> None:
@@ -106,14 +163,16 @@ class Store:
     # messages -----------------------------------------------------------------------------------------------
 
     def add_message(self, *, id: str, created_at: str, channel: str, type: str, speech: str | None, key: str,
-                    bytes: int, text_chars: int | None, idem_key: str | None = None) -> None:
+                    bytes: int, text_chars: int | None, idem_key: str | None = None, tag: str | None = None,
+                    normalized: bool = False, truncated: bool = False) -> None:
         with self._lock:
             if idem_key is not None:  # an expired use of the same key gives way to this one
                 self._db.execute("UPDATE messages SET idem_key=NULL WHERE idem_key=?", (idem_key,))
             self._db.execute(
-                "INSERT INTO messages(id, created_at, channel, type, speech, key, bytes, text_chars, idem_key)"
-                " VALUES(?,?,?,?,?,?,?,?,?)",
-                (id, created_at, channel, type, speech, key, bytes, text_chars, idem_key),
+                "INSERT INTO messages(id, created_at, channel, type, speech, key, bytes, text_chars, idem_key, tag,"
+                " normalized, truncated) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (id, created_at, channel, type, speech, key, bytes, text_chars, idem_key, tag, int(normalized),
+                 int(truncated)),
             )
 
     def get_by_idem(self, idem_key: str, not_before: str) -> MessageRow | None:
@@ -127,7 +186,8 @@ class Store:
         if row is None:
             return None
         return MessageRow(row["rowid"], row["id"], row["created_at"], row["channel"], row["type"], row["speech"],
-                          row["key"], row["bytes"], row["text_chars"])
+                          row["key"], row["bytes"], row["text_chars"], row["tag"], bool(row["normalized"]),
+                          bool(row["truncated"]))
 
     def get_message(self, message_id: str) -> MessageRow | None:
         with self._lock:
@@ -167,6 +227,105 @@ class Store:
         with self._lock:
             row = self._db.execute("SELECT MAX(created_at) AS t FROM messages").fetchone()
         return row["t"] if row else None
+
+    def latest_tagged(self, channel: str, tag: str, not_before: str) -> MessageRow | None:
+        """The newest message written to `channel` under `tag` at or after `not_before` (the cooldown check)."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT rowid, * FROM messages WHERE channel=? AND tag=? AND created_at >= ?"
+                " ORDER BY created_at DESC, rowid DESC LIMIT 1", (channel, tag, not_before)).fetchone()
+        return self._message(row)
+
+    def undetected_message(self, after: str, before: str) -> MessageRow | None:
+        """The oldest message created in (after, before] that no device has reported on at all (the watchdog)."""
+        marks = ",".join("?" * len(PLAYBACK_PHASES))
+        with self._lock:
+            row = self._db.execute(
+                "SELECT rowid, * FROM messages m WHERE m.created_at > ? AND m.created_at <= ? AND NOT EXISTS ("
+                f"SELECT 1 FROM beacons b WHERE b.key = m.key AND b.phase IN ({marks}))"
+                " ORDER BY m.created_at ASC, m.rowid ASC LIMIT 1", (after, before, *PLAYBACK_PHASES)).fetchone()
+        return self._message(row)
+
+    # coalescing (pending writes) ------------------------------------------------------------------------------
+
+    @staticmethod
+    def _pending(row: sqlite3.Row | None) -> PendingRow | None:
+        if row is None:
+            return None
+        return PendingRow(row["id"], row["channel"], row["tag"], row["created_at"], row["due_at"], row["text"],
+                          row["speech"], row["voice"], bool(row["normalized"]), bool(row["truncated"]), row["merged"],
+                          row["attempts"])
+
+    def get_pending(self, channel: str, tag: str) -> PendingRow | None:
+        with self._lock:
+            return self._pending(self._db.execute("SELECT * FROM pending WHERE channel=? AND tag=?",
+                                                  (channel, tag)).fetchone())
+
+    def get_pending_by_id(self, message_id: str) -> PendingRow | None:
+        with self._lock:
+            return self._pending(self._db.execute("SELECT * FROM pending WHERE id=?", (message_id,)).fetchone())
+
+    def add_pending(self, row: PendingRow) -> None:
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO pending(id, channel, tag, created_at, due_at, text, speech, voice, normalized, truncated,"
+                " merged, attempts) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (row.id, row.channel, row.tag, row.created_at, row.due_at, row.text, row.speech, row.voice,
+                 int(row.normalized), int(row.truncated), row.merged, row.attempts))
+
+    def update_pending(self, message_id: str, *, text: str, speech: str, voice: str | None, normalized: bool,
+                       truncated: bool) -> None:
+        """The latest message wins: replace what will be written, keep the id and the window."""
+        with self._lock:
+            self._db.execute(
+                "UPDATE pending SET text=?, speech=?, voice=?, normalized=?, truncated=?, merged=merged+1 WHERE id=?",
+                (text, speech, voice, int(normalized), int(truncated), message_id))
+
+    def retry_pending(self, message_id: str, attempts: int, due_at: str) -> None:
+        with self._lock:
+            self._db.execute("UPDATE pending SET attempts=?, due_at=? WHERE id=?", (attempts, due_at, message_id))
+
+    def delete_pending(self, message_id: str) -> None:
+        with self._lock:
+            self._db.execute("DELETE FROM pending WHERE id=?", (message_id,))
+
+    def due_pending(self, now: str, limit: int = 50) -> list[PendingRow]:
+        with self._lock:
+            rows = self._db.execute("SELECT * FROM pending WHERE due_at <= ? ORDER BY due_at ASC LIMIT ?",
+                                    (now, limit)).fetchall()
+        return [self._pending(r) for r in rows]
+
+    def pending_count(self) -> int:
+        with self._lock:
+            (n,) = self._db.execute("SELECT COUNT(*) FROM pending").fetchone()
+        return n
+
+    def add_alias(self, idem_key: str, message_id: str, created_at: str) -> None:
+        with self._lock:
+            self._db.execute("INSERT OR REPLACE INTO idem_aliases(idem_key, message_id, created_at) VALUES(?,?,?)",
+                             (idem_key, message_id, created_at))
+
+    def get_alias(self, idem_key: str, not_before: str) -> str | None:
+        """The id of the message an Idempotency-Key hash was merged into by coalescing, if recent enough."""
+        with self._lock:
+            row = self._db.execute("SELECT message_id FROM idem_aliases WHERE idem_key=? AND created_at >= ?",
+                                   (idem_key, not_before)).fetchone()
+        return row["message_id"] if row else None
+
+    # meta (small persisted state, e.g. the watchdog's) -----------------------------------------------------------
+
+    def get_meta(self, key: str) -> str | None:
+        with self._lock:
+            row = self._db.execute("SELECT v FROM meta WHERE k=?", (key,)).fetchone()
+        return row["v"] if row else None
+
+    def set_meta(self, **values: str | None) -> None:
+        with self._lock:
+            for k, v in values.items():
+                if v is None:
+                    self._db.execute("DELETE FROM meta WHERE k=?", (k,))
+                else:
+                    self._db.execute("INSERT OR REPLACE INTO meta(k, v) VALUES(?,?)", (k, v))
 
     # beacons ------------------------------------------------------------------------------------------------
 
@@ -215,6 +374,14 @@ class Store:
         with self._lock:
             return self._db.execute("SELECT 1 FROM beacons LIMIT 1").fetchone() is not None
 
+    def last_playback_beacon_at(self) -> str | None:
+        """When the relay last received a beacon that reports on a message (a heartbeat does not count)."""
+        marks = ",".join("?" * len(PLAYBACK_PHASES))
+        with self._lock:
+            row = self._db.execute(f"SELECT MAX(received_at) AS t FROM beacons WHERE phase IN ({marks})",
+                                   PLAYBACK_PHASES).fetchone()
+        return row["t"] if row else None
+
     def last_beacon_at(self) -> str | None:
         with self._lock:
             row = self._db.execute("SELECT MAX(received_at) AS t FROM beacons").fetchone()
@@ -236,4 +403,5 @@ class Store:
         with self._lock:
             m = self._db.execute("DELETE FROM messages WHERE created_at < ?", (cutoff,)).rowcount
             b = self._db.execute("DELETE FROM beacons WHERE received_at < ?", (cutoff,)).rowcount
+            self._db.execute("DELETE FROM idem_aliases WHERE created_at < ?", (cutoff,))
         return m, b

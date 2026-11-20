@@ -11,7 +11,14 @@ Every compat route answers with:
 - `X-Earshot-Message-Id` and `Location: /v1/messages/{id}`, so the receipt is one GET away;
 - `X-Earshot-Ignored`: the request fields Earshot cannot honour (attachments, actions, click URLs, sounds,
   markdown...), named, never dropped silently;
-- `X-Earshot-Downgraded: alarm` when the sender asked for its top priority and compat alarm is off.
+- `X-Earshot-Downgraded: alarm` when the sender asked for its top priority and compat alarm is off;
+- `X-Earshot-Status: coalescing|suppressed` when tag/coalesce/cooldown held or dropped the send (the protocol body
+  still says 200, which then means accepted, not written), and `X-Earshot-Normalized` / `X-Earshot-Truncated`.
+
+None of these protocols can carry Earshot's hygiene fields, so they ride as `X-Earshot-Tag`, `X-Earshot-Coalesce-S`,
+`X-Earshot-Cooldown-S` and `X-Earshot-Normalize` headers, or the query parameters `earshot_tag`, `earshot_coalesce_s`,
+`earshot_cooldown_s` and `earshot_normalize` (for producers that can set a URL but not a header). The server-wide
+EARSHOT_RELAY_NORMALIZE default applies to every compat send without any of them.
 
 Errors come back in each protocol's own error shape, never truncated text.
 """
@@ -276,6 +283,33 @@ def _int_field(data: dict, name: str) -> int | None:
 
 # ---- delivery (shared by every protocol) --------------------------------------------------------------------------
 
+HYGIENE_NAMES = ("tag", "coalesce_s", "cooldown_s", "normalize")
+FLAG_WORDS = {"1": True, "true": True, "yes": True, "on": True, "0": False, "false": False, "no": False, "off": False}
+
+
+def hygiene_params(request: Request) -> dict[str, Any]:
+    """Earshot's own send options from X-Earshot-* headers or earshot_* query parameters (header wins)."""
+    out: dict[str, Any] = {}
+    for name in HYGIENE_NAMES:
+        raw = request.headers.get("x-earshot-" + name.replace("_", "-"))
+        if raw is None:
+            raw = request.query_params.get("earshot_" + name)
+        if raw is None or not raw.strip():
+            continue
+        raw = raw.strip()
+        if name == "tag":
+            out[name] = raw
+        elif name == "normalize":
+            if raw.lower() not in FLAG_WORDS:
+                raise ApiError(400, "invalid_field", "earshot normalize must be true or false", name)
+            out[name] = FLAG_WORDS[raw.lower()]
+        else:
+            try:
+                out[name] = float(raw)
+            except ValueError:
+                raise ApiError(400, "invalid_field", f"earshot {name} must be a number of seconds", name) from None
+    return out
+
 
 async def deliver(relay: Relay, request: Request, incoming: Incoming, protocol: str) -> Delivered:
     idem_header = request.headers.get("idempotency-key")
@@ -292,6 +326,10 @@ async def deliver(relay: Relay, request: Request, incoming: Incoming, protocol: 
     text = incoming.text if incoming.audio is None else ""
     if incoming.audio is None and not text:
         raise ApiError(400, "empty_text", "there is no title or message to speak", "message")
+    hygiene = hygiene_params(request)
+    if incoming.audio is not None and hygiene:
+        incoming.ignore(*(f"earshot_{n}" for n in hygiene))  # audio is never normalized, tagged or coalesced
+        hygiene = {}
     async with relay.idempotency(idem_header) as idem:
         if idem.replay is not None:
             result = idem.replay
@@ -301,13 +339,19 @@ async def deliver(relay: Relay, request: Request, incoming: Incoming, protocol: 
             result = await relay.send_audio(fileobj=fileobj, size=size, ext=ext, channel=channel, idem_key=idem.digest)
         else:
             try:
-                result = await relay.send_text(text=text, channel=channel, idem_key=idem.digest)
+                result = await relay.send_text(text=text, channel=channel, idem_key=idem.digest, **hygiene)
             except ApiError as exc:
                 if exc.field == "text":
                     exc.field = "message"
                 raise
     headers["X-Earshot-Message-Id"] = result["id"]
     headers["Location"] = result["receipt_url"]
+    if result["status"] != "stored":
+        headers["X-Earshot-Status"] = result["status"]
+    if result.get("normalized"):
+        headers["X-Earshot-Normalized"] = "true"
+    if result.get("truncated"):
+        headers["X-Earshot-Truncated"] = "true"
     if incoming.ignored:
         headers["X-Earshot-Ignored"] = ", ".join(incoming.ignored)
     request.state.message_id = result["id"]
@@ -751,7 +795,7 @@ def _join_routes(app: FastAPI, relay: Relay, prefix: str, include_in_schema: boo
             else:
                 incoming.message, incoming.title = text, title
             for key, value in data.items():
-                if key not in JOIN_SPOKEN and key != "apikey" and value not in (None, ""):
+                if key not in JOIN_SPOKEN and key != "apikey" and not key.startswith("earshot_") and value not in (None, ""):
                     incoming.ignore(key)
             delivered = await deliver(relay, request, incoming, "join")
             return JSONResponse({"success": True, "userAuthError": False, "messageId": delivered.result["id"]},
@@ -800,6 +844,11 @@ HEADERS_DOC = {
     "Location": {"description": "/v1/messages/{id}", "schema": {"type": "string"}},
     "X-Earshot-Ignored": {"description": "Comma-separated request fields Earshot did not honour (attachments, "
                                          "actions, click, sound, markdown, ...)", "schema": {"type": "string"}},
+    "X-Earshot-Status": {"description": "coalescing (held until the window closes) or suppressed (dropped by "
+                                        "cooldown): the 200 means accepted, not written", "schema": {"type": "string"}},
+    "X-Earshot-Normalized": {"description": "'true' when the normalizer changed the text", "schema": {"type": "string"}},
+    "X-Earshot-Truncated": {"description": "'true' when the text was cut at EARSHOT_RELAY_MAX_WORDS",
+                            "schema": {"type": "string"}},
     "X-Earshot-Downgraded": {"description": "'alarm' when the top priority was delivered as a normal item because "
                                             "EARSHOT_RELAY_COMPAT_ALARM is off or alarm is not in "
                                             "EARSHOT_RELAY_CHANNELS", "schema": {"type": "string"}},

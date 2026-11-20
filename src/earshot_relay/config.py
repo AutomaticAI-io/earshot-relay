@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from .hygiene import MAX_WORDS_LIMIT
 from .keys import CHANNEL_RE, VOICE_RE
 
 MIN_TOKEN_LEN = 32
@@ -26,7 +27,14 @@ BUCKET_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{1,254}$")
 # (`earshot-relay token`) never contains them, so a value that does was never filled in.
 PLACEHOLDER_RE = re.compile(r"replace|changeme|change-me|your-token|placeholder", re.IGNORECASE)
 SECRET_VARS = ("EARSHOT_RELAY_TOKEN", "EARSHOT_RELAY_BEACON_TOKEN", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
-               "EARSHOT_RELAY_TTS_API_KEY", "EARSHOT_RELAY_COMPAT_PUSHOVER_TOKEN")
+               "EARSHOT_RELAY_TTS_API_KEY", "ELEVENLABS_API_KEY", "EARSHOT_RELAY_COMPAT_PUSHOVER_TOKEN")
+
+TTS_PROVIDERS = ("openai", "elevenlabs")
+ELEVENLABS_URL = "https://api.elevenlabs.io"
+ELEVENLABS_DEFAULT_MODEL = "eleven_multilingual_v2"
+NORMALIZE_MODES = ("off", "basic")
+WATCHDOG_FORMATS = ("auto", "json", "text")
+WATCHDOG_MIN_S, WATCHDOG_MAX_S = 10, 86_400
 
 # Producer-compat ingress (compat.py): the push APIs a producer may already speak.
 COMPAT_PROTOCOLS = ("ntfy", "gotify", "pushover", "join")
@@ -102,6 +110,7 @@ def default_data_dir() -> str:
 
 @dataclass(frozen=True)
 class TtsSettings:
+    provider: str
     url: str
     model: str
     voice: str | None
@@ -141,6 +150,20 @@ class Settings:
     compat_port: int | None = None
     compat_ntfy_topics: tuple[tuple[str, str], ...] = ()
     compat_pushover_token: str | None = field(default=None, repr=False)
+    normalize: str = "off"
+    max_words: int | None = None
+    watchdog_s: int | None = None
+    watchdog_url: str | None = field(default=None, repr=False)  # may carry a topic or token: never logged or shown
+    watchdog_cooldown_s: int = 1800
+    watchdog_format: str = "auto"
+
+    @property
+    def normalize_default(self) -> bool:
+        return self.normalize == "basic"
+
+    @property
+    def watchdog_host(self) -> str | None:
+        return urlsplit(self.watchdog_url).netloc.rpartition("@")[2] if self.watchdog_url else None
 
     @property
     def endpoint_host(self) -> str:
@@ -276,42 +299,13 @@ def load_settings(environ: dict[str, str] | None = None, *, check_ffmpeg: bool =
     if default_speech not in ("device", "server"):
         problems.append("EARSHOT_RELAY_DEFAULT_SPEECH must be device or server")
 
-    tts = None
-    tts_url = take(env, "EARSHOT_RELAY_TTS_URL", e)
-    if tts_url:
-        tts_url = tts_url.rstrip("/")
-        tu = urlsplit(tts_url)
-        if tu.scheme not in ("http", "https") or not tu.netloc or tu.query or tu.fragment:
-            problems.append("EARSHOT_RELAY_TTS_URL must be an http(s) base URL ending in /v1")
-        elif tu.username or tu.password:
-            problems.append("EARSHOT_RELAY_TTS_URL must not carry credentials (use EARSHOT_RELAY_TTS_API_KEY)")
-        model = take(env, "EARSHOT_RELAY_TTS_MODEL", e)
-        if not model:
-            problems.append("EARSHOT_RELAY_TTS_MODEL is required when EARSHOT_RELAY_TTS_URL is set")
-        voice = take(env, "EARSHOT_RELAY_TTS_VOICE", e)
-        if not voice:
-            problems.append("EARSHOT_RELAY_TTS_VOICE is required when EARSHOT_RELAY_TTS_URL is set "
-                            "(the OpenAI speech API requires a voice; a request can still override it)")
-        elif not VOICE_RE.fullmatch(voice):
-            problems.append("EARSHOT_RELAY_TTS_VOICE must match ^[A-Za-z0-9_+().: -]{1,100}$")
-        fmt = (take(env, "EARSHOT_RELAY_TTS_FORMAT", e) or "mp3").lower()
-        if fmt not in ("mp3", "wav"):
-            problems.append("EARSHOT_RELAY_TTS_FORMAT must be mp3 or wav")
-        timeout = take(_int, "EARSHOT_RELAY_TTS_TIMEOUT_S", take(env, "EARSHOT_RELAY_TTS_TIMEOUT_S", e), 60, 1, 600)
-        leadin = take(_int, "EARSHOT_RELAY_TTS_LEADIN_MS", take(env, "EARSHOT_RELAY_TTS_LEADIN_MS", e), 700, 0, 10000)
-        if check_ffmpeg and leadin and shutil.which("ffmpeg") is None:
-            problems.append("EARSHOT_RELAY_TTS_LEADIN_MS is above 0 but ffmpeg is not installed "
-                            "(install ffmpeg or set EARSHOT_RELAY_TTS_LEADIN_MS=0)")
-        if model:
-            tts = TtsSettings(url=tts_url, model=model or "", voice=voice, api_key=take(env, "EARSHOT_RELAY_TTS_API_KEY", e),
-                              response_format=fmt, timeout_s=float(timeout or 60), leadin_ms=leadin or 0)
-    else:
-        for orphan in ("EARSHOT_RELAY_TTS_MODEL", "EARSHOT_RELAY_TTS_VOICE", "EARSHOT_RELAY_TTS_API_KEY"):
-            if take(env, orphan, e):
-                problems.append(f"{orphan} is set but EARSHOT_RELAY_TTS_URL is not")
-    if default_speech == "server" and not tts_url:
-        problems.append("EARSHOT_RELAY_DEFAULT_SPEECH=server needs EARSHOT_RELAY_TTS_URL")
+    tts = _tts_settings(e, take, problems, check_ffmpeg=check_ffmpeg)
+    if default_speech == "server" and tts is None and not problems:
+        problems.append("EARSHOT_RELAY_DEFAULT_SPEECH=server needs EARSHOT_RELAY_TTS_URL "
+                        "(or EARSHOT_RELAY_TTS_PROVIDER=elevenlabs)")
 
+    hygiene = _hygiene_settings(e, take, problems)
+    watchdog = _watchdog_settings(e, take, problems, beacon_token=beacon_token)
     compat = _compat_settings(e, take, problems, channels=channels, port=port, beacon_port=beacon_port)
 
     if problems:
@@ -322,7 +316,7 @@ def load_settings(environ: dict[str, str] | None = None, *, check_ffmpeg: bool =
         public_url=public_url, data_dir=data_dir, host=host, port=port, beacon_port=beacon_port,
         retention_days=retention, receipt_wait_min=wait_min, max_audio_bytes=max_audio, rate_limit=rate,
         alarm_rate_limit=alarm_rate, beacon_rate_limit=beacon_rate, default_speech=default_speech, tts=tts,
-        allow_http_s3=allow_http, **compat,
+        allow_http_s3=allow_http, **compat, **hygiene, **watchdog,
     )
 
 
@@ -396,3 +390,102 @@ def _compat_settings(e, take, problems: list[str], *, channels: list[str], port,
                             "generate one with: earshot-relay token --pushover")
     return {"compat": tuple(enabled), "compat_alarm": alarm, "compat_port": compat_port,
             "compat_ntfy_topics": tuple(topics.items()), "compat_pushover_token": pushover_token}
+
+
+def _tts_settings(e, take, problems: list[str], *, check_ffmpeg: bool) -> TtsSettings | None:
+    """The optional server TTS: an OpenAI-compatible endpoint (EARSHOT_RELAY_TTS_URL) or ElevenLabs."""
+    provider = (take(env, "EARSHOT_RELAY_TTS_PROVIDER", e) or "openai").lower()
+    if provider not in TTS_PROVIDERS:
+        problems.append(f"EARSHOT_RELAY_TTS_PROVIDER must be one of: {', '.join(TTS_PROVIDERS)}")
+        return None
+    tts_url = take(env, "EARSHOT_RELAY_TTS_URL", e)
+    if provider == "openai" and not tts_url:
+        for orphan in ("EARSHOT_RELAY_TTS_MODEL", "EARSHOT_RELAY_TTS_VOICE", "EARSHOT_RELAY_TTS_API_KEY"):
+            if take(env, orphan, e):
+                problems.append(f"{orphan} is set but EARSHOT_RELAY_TTS_URL is not")
+        return None
+    elevenlabs = provider == "elevenlabs"
+    if elevenlabs and not tts_url:
+        tts_url = ELEVENLABS_URL
+    tts_url = tts_url.rstrip("/")
+    tu = urlsplit(tts_url)
+    if tu.scheme not in ("http", "https") or not tu.netloc or tu.query or tu.fragment:
+        problems.append("EARSHOT_RELAY_TTS_URL must be an http(s) base URL" + ("" if elevenlabs else " ending in /v1"))
+    elif tu.username or tu.password:
+        problems.append("EARSHOT_RELAY_TTS_URL must not carry credentials (use EARSHOT_RELAY_TTS_API_KEY)")
+    model = take(env, "EARSHOT_RELAY_TTS_MODEL", e)
+    if elevenlabs:
+        model = model or ELEVENLABS_DEFAULT_MODEL
+    elif not model:
+        problems.append("EARSHOT_RELAY_TTS_MODEL is required when EARSHOT_RELAY_TTS_URL is set")
+    voice = take(env, "EARSHOT_RELAY_TTS_VOICE", e)
+    if not voice:
+        problems.append("EARSHOT_RELAY_TTS_VOICE is required when " + (
+            "EARSHOT_RELAY_TTS_PROVIDER=elevenlabs (an ElevenLabs voice id; a request can still override it)" if elevenlabs
+            else "EARSHOT_RELAY_TTS_URL is set (the OpenAI speech API requires a voice; a request can still override it)"))
+    elif not VOICE_RE.fullmatch(voice):
+        problems.append("EARSHOT_RELAY_TTS_VOICE must match ^[A-Za-z0-9_+().: -]{1,100}$")
+    if elevenlabs:
+        # The ElevenLabs key comes from the environment (or a *_FILE secret), under its usual name or the relay's.
+        api_key = take(env, "ELEVENLABS_API_KEY", e) or take(env, "EARSHOT_RELAY_TTS_API_KEY", e)
+        if not api_key:
+            problems.append("ELEVENLABS_API_KEY is required when EARSHOT_RELAY_TTS_PROVIDER=elevenlabs "
+                            "(environment or ELEVENLABS_API_KEY_FILE; never put it in a file in the repo)")
+        fmt = (take(env, "EARSHOT_RELAY_TTS_FORMAT", e) or "mp3").lower()
+        if fmt not in ("mp3", "opus"):
+            problems.append("EARSHOT_RELAY_TTS_FORMAT must be mp3 or opus for ElevenLabs")
+    else:
+        api_key = take(env, "EARSHOT_RELAY_TTS_API_KEY", e)
+        fmt = (take(env, "EARSHOT_RELAY_TTS_FORMAT", e) or "mp3").lower()
+        if fmt not in ("mp3", "wav"):
+            problems.append("EARSHOT_RELAY_TTS_FORMAT must be mp3 or wav")
+    timeout = take(_int, "EARSHOT_RELAY_TTS_TIMEOUT_S", take(env, "EARSHOT_RELAY_TTS_TIMEOUT_S", e), 60, 1, 600)
+    leadin = take(_int, "EARSHOT_RELAY_TTS_LEADIN_MS", take(env, "EARSHOT_RELAY_TTS_LEADIN_MS", e), 700, 0, 10000)
+    if check_ffmpeg and leadin and shutil.which("ffmpeg") is None:
+        problems.append("EARSHOT_RELAY_TTS_LEADIN_MS is above 0 but ffmpeg is not installed "
+                        "(install ffmpeg or set EARSHOT_RELAY_TTS_LEADIN_MS=0)")
+    if not model:
+        return None
+    return TtsSettings(provider=provider, url=tts_url, model=model, voice=voice, api_key=api_key, response_format=fmt,
+                       timeout_s=float(timeout or 60), leadin_ms=leadin or 0)
+
+
+def _hygiene_settings(e, take, problems: list[str]) -> dict:
+    """EARSHOT_RELAY_NORMALIZE and EARSHOT_RELAY_MAX_WORDS."""
+    mode = (take(env, "EARSHOT_RELAY_NORMALIZE", e) or "off").lower()
+    if mode not in NORMALIZE_MODES:
+        problems.append(f"EARSHOT_RELAY_NORMALIZE must be one of: {', '.join(NORMALIZE_MODES)}")
+        mode = "off"
+    raw_words = take(env, "EARSHOT_RELAY_MAX_WORDS", e)
+    max_words = take(_int, "EARSHOT_RELAY_MAX_WORDS", raw_words, 0, 1, MAX_WORDS_LIMIT) if raw_words else None
+    return {"normalize": mode, "max_words": max_words}
+
+
+def _watchdog_settings(e, take, problems: list[str], *, beacon_token: str | None) -> dict:
+    """The delivery watchdog: off unless EARSHOT_RELAY_WATCHDOG_S is set, and then it needs receipts and a URL."""
+    raw_s = take(env, "EARSHOT_RELAY_WATCHDOG_S", e)
+    raw_url = take(env, "EARSHOT_RELAY_WATCHDOG_URL", e)
+    raw_cooldown = take(env, "EARSHOT_RELAY_WATCHDOG_COOLDOWN_S", e)
+    raw_format = take(env, "EARSHOT_RELAY_WATCHDOG_FORMAT", e)
+    if not raw_s or raw_s.lower() in ("off", "0", "none", "disabled"):
+        for var, value in (("EARSHOT_RELAY_WATCHDOG_URL", raw_url), ("EARSHOT_RELAY_WATCHDOG_COOLDOWN_S", raw_cooldown),
+                           ("EARSHOT_RELAY_WATCHDOG_FORMAT", raw_format)):
+            if value:
+                problems.append(f"{var} is set but EARSHOT_RELAY_WATCHDOG_S is not")
+        return {}
+    seconds = take(_int, "EARSHOT_RELAY_WATCHDOG_S", raw_s, 120, WATCHDOG_MIN_S, WATCHDOG_MAX_S)
+    cooldown = take(_int, "EARSHOT_RELAY_WATCHDOG_COOLDOWN_S", raw_cooldown, 1800, 60, 7 * 86400)
+    fmt = (raw_format or "auto").lower()
+    if fmt not in WATCHDOG_FORMATS:
+        problems.append(f"EARSHOT_RELAY_WATCHDOG_FORMAT must be one of: {', '.join(WATCHDOG_FORMATS)}")
+    if not beacon_token:
+        problems.append("EARSHOT_RELAY_WATCHDOG_S needs receipts: set EARSHOT_RELAY_BEACON_TOKEN (the watchdog "
+                        "watches for the phone's 'detected' beacon; without beacons it cannot tell)")
+    if not raw_url:
+        problems.append("EARSHOT_RELAY_WATCHDOG_URL is required when EARSHOT_RELAY_WATCHDOG_S is set")
+    else:
+        wu = urlsplit(raw_url)
+        if wu.scheme not in ("http", "https") or not wu.netloc or wu.fragment:
+            problems.append("EARSHOT_RELAY_WATCHDOG_URL must be an http(s) URL without a fragment")
+    return {"watchdog_s": seconds, "watchdog_url": raw_url, "watchdog_cooldown_s": cooldown or 1800,
+            "watchdog_format": fmt if fmt in WATCHDOG_FORMATS else "auto"}

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
+import logging
 import shutil
 import time
 from collections import deque
@@ -18,18 +20,30 @@ from starlette.concurrency import run_in_threadpool
 from . import RECEIPT_WORDING, __version__
 from .beacons import HEARTBEAT, PHASE_ORDER, TERMINAL, iso_ms, parse_rfc3339, receipt_is_final
 from .config import RateLimit, Settings
+from .hygiene import (
+    MAX_COALESCE_S,
+    MAX_COOLDOWN_S,
+    check_flag,
+    check_seconds,
+    check_tag,
+    normalize_text,
+)
 from .keys import (
     ApiError,
     check_voice,
     clean_text,
     content_type_for,
     is_valid_channel,
+    new_id,
     new_key,
     utf16_units,
 )
 from .storage import S3Writer, StorageError
-from .store import BeaconRow, MessageRow, Store, TooManyDevices, now_utc
+from .store import BeaconRow, MessageRow, PendingRow, Store, TooManyDevices, now_utc
 from .tts import TtsClient
+from .watchdog import Watchdog
+
+log = logging.getLogger("earshot_relay")
 
 __all__ = ["TERMINAL", "Relay", "derive_receipt", "receipt_is_final"]
 
@@ -44,6 +58,8 @@ ALARM_CAVEAT = (
 )
 # Rank of a device status: furthest phase first, then for terminal ties finished > skipped > failed > missed.
 TERMINAL_PREFERENCE = {"finished": 4, "skipped": 3, "failed": 2, "missed": 1}
+# A coalesced write that fails (the bucket or the TTS server is down) is retried after these delays, then dropped.
+FLUSH_RETRY_S = (10, 30, 60)
 NO_BEACON_HINT = "no beacon has reached this relay; set the phone's beacon endpoint (see GET /v1/status)"
 
 
@@ -296,7 +312,7 @@ class BeaconSignal:
 
 class Relay:
     def __init__(self, settings: Settings, store: Store, writer: S3Writer, tts: TtsClient | None = None,
-                 clock=now_utc, monotonic=time.monotonic):
+                 clock=now_utc, monotonic=time.monotonic, watchdog_transport=None):
         self.settings = settings
         self.store = store
         self.writer = writer
@@ -307,6 +323,8 @@ class Relay:
         self.signal = BeaconSignal()
         self.last_write_ok_at: str | None = None
         self._idem_locks = KeyedLocks()
+        self._tag_locks = KeyedLocks()
+        self.watchdog = Watchdog(self, watchdog_transport) if settings.watchdog_s else None
 
     # sending ----------------------------------------------------------------------------------------------------
 
@@ -355,46 +373,183 @@ class Relay:
             return
         digest = hashlib.sha256(header.encode("utf-8")).hexdigest()
         async with self._idem_locks.hold(digest):
-            row = self.store.get_by_idem(digest, iso_ms(self.clock() - IDEMPOTENCY_WINDOW))
-            replay = self._accepted(row.id, row.type, row.speech, row.channel, row.key, row.created_at) if row else None
+            cutoff = iso_ms(self.clock() - IDEMPOTENCY_WINDOW)
+            row = self.store.get_by_idem(digest, cutoff)
+            replay = self._accepted_row(row) if row else None
+            if replay is None:  # a key that was merged into a coalesced message (before or after it was written)
+                alias = self.store.get_alias(digest, cutoff)
+                if alias:
+                    written = self.store.get_message(alias)
+                    pending = None if written else self.store.get_pending_by_id(alias)
+                    replay = (self._accepted_row(written) if written
+                              else self._accepted_pending(pending) if pending else None)
             yield Idempotency(digest, replay)
 
-    def _accepted(self, msg_id: str, kind: str, speech: str | None, channel: str, key: str, created_at: str) -> dict:
+    def _accepted(self, msg_id: str, kind: str, speech: str | None, channel: str, key: str | None, created_at: str, *,
+                  status: str = "stored", tag: str | None = None, normalized: bool = False, truncated: bool = False,
+                  write_at: str | None = None, cooldown_until: str | None = None) -> dict:
         return {
             "id": msg_id,
             "type": kind,
             "speech": speech,
             "channel": channel,
-            "status": "stored",
+            "status": status,
             "created_at": created_at,
             "key": key,
             "receipt_url": f"/v1/messages/{msg_id}",
+            "tag": tag,
+            "normalized": normalized,
+            "truncated": truncated,
+            "write_at": write_at,
+            "cooldown_until": cooldown_until,
         }
 
+    def _accepted_row(self, row: MessageRow) -> dict:
+        return self._accepted(row.id, row.type, row.speech, row.channel, row.key, row.created_at, tag=row.tag,
+                              normalized=row.normalized, truncated=row.truncated)
+
+    def _accepted_pending(self, p: PendingRow) -> dict:
+        return self._accepted(p.id, "text", p.speech, p.channel, None, p.created_at, status="coalescing", tag=p.tag,
+                              normalized=p.normalized, truncated=p.truncated, write_at=p.due_at)
+
+    def _prepare_text(self, text: object, normalize: bool | None) -> tuple[str, bool, bool]:
+        """The text to store, and whether the normalizer changed it and whether it cut it short."""
+        if not isinstance(text, str):
+            raise ApiError(422, "invalid_field", "text must be a string", "text")
+        if (self.settings.normalize_default if normalize is None else normalize):
+            result = normalize_text(text, max_words=self.settings.max_words)
+            if not result.text:
+                raise ApiError(422, "empty_text", "text is empty after normalization (it held only emoji, markdown "
+                                                  "or links)", "text")
+            return clean_text(result.text), result.changed, result.truncated
+        return clean_text(text), False, False
+
     async def send_text(self, *, text: object, channel: object = None, speech: object = None, voice: object = None,
-                        idem_key: str | None = None) -> dict:
-        clean = clean_text(text)
+                        idem_key: str | None = None, normalize: object = None, tag: object = None,
+                        coalesce_s: object = None, cooldown_s: object = None) -> dict:
+        """Store text for the phone. `tag` with `coalesce_s` holds the write until the window closes (the latest text
+        under the tag wins); `tag` with `cooldown_s` drops a repeat of the tag inside the cooldown. Both act before
+        anything is written: the relay holds PutObject only and cannot replace an object that already exists."""
+        clean, normalized, truncated = self._prepare_text(text, check_flag("normalize", normalize))
         chan = self.resolve_channel(channel)
         chosen_voice = check_voice(voice)
         mode = self.resolve_speech(speech, chosen_voice)
-        reservation = self.limiter.take(chan)
+        tag = check_tag(tag)
+        coalesce = check_seconds("coalesce_s", coalesce_s, MAX_COALESCE_S)
+        cooldown = check_seconds("cooldown_s", cooldown_s, MAX_COOLDOWN_S)
+        if tag is None and (coalesce or cooldown):
+            raise ApiError(422, "tag_required", "coalesce_s and cooldown_s need a tag", "tag")
+        if coalesce or cooldown:
+            return await self._send_tagged(text=clean, chan=chan, mode=mode, voice=chosen_voice, idem_key=idem_key,
+                                           tag=tag, normalized=normalized, truncated=truncated, coalesce=coalesce,
+                                           cooldown=cooldown)
+        return await self._write_text(text=clean, chan=chan, mode=mode, voice=chosen_voice, idem_key=idem_key, tag=tag,
+                                      normalized=normalized, truncated=truncated)
+
+    async def _write_text(self, *, text: str, chan: str, mode: str, voice: str | None, idem_key: str | None,
+                          tag: str | None, normalized: bool, truncated: bool, message_id: str | None = None,
+                          reserve: bool = True) -> dict:
+        """TTS (when server speech), PutObject and the index row. `reserve=False` is the coalescing flush, whose
+        send was already counted when its window opened."""
+        reservation = self.limiter.take(chan) if reserve else []
         try:
             if mode == "device":
-                body = clean.encode("utf-8")
+                body = text.encode("utf-8")
                 ext, ctype = "say", content_type_for("say")
             else:
-                assert self.tts is not None
-                result = await self.tts.render(clean, chosen_voice)
+                if self.tts is None:
+                    raise ApiError(422, "tts_not_configured", "speech=server needs the relay's TTS settings", "speech")
+                result = await self.tts.render(text, voice)
                 body, ext, ctype = result.data, result.ext, result.content_type
-            nk = new_key(chan, ext)
+            nk = new_key(chan, ext, message_id)
             await self._put(nk.key, body, ctype)
         except BaseException:
             self.limiter.refund(reservation)
             raise
         created = iso_ms(self.clock())
         self.store.add_message(id=nk.message_id, created_at=created, channel=chan, type="text", speech=mode,
-                               key=nk.key, bytes=len(body), text_chars=utf16_units(clean), idem_key=idem_key)
-        return self._accepted(nk.message_id, "text", mode, chan, nk.key, created)
+                               key=nk.key, bytes=len(body), text_chars=utf16_units(text), idem_key=idem_key, tag=tag,
+                               normalized=normalized, truncated=truncated)
+        return self._accepted(nk.message_id, "text", mode, chan, nk.key, created, tag=tag, normalized=normalized,
+                              truncated=truncated)
+
+    # coalescing and cooldown ------------------------------------------------------------------------------------
+
+    async def _send_tagged(self, *, text: str, chan: str, mode: str, voice: str | None, idem_key: str | None,
+                           tag: str, normalized: bool, truncated: bool, coalesce: float | None,
+                           cooldown: float | None) -> dict:
+        async with self._tag_locks.hold(f"{chan}\x00{tag}"):
+            now = self.clock()
+            pending = self.store.get_pending(chan, tag)
+            if pending and coalesce:
+                # Inside an open window: the latest text replaces what will be written. Same id, same window.
+                self.store.update_pending(pending.id, text=text, speech=mode, voice=voice, normalized=normalized,
+                                          truncated=truncated)
+                if idem_key:
+                    self.store.add_alias(idem_key, pending.id, iso_ms(now))
+                return self._accepted_pending(self.store.get_pending_by_id(pending.id) or pending)
+            if cooldown:
+                if pending:
+                    ref = (pending.id, None, pending.speech, pending.created_at, pending.due_at)
+                else:
+                    recent = self.store.latest_tagged(chan, tag, iso_ms(now - timedelta(seconds=cooldown)))
+                    ref = (recent.id, recent.key, recent.speech, recent.created_at, recent.created_at) if recent else None
+                if ref:
+                    until = parse_rfc3339(ref[4]) + timedelta(seconds=cooldown)
+                    return self._accepted(ref[0], "text", ref[2], chan, ref[1], ref[3], status="suppressed", tag=tag,
+                                          cooldown_until=iso_ms(until))
+            if coalesce:
+                reservation = self.limiter.take(chan)  # one send, counted when its window opens
+                row = PendingRow(id=new_id(), channel=chan, tag=tag, created_at=iso_ms(now),
+                                 due_at=iso_ms(now + timedelta(seconds=coalesce)), text=text, speech=mode, voice=voice,
+                                 normalized=normalized, truncated=truncated, merged=1, attempts=0)
+                try:
+                    self.store.add_pending(row)
+                except BaseException:
+                    self.limiter.refund(reservation)
+                    raise
+                if idem_key:
+                    self.store.add_alias(idem_key, row.id, iso_ms(now))
+                return self._accepted_pending(row)
+            return await self._write_text(text=text, chan=chan, mode=mode, voice=voice, idem_key=idem_key, tag=tag,
+                                          normalized=normalized, truncated=truncated)
+
+    async def flush_due(self) -> int:
+        """Write every coalesced message whose window has closed. Runs at startup and about once a second."""
+        written = 0
+        for row in self.store.due_pending(iso_ms(self.clock())):
+            if await self._flush_one(row.channel, row.tag):
+                written += 1
+        return written
+
+    async def _flush_one(self, channel: str, tag: str) -> bool:
+        async with self._tag_locks.hold(f"{channel}\x00{tag}"):
+            row = self.store.get_pending(channel, tag)  # re-read under the lock: a request may have changed it
+            if row is None or row.due_at > iso_ms(self.clock()):
+                return False
+            if self.store.get_message(row.id) is not None:  # written just before a crash: only the row is left over
+                self.store.delete_pending(row.id)
+                return False
+            try:
+                await self._write_text(text=row.text, chan=row.channel, mode=row.speech, voice=row.voice, idem_key=None,
+                                       tag=row.tag, normalized=row.normalized, truncated=row.truncated,
+                                       message_id=row.id, reserve=False)
+            except Exception as exc:  # noqa: BLE001 - a failed write is retried, then dropped, never raised into the loop
+                code = exc.code if isinstance(exc, ApiError) else type(exc).__name__
+                attempts = row.attempts + 1
+                if attempts > len(FLUSH_RETRY_S):
+                    self.store.delete_pending(row.id)
+                    log.warning(json.dumps({"event": "coalesce_dropped", "message_id": row.id, "error": code}))
+                else:
+                    due = self.clock() + timedelta(seconds=FLUSH_RETRY_S[attempts - 1])
+                    self.store.retry_pending(row.id, attempts, iso_ms(due))
+                    log.warning(json.dumps({"event": "coalesce_retry", "message_id": row.id, "error": code,
+                                            "attempt": attempts}))
+                return False
+            self.store.delete_pending(row.id)
+            log.info(json.dumps({"event": "coalesce_flushed", "message_id": row.id, "merged": row.merged}))
+            self.signal.notify()
+            return True
 
     async def send_audio(self, *, fileobj: IO[bytes], size: int, ext: str, channel: object = None,
                          idem_key: str | None = None) -> dict:
@@ -444,19 +599,46 @@ class Relay:
         return derive_receipt(msg, beacons, now=self.clock(), wait_min=self.settings.receipt_wait_min,
                               beacons_ever=self.store.any_beacon(), include_hops=include_hops)
 
+    def _pending_receipt(self, p: PendingRow) -> dict:
+        return {
+            "id": p.id, "type": "text", "speech": p.speech, "channel": p.channel, "key": None,
+            "created_at": p.created_at, "status": "coalescing", "status_at": p.created_at,
+            "object_last_modified": None, "hops": [], "devices": [],
+            "hint": (f"held for coalescing under tag '{p.tag}': nothing is in the bucket yet. It is written at "
+                     f"{p.due_at} with the latest text sent under that tag."),
+        }
+
+    def _missing(self, message_id: str) -> ApiError:
+        return ApiError(404, "not_found", "no message with that id" if message_id != "latest" else "no message sent yet")
+
     def receipt(self, message_id: str) -> dict:
         msg = self.store.get_message(message_id)
         if msg is None:
-            raise ApiError(404, "not_found", "no message with that id" if message_id != "latest" else "no message sent yet")
+            pending = self.store.get_pending_by_id(message_id) if message_id != "latest" else None
+            if pending is None:
+                raise self._missing(message_id)
+            return self._pending_receipt(pending)
         return self._receipt_for(msg)
 
     async def wait_receipt(self, message_id: str, wait_s: float) -> dict:
         msg = self.store.get_message(message_id)
+        pending_id = None
         if msg is None:
-            raise ApiError(404, "not_found", "no message with that id" if message_id != "latest" else "no message sent yet")
+            pending = self.store.get_pending_by_id(message_id) if message_id != "latest" else None
+            if pending is None:
+                raise self._missing(message_id)
+            pending_id = pending.id
         deadline = time.monotonic() + max(0.0, wait_s)
         while True:
-            receipt = self._receipt_for(msg)
+            if msg is None and pending_id:
+                msg = self.store.get_message(pending_id)  # the window closed and the object was written
+            if msg is not None:
+                receipt = self._receipt_for(msg)
+            else:
+                pending = self.store.get_pending_by_id(pending_id)
+                if pending is None:
+                    raise ApiError(404, "not_found", "the coalesced message was dropped: its write failed repeatedly")
+                receipt = self._pending_receipt(pending)
             left = deadline - time.monotonic()
             if receipt_is_final(receipt) or left <= 0:
                 return receipt
@@ -530,6 +712,9 @@ class Relay:
                 "retention_days": s.retention_days,
             },
             "compat": self.compat_status(),
+            "hygiene": {"normalize": s.normalize, "max_words": s.max_words,
+                        "coalescing_pending": self.store.pending_count()},
+            "watchdog": self.watchdog.status() if self.watchdog else {"enabled": False},
         }
 
     def compat_status(self) -> dict:
@@ -573,6 +758,12 @@ class Relay:
             alarm = ("top priority plays on the alarm channel" if c["alarm"]
                      else "top priority plays as a normal item (X-Earshot-Downgraded: alarm)")
             check("compat", True, f"{where}{port}; {alarm}")
+        if s.normalize != "off" or s.max_words:
+            check("normalize", True, f"mode {s.normalize}" + (f"; at most {s.max_words} words" if s.max_words else "")
+                  + " (a request's normalize field overrides the mode)")
+        if self.watchdog:
+            check("watchdog", True, f"notice after {s.watchdog_s} s without a playback report, to {s.watchdog_host} "
+                  f"({self.watchdog.format()} body); it watches sends, not idle phones")
         if s.beacon_port:
             check("beacon_port", True, f"beacons are served only on port {s.beacon_port}, not on {s.port}: publish it "
                   f"too (docker: -p 127.0.0.1:{s.beacon_port}:{s.beacon_port}) and point the tunnel at it")

@@ -170,13 +170,22 @@ def cmd_token(args) -> int:
 
 def cmd_say(args) -> int:
     with _client() as c:
-        _print_sent(c.say(_read_text(args.text), args.channel, args.speech, args.voice, args.idempotency_key), args)
+        result = c.say(_read_text(args.text), args.channel, args.speech, args.voice, args.idempotency_key,
+                       normalize=args.normalize, tag=args.tag, coalesce_s=args.coalesce_s, cooldown_s=args.cooldown_s)
+        _print_sent(result, args)
+    if result.get("status") == "coalescing" and not args.quiet and not args.json:
+        print(f"# held until {result['write_at']}; only the latest text under tag '{result['tag']}' is written",
+              file=sys.stderr)
+    elif result.get("status") == "suppressed" and not args.quiet and not args.json:
+        print(f"# suppressed: nothing written; tag '{result['tag']}' is in its cooldown until "
+              f"{result['cooldown_until']}", file=sys.stderr)
     return EXIT_OK
 
 
 def cmd_alarm(args) -> int:
     with _client() as c:
-        _print_sent(c.say(_read_text(args.text), "alarm", args.speech, args.voice, args.idempotency_key), args)
+        _print_sent(c.say(_read_text(args.text), "alarm", args.speech, args.voice, args.idempotency_key,
+                          normalize=args.normalize), args)
     return EXIT_OK
 
 
@@ -266,6 +275,17 @@ def cmd_status(args) -> int:
         port = f"; root of port {c['port']}" if c.get("port") else ""
         where = ", ".join(f"{p} {c['paths'][p]}" for p in c["enabled"])
         print(f"compat     {where}{port}; top priority -> {'alarm' if c.get('alarm') else 'normal (downgraded)'}")
+    h = s.get("hygiene") or {}
+    if h.get("normalize", "off") != "off" or h.get("max_words") or h.get("coalescing_pending"):
+        words = f", at most {h['max_words']} words" if h.get("max_words") else ""
+        print(f"hygiene    normalize {h.get('normalize', 'off')}{words}; {h.get('coalescing_pending', 0)} message(s) "
+              "held for coalescing")
+    w = s.get("watchdog") or {}
+    if w.get("enabled"):
+        print(f"watchdog   notice after {w['after_s']} s without a playback report to {w['target_host']}: {w['state']}"
+              f" ({w['notices_sent']} sent; watches sends, not idle phones)")
+        if w.get("last_error"):
+            print(safe(f"           last notice failed: {w['last_error']}"))
     print(f"note       {RECEIPT_WORDING}")
     return EXIT_OK
 
@@ -330,11 +350,22 @@ def build_parser() -> argparse.ArgumentParser:
                         help="send this Idempotency-Key: a retry with the same key within 24 h returns the first "
                              "result instead of playing twice")
 
+    def normalize_flag(sp):
+        sp.add_argument("--normalize", action=argparse.BooleanOptionalAction, default=None,
+                        help="strip emoji and markdown, say URLs as 'link', cut at the relay's max words "
+                             "(default: the relay's EARSHOT_RELAY_NORMALIZE; --no-normalize sends the text as given)")
+
     sp = sub.add_parser("say", help="store text for the phone to speak ('-' reads stdin)")
     sp.add_argument("text", nargs="+")
     sp.add_argument("-c", "--channel", default=None, help="channel (default: the relay's default)")
     sp.add_argument("--speech", choices=["device", "server"], default=None)
     sp.add_argument("--voice", default=None, help="server TTS voice")
+    normalize_flag(sp)
+    sp.add_argument("--tag", default=None, help="label for --coalesce-s and --cooldown-s")
+    sp.add_argument("--coalesce-s", type=float, default=None, metavar="SECONDS",
+                    help="needs --tag: hold the write this long and write only the latest text sent under the tag")
+    sp.add_argument("--cooldown-s", type=float, default=None, metavar="SECONDS",
+                    help="needs --tag: drop this message if the tag was written within this many seconds")
     idem_flag(sp)
     out_flags(sp)
     sp.set_defaults(fn=cmd_say)
@@ -344,6 +375,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("text", nargs="+")
     sp.add_argument("--speech", choices=["device", "server"], default=None)
     sp.add_argument("--voice", default=None)
+    normalize_flag(sp)
     idem_flag(sp)
     out_flags(sp)
     sp.set_defaults(fn=cmd_alarm)

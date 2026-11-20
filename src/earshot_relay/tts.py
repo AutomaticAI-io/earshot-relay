@@ -1,4 +1,5 @@
-"""Optional server-side TTS through any OpenAI-compatible `POST {base}/audio/speech` (Kokoro-FastAPI, LocalAI, ...).
+"""Optional server-side TTS: any OpenAI-compatible `POST {base}/audio/speech` (Kokoro-FastAPI, LocalAI, ...), or
+ElevenLabs (`POST {base}/v1/text-to-speech/{voice_id}`), chosen with EARSHOT_RELAY_TTS_PROVIDER.
 
 The result gets the same 700 ms lead-in the operator toolkit adds (Bluetooth sinks swallow the first moment) and is
 re-encoded to Ogg/Opus with ffmpeg. A failure is an error for the caller: the relay never silently falls back to a
@@ -11,6 +12,7 @@ import asyncio
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import quote
 
 import httpx
 
@@ -18,6 +20,9 @@ from .config import TtsSettings
 from .keys import ApiError
 
 MIN_AUDIO_BYTES = 200  # the operator toolkit's floor for a real synthesis result
+# ElevenLabs output_format for each EARSHOT_RELAY_TTS_FORMAT (the audio is re-encoded by the lead-in step anyway).
+ELEVENLABS_FORMATS = {"mp3": "mp3_44100_128", "opus": "opus_48000_64"}
+CONTENT_TYPES = {"mp3": "audio/mpeg", "wav": "audio/wav", "opus": "audio/ogg"}
 
 
 @dataclass(frozen=True)
@@ -34,17 +39,31 @@ class TtsClient:
         self._transport = transport
 
     def _request_body(self, text: str, voice: str | None) -> dict:
+        if self.settings.provider == "elevenlabs":
+            return {"text": text, "model_id": self.settings.model}
         body = {"model": self.settings.model, "input": text, "response_format": self.settings.response_format}
         chosen = voice or self.settings.voice
         if chosen:
             body["voice"] = chosen
         return body
 
-    async def synthesize(self, text: str, voice: str | None) -> bytes:
+    def _endpoint(self, voice: str | None) -> tuple[str, dict[str, str]]:
+        """The request URL and headers for the configured provider. The API key goes only in a header."""
+        key = self.settings.api_key
+        if self.settings.provider == "elevenlabs":
+            voice_id = quote(voice or self.settings.voice or "", safe="")
+            fmt = ELEVENLABS_FORMATS[self.settings.response_format]
+            headers = {"Content-Type": "application/json", "Accept": "audio/*"}
+            if key:
+                headers["xi-api-key"] = key
+            return f"{self.settings.url}/v1/text-to-speech/{voice_id}?output_format={fmt}", headers
         headers = {"Content-Type": "application/json", "Accept": "audio/*"}
-        if self.settings.api_key:
-            headers["Authorization"] = f"Bearer {self.settings.api_key}"
-        url = f"{self.settings.url}/audio/speech"
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+        return f"{self.settings.url}/audio/speech", headers
+
+    async def synthesize(self, text: str, voice: str | None) -> bytes:
+        url, headers = self._endpoint(voice)
         timeout = httpx.Timeout(self.settings.timeout_s)
         try:
             async with httpx.AsyncClient(timeout=timeout, transport=self._transport, follow_redirects=False) as client:
@@ -71,7 +90,7 @@ class TtsClient:
         raw = await self.synthesize(text, voice)
         fmt = self.settings.response_format
         if self.settings.leadin_ms <= 0:
-            return SynthResult(raw, fmt, "audio/mpeg" if fmt == "mp3" else "audio/wav")
+            return SynthResult(raw, fmt, CONTENT_TYPES[fmt])
         return SynthResult(await add_leadin(raw, fmt, self.settings.leadin_ms), "opus", "audio/ogg")
 
 
