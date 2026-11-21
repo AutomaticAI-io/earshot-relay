@@ -3,7 +3,7 @@
 All notable changes. Versions follow semver. A `202` always means stored (or, with `coalesce_window_s`, held), never played;
 receipts describe device playback, never that a person heard anything.
 
-## Unreleased (1.1.1)
+## 1.1.1 (2026-11-21)
 
 Reconciles 1.1.0 with the spec-gap corrections that had been left on the `ears25-spec-gaps` branch. Both sets are kept.
 
@@ -27,6 +27,11 @@ Reconciles 1.1.0 with the spec-gap corrections that had been left on the `ears25
 
 ### Added
 
+- **Directory listings.** `server.json` for the official MCP Registry (`io.github.AutomaticAI-io/earshot-relay`, an OCI
+  package plus a remote template), the image label `io.modelcontextprotocol.server.name` the registry checks, a manual
+  `publish-mcp` workflow (GitHub OIDC), `glama.json` for claiming the Glama listing, and a Claude Code plugin
+  (`plugins/earshot`) with a `.claude-plugin/marketplace.json` so `claude plugin marketplace add AutomaticAI-io/earshot-relay`
+  works. See [docs/mcp.md](docs/mcp.md#listings-and-the-claude-code-plugin). Nothing is submitted for you.
 - Per-channel text hygiene: `EARSHOT_RELAY_CHANNEL_HYGIENE`, a JSON object `{channel: {normalize, max_words}}`.
 - **Gemini TTS adapter** (`EARSHOT_RELAY_TTS_PROVIDER=gemini`, `GEMINI_API_KEY`). Tested against a stub server only; no
   live Gemini call has been made.

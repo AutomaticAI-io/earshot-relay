@@ -1,0 +1,31 @@
+{
+  "name": "earshot",
+  "displayName": "Earshot",
+  "version": "1.1.1",
+  "description": "Speak short messages on your Android phone through your own Earshot relay, and check whether the phone played them.",
+  "author": {
+    "name": "AutomaticAI",
+    "url": "https://automaticai.io"
+  },
+  "homepage": "https://store.automaticai.io/earshot/",
+  "repository": "https://github.com/AutomaticAI-io/earshot-relay",
+  "license": "MIT",
+  "keywords": ["mcp", "tts", "notifications", "android", "voice", "earshot"],
+  "documentationUrl": "https://github.com/AutomaticAI-io/earshot-relay/blob/main/docs/mcp.md",
+  "supportUrl": "https://github.com/AutomaticAI-io/earshot-relay/issues",
+  "userConfig": {
+    "mcp_url": {
+      "type": "string",
+      "title": "Relay MCP URL",
+      "description": "The /mcp URL of your own earshot-relay, for example https://relay.example.com/mcp or http://127.0.0.1:8080/mcp.",
+      "required": true
+    },
+    "api_token": {
+      "type": "string",
+      "title": "Relay token",
+      "description": "The relay's EARSHOT_RELAY_TOKEN. Stored in your system credential store, never in settings.json.",
+      "required": true,
+      "sensitive": true
+    }
+  }
+}

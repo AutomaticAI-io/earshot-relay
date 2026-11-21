@@ -41,6 +41,19 @@ Tools return structured results; a failure is an MCP tool error whose text start
 
 The server's instructions tell the model to keep messages short, never to put secrets in them, and not to claim a person heard something because a receipt says `finished`. They are guidance, not enforcement: anything a connected agent says goes into your bucket.
 
+## Listings and the Claude Code plugin
+
+**Claude Code plugin.** This repository is also a Claude Code plugin marketplace. The plugin adds the HTTP server above and a small skill that tells the model how to use it honestly (stored is not played, a receipt is device playback). It prompts for your relay's `/mcp` URL and token and keeps the token in the system credential store:
+
+```sh
+claude plugin marketplace add AutomaticAI-io/earshot-relay
+claude plugin install earshot@earshot-relay
+```
+
+**Official MCP Registry.** `server.json` describes two ways to run it: the Docker image over stdio (`docker run -i ... ghcr.io/automaticai-io/earshot-relay:<version> mcp`, which needs `EARSHOT_API_URL` and `EARSHOT_API_TOKEN` pointing at your relay) and a remote template (`https://<your relay host>/mcp` with a bearer header). There is no shared Earshot server: both point at a relay you run. The image carries the label `io.modelcontextprotocol.server.name`, which is how the registry confirms the image belongs to the listing; it must equal `server.json`'s `name` exactly, and `tests/test_registry_files.py` checks that, and the version, on every change. Publishing is the manual `publish-mcp` workflow, never part of a release.
+
+**Glama.** `glama.json` lets the maintainer claim the listing. Glama introspects a stdio server in a container with no relay and no environment, so give its admin form placeholder values for `EARSHOT_API_URL` and `EARSHOT_API_TOKEN` and the command `earshot-relay mcp`: the tools register even when no relay answers, and `alarm` is left out because the status check fails.
+
 ## Security
 
 - An unauthenticated MCP request is a 401, like the rest of the API.

@@ -1,0 +1,52 @@
+name: publish-mcp
+# Publishes server.json to the official MCP Registry (registry.modelcontextprotocol.io).
+# Manual on purpose: run it once the image for server.json's version is on ghcr.io, e.g.
+#   gh workflow run publish-mcp.yml --ref v1.1.1
+# It authenticates with GitHub OIDC, which (unlike `mcp-publisher login github`) can publish under the organization
+# namespace io.github.AutomaticAI-io/*. No secret is needed. Docs:
+# https://modelcontextprotocol.io/registry/github-actions
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # GitHub OIDC for the registry login
+      contents: read
+    env:
+      MCP_PUBLISHER_VERSION: v1.8.10
+    steps:
+      - uses: actions/checkout@v5
+      - name: server.json and the image agree
+        run: |
+          set -euo pipefail
+          version="$(jq -r .version server.json)"
+          image="$(jq -r '.packages[] | select(.registryType == "oci") | .identifier' server.json)"
+          name="$(jq -r .name server.json)"
+          test "$image" = "ghcr.io/automaticai-io/earshot-relay:${version}"
+          docker pull --quiet "$image" >/dev/null
+          label="$(docker inspect --format '{{ index .Config.Labels "io.modelcontextprotocol.server.name" }}' "$image")"
+          echo "image $image carries io.modelcontextprotocol.server.name=$label"
+          test "$label" = "$name"
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Download and verify mcp-publisher
+        run: |
+          set -euo pipefail
+          os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+          arch="$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')"
+          archive="mcp-publisher_${os}_${arch}.tar.gz"
+          base_url="https://github.com/modelcontextprotocol/registry/releases/download/${MCP_PUBLISHER_VERSION}"
+          curl --fail --location --silent --show-error --output "$archive" "$base_url/$archive"
+          curl --fail --location --silent --show-error --output "$archive.sigstore.json" "$base_url/$archive.sigstore.json"
+          cosign verify-blob \
+            --bundle "$archive.sigstore.json" \
+            --certificate-identity "https://github.com/modelcontextprotocol/registry/.github/workflows/release.yml@refs/tags/${MCP_PUBLISHER_VERSION}" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            "$archive"
+          tar xzf "$archive" mcp-publisher
+          rm -f "$archive" "$archive.sigstore.json"
+      - run: ./mcp-publisher validate server.json
+      - run: ./mcp-publisher login github-oidc
+      - run: ./mcp-publisher publish

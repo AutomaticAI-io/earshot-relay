@@ -1,0 +1,15 @@
+{
+  "name": "earshot-relay",
+  "description": "Plugins for the Earshot relay: speak to your Android phone from Claude Code.",
+  "owner": {
+    "name": "AutomaticAI",
+    "url": "https://automaticai.io"
+  },
+  "plugins": [
+    {
+      "name": "earshot",
+      "source": "./plugins/earshot",
+      "description": "Speak short messages on your Android phone through your own Earshot relay, and check whether the phone played them."
+    }
+  ]
+}

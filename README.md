@@ -90,6 +90,8 @@ claude mcp add earshot --env EARSHOT_API_URL=http://127.0.0.1:8080 \
 
 The first form talks to a running relay over HTTP; the second runs a local stdio server, which needs `earshot-relay` on your PATH: install it once with `uv tool install /absolute/path/to/earshot-relay` (Claude Code starts the server from your project directory, so a relative path such as `uvx --from .` does not work). Tools: `say`, `receipt`, `recent`, `status`, plus `alarm` only if you enabled that channel. See [docs/mcp.md](docs/mcp.md).
 
+Or install it as a Claude Code plugin, which asks for your relay URL and token once: `claude plugin marketplace add AutomaticAI-io/earshot-relay`, then `claude plugin install earshot@earshot-relay`.
+
 For agent hooks (speak when Claude Code needs you, or when it finishes), see [examples/](examples) and read the warning there: **hook examples send a slice of agent text to your bucket, so use a private bucket.**
 
 ### Switch a producer over by changing a URL

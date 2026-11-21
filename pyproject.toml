@@ -1,6 +1,6 @@
 [project]
 name = "earshot-relay"
-version = "1.1.0"
+version = "1.1.1"
 description = "Self-hosted relay that lets any tool or agent speak through the Earshot Android app: HTTP, CLI and MCP in, your own S3 bucket out, playback receipts back."
 readme = "README.md"
 license = "MIT"

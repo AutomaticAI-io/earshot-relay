@@ -1,0 +1,88 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.AutomaticAI-io/earshot-relay",
+  "title": "Earshot Relay",
+  "description": "Speak text on your Android phone from any agent. Your own S3 bucket, playback receipts, opt-in alarm",
+  "repository": {
+    "url": "https://github.com/AutomaticAI-io/earshot-relay",
+    "source": "github",
+    "id": "1465639784"
+  },
+  "websiteUrl": "https://store.automaticai.io/earshot/",
+  "version": "1.1.1",
+  "packages": [
+    {
+      "registryType": "oci",
+      "identifier": "ghcr.io/automaticai-io/earshot-relay:1.1.1",
+      "transport": {
+        "type": "stdio"
+      },
+      "runtimeHint": "docker",
+      "runtimeArguments": [
+        {
+          "type": "named",
+          "name": "-e",
+          "value": "EARSHOT_API_URL={relay_url}",
+          "description": "Where this container reaches your running relay (the stdio server only forwards to it). From Docker Desktop use http://host.docker.internal:8080; on Linux add --network host and use http://127.0.0.1:8080.",
+          "isRequired": true,
+          "variables": {
+            "relay_url": {
+              "description": "Base URL of your own earshot-relay, as seen from inside the container.",
+              "isRequired": true,
+              "default": "http://host.docker.internal:8080"
+            }
+          }
+        },
+        {
+          "type": "named",
+          "name": "-e",
+          "value": "EARSHOT_API_TOKEN={api_token}",
+          "description": "The relay's EARSHOT_RELAY_TOKEN.",
+          "isRequired": true,
+          "variables": {
+            "api_token": {
+              "description": "Bearer token of your relay (its EARSHOT_RELAY_TOKEN). Sends and receipts are authorised by it.",
+              "isRequired": true,
+              "isSecret": true
+            }
+          }
+        }
+      ],
+      "packageArguments": [
+        {
+          "type": "positional",
+          "valueHint": "mcp",
+          "value": "mcp"
+        }
+      ]
+    }
+  ],
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://{relay_host}/mcp",
+      "variables": {
+        "relay_host": {
+          "description": "Host name of your own relay behind HTTPS (for example relay.example.com). There is no shared Earshot server: every relay is yours.",
+          "isRequired": true
+        }
+      },
+      "headers": [
+        {
+          "name": "Authorization",
+          "description": "Bearer token of your relay (its EARSHOT_RELAY_TOKEN).",
+          "value": "Bearer {api_token}",
+          "isRequired": true,
+          "isSecret": true,
+          "variables": {
+            "api_token": {
+              "description": "The relay's EARSHOT_RELAY_TOKEN.",
+              "isRequired": true,
+              "isSecret": true
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
