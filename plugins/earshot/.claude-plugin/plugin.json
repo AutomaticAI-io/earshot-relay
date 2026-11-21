@@ -1,7 +1,7 @@
 {
   "name": "earshot",
   "displayName": "Earshot",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "description": "Speak short messages on your Android phone through your own Earshot relay, and check whether the phone played them.",
   "author": {
     "name": "AutomaticAI",

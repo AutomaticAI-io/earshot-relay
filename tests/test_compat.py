@@ -79,7 +79,7 @@ def known_ids(main) -> set[str]:
 # ---- replay of real-client requests ----------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("path", [p for p in fixtures() if p.stem != "ntfy_cli_file_audio"], ids=lambda p: p.stem)
+@pytest.mark.parametrize("path", fixtures(), ids=lambda p: p.stem)
 def test_real_client_request_is_accepted(path, clients, s3_admin):
     main, root, _ = clients
     fx = json.loads(path.read_text())
@@ -108,7 +108,7 @@ def test_real_client_request_is_accepted(path, clients, s3_admin):
         assert r.headers.get(name) == value, name
 
 
-@pytest.mark.parametrize("path", [p for p in fixtures() if p.stem != "ntfy_cli_file_audio"], ids=lambda p: p.stem)
+@pytest.mark.parametrize("path", fixtures(), ids=lambda p: p.stem)
 def test_fixture_response_shape_is_the_protocols(path, clients):
     main, root, _ = clients
     fx = json.loads(path.read_text())
@@ -314,19 +314,31 @@ def test_ntfy_unicode_title_header_is_decoded(clients, s3_admin):
     assert stored_text(s3_admin, message_key(main, BEARER, mid)["key"]) == "Café. déjà vu"
 
 
-def test_ntfy_audio_attachment_is_rejected_without_text(clients):
+def test_ntfy_audio_attachment_is_played_as_audio(clients, s3_admin):
     main, root, _ = clients
     before = known_ids(main)
     wav = b"RIFF\x24\x00\x00\x00WAVEfmt " + b"\x00" * 32
     r = root.put("/phone", content=wav, headers={**BEARER, "X-Filename": "ding.wav"})
-    assert r.status_code == 400 and "attachments are unsupported" in r.json()["error"]
-    assert new_ids(main, before) == []
+    assert r.status_code == 200
+    (mid,) = new_ids(main, before)
+    info = message_key(main, BEARER, mid)
+    assert info["type"] == "audio" and info["key"].endswith(".wav")
+    assert s3_admin.get_object(Bucket=BUCKET, Key=info["key"])["Body"].read() == wav
 
 
-def test_ntfy_attachment_with_message_ignores_binary(clients, s3_admin):
+def test_ntfy_audio_attachment_with_message_plays_the_audio(clients, s3_admin):
     main, root, _ = clients
-    r = root.put("/phone", content=b"RIFF" + b"\x00" * 32,
-                 headers={**BEARER, "X-Filename": "ding.wav", "Message": "A message"})
+    wav = b"RIFF" + b"\x00" * 32
+    r = root.put("/phone", content=wav, headers={**BEARER, "X-Filename": "ding.wav", "Message": "A message"})
+    assert r.status_code == 200 and "message" in r.headers["x-earshot-ignored"]
+    info = message_key(main, BEARER, r.headers["x-earshot-message-id"])
+    assert info["type"] == "audio" and s3_admin.get_object(Bucket=BUCKET, Key=info["key"])["Body"].read() == wav
+
+
+def test_ntfy_non_audio_attachment_with_message_speaks_the_message(clients, s3_admin):
+    main, root, _ = clients
+    r = root.put("/phone", content=b"%PDF-1.4" + b"\x00" * 32,
+                 headers={**BEARER, "X-Filename": "report.pdf", "Message": "A message"})
     assert r.status_code == 200 and "attachment" in r.headers["x-earshot-ignored"]
     info = message_key(main, BEARER, r.headers["x-earshot-message-id"])
     assert info["type"] == "text" and stored_text(s3_admin, info["key"]) == "A message"

@@ -641,12 +641,12 @@ def test_compat_coalesce_and_cooldown_by_header_or_query(compat, auth, s3_admin,
     assert len(objects(s3_admin, chan)) == 1
 
 
-def test_compat_audio_attachment_is_unsupported(compat, auth, s3_admin, chan):
+def test_compat_audio_ignores_hygiene_options_by_name(compat, auth, s3_admin, chan):
     _, _, c = compat
     r = c.post("/compat/ntfy/phone?earshot_tag=x&earshot_coalesce_window_s=30", headers={**auth, "Filename": "ding.wav"},
                content=b"RIFF" + b"\x00" * 400)
-    assert r.status_code == 400 and "attachments are unsupported" in r.json()["error"]
-    assert objects(s3_admin, chan) == {}
+    assert r.status_code == 200 and "x-earshot-status" not in r.headers
+    assert "earshot_tag" in r.headers["x-earshot-ignored"]
 
 
 # ---- MCP and CLI --------------------------------------------------------------------------------------------------------

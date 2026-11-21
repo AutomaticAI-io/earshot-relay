@@ -154,9 +154,12 @@ Success is ntfy's JSON: `id`, `time`, `expires`, `event: "message"`, `topic`, `m
 and `tags` when sent). The id is the relay message id, so `GET /v1/messages/{id}` works with it. Errors use ntfy's
 shape (`{"code": 40101, "http": 401, "error": "..."}`).
 
-**Attachments.** Compat ingress is text-only. Binary/audio attachments are ignored and reported in
-`X-Earshot-Ignored: attachment` when a separate title/message is present. An attachment-only upload returns a
-protocol-shaped 400, writes nothing, and never plays audio. Send audio through the native `/v1/messages` upload API.
+**Audio.** An ntfy attachment upload whose `Filename` (or `X-Filename`) has an audio extension, or whose
+`Content-Type` is audio, is stored as audio and played as audio: `ntfy publish --file ding.wav <topic>` plays the
+file. This goes beyond ntfy's own behavior and is capped by `EARSHOT_RELAY_MAX_AUDIO_BYTES`. `title` and `message`
+are then ignored and named in `X-Earshot-Ignored`, and audio is never normalized, tagged or coalesced. Any other
+attachment (a PDF, an image) is ignored and named `attachment`; with no title or message it is a protocol-shaped 400.
+Gotify, Pushover and Join carry no audio upload, so their routes are text only.
 
 Unsupported and ignored (named in `X-Earshot-Ignored` when sent): `tags`, `click`, `icon`, `attach`, `actions`,
 `markdown`, `email`, `call`, `template`, `sequence_id`, and `cache`, `firebase` or `unifiedpush` when set to anything
@@ -228,7 +231,7 @@ channel, text or audio bytes, and a `stored` receipt. Each client's request is r
 Run on 2026-11-20 with curl 8.14.1, Apprise 2.3.0, ntfy CLI 2.22.0, gotify-cli 2.4.0, Go 1.26.7 and Uptime Kuma
 1.23.16: **18 passed, 0 failed.**
 
-Re-run on 2026-11-21 against 1.1.1 (curl, Apprise, ntfy CLI, Go; no gotify-cli or Uptime Kuma this time): 13 passed, 2 expected failures (Apprise `ntfy://` at the prefix, and the ntfy CLI audio file, which compat no longer plays), 0 failed.
+Re-run on 2026-11-21 against 1.1.1 (curl, Apprise, ntfy CLI, Go; no gotify-cli or Uptime Kuma this time): 13 passed, 2 expected failures (Apprise `ntfy://` at the prefix, and the ntfy CLI audio file, which 1.1.1 refused), 0 failed. Re-run on 2026-11-21 against 1.1.2 with the same clients: 15 ok, 0 failed (14 passed, including the ntfy CLI audio file stored byte for byte, plus the one expected failure, Apprise `ntfy://` at the prefix).
 
 | Producer | Command or action | Result |
 | --- | --- | --- |
@@ -240,7 +243,7 @@ Re-run on 2026-11-21 against 1.1.1 (curl, Apprise, ntfy CLI, Go; no gotify-cli o
 | Apprise ntfys | `apprise ... "ntfys://$T@H:TLS/phone?auth=token&verify=no&priority=max"` (`H:TLS` is a TLS terminator in front of the compat port; the relay has no TLS of its own) | stored, downgraded |
 | ntfy CLI | `docker run --rm --network host binwiederhier/ntfy publish --token $T --title Backup --priority high http://H:8080/compat/ntfy/phone "Nightly backup finished"` | stored |
 | ntfy CLI, root, Basic | `... publish -u earshot:$T http://H:8082/phone "Dryer done"` | stored |
-| ntfy CLI, audio file | `... publish --token $T --file /work/ding.wav http://H:8080/compat/ntfy/phone` | refused `400` (compat is text only; 1.1.0 stored the audio), nothing written |
+| ntfy CLI, audio file | `... publish --token $T --file /work/ding.wav http://H:8080/compat/ntfy/phone` | stored as `.wav`, bytes identical (1.1.1 alone refused it) |
 | Apprise Gotify | `apprise -b "Server rebooted" "gotify://H:8082/$T"`, and `apprise -t Backup -b done "gotify://H:8080/compat/gotify/$T?priority=high"` | both stored (second: downgraded) |
 | gotify-cli | `gotify push --url http://H:8080/compat/gotify --token $T -t Deploy -p 5 "Release 1.1 is live"` | stored |
 | curl, Pushover | `curl --form-string token=$T --form-string user=$U --form-string "message=Front door opened" --form-string title=Security --form-string priority=2 --form-string sound=siren http://H:8080/compat/pushover/1/messages.json` | stored, downgraded, `sound` ignored |

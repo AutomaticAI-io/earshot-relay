@@ -3,6 +3,16 @@
 All notable changes. Versions follow semver. A `202` always means stored (or, with `coalesce_window_s`, held), never played;
 receipts describe device playback, never that a person heard anything.
 
+## 1.1.2 (2026-11-21)
+
+### Fixed
+
+- **ntfy audio attachments play again.** 1.1.1 made the compat routes text only, so `ntfy publish --file ding.wav`
+  became a `400`. That undid a 1.1.0 feature and the most requested one in the ntfy, Home Assistant and Pushover
+  communities ("send my own audio and have it just play"). An ntfy upload with an audio `Filename` or audio
+  `Content-Type` is stored and played as audio again, exactly as in 1.1.0; any other attachment is still ignored.
+  Text sends keep every 1.1.1 fix.
+
 ## 1.1.1 (2026-11-21)
 
 Reconciles 1.1.0 with the spec-gap corrections that had been left on the `ears25-spec-gaps` branch. Both sets are kept.
@@ -43,8 +53,8 @@ Reconciles 1.1.0 with the spec-gap corrections that had been left on the `ears25
 - The coalescing field is `coalesce_window_s` everywhere (JSON, MCP, CLI `--coalesce-window-s`, `X-Earshot-Coalesce-Window-S`,
   `earshot_coalesce_window_s`). The 1.1.0 name `coalesce_s` is still accepted on every one of them; sending both with
   different values is `422`.
-- Compat routes are text only: a ntfy, Gotify, Pushover or Join request that carries an attachment instead of text is
-  `400 empty_text` (1.1.0 could play an audio attachment). Send audio through `POST /v1/messages`.
+- Compat routes were made text only: a ntfy request carrying an audio attachment was `400 empty_text`. Reverted in
+  1.1.2.
 - Schema v5 adds `pending.compat`, `pending.window_end_at` and the `suppressed_idem` table, migrated in place.
 
 ## 1.1.0

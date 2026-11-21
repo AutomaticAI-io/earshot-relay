@@ -47,7 +47,7 @@ from starlette.datastructures import UploadFile
 
 from .beacons import parse_rfc3339
 from .config import NTFY_TOPIC_RE
-from .keys import MAX_TEXT_UTF8_BYTES, ApiError
+from .keys import AUDIO_EXTENSIONS, MAX_TEXT_UTF8_BYTES, MEDIA_TYPE_EXTENSIONS, ApiError
 from .service import Relay
 
 log = logging.getLogger("earshot_relay")
@@ -72,6 +72,7 @@ class Incoming:
     high: bool = False  # the protocol's top priority (ntfy 5, Gotify >= 8, Pushover 2)
     channel: str | None = None  # None: the relay's default channel
     ignored: list[str] = field(default_factory=list)
+    audio: tuple[IO[bytes], int, str] | None = None  # (file, size, extension) for an audio attachment
 
     def ignore(self, *names: str) -> None:
         for n in names:
@@ -187,7 +188,7 @@ async def read_capped(request: Request, cap: int) -> bytes:
 
 
 async def spool_capped(request: Request, cap: int) -> tuple[IO[bytes], int]:
-    """The body in a temporary file (memory up to 1 MiB), capped even for unsupported attachments."""
+    """The body in a temporary file (memory up to 1 MiB), for a body that may be an audio attachment."""
     declared = request.headers.get("content-length")
     if declared and declared.isdigit() and int(declared) > cap:
         raise ApiError(413, "too_large", f"request body is over {cap} bytes")
@@ -331,15 +332,20 @@ async def deliver(relay: Relay, request: Request, incoming: Incoming, protocol: 
         else:
             channel = "alarm"
             headers["X-Earshot-Promoted"] = "alarm"
-    text = incoming.text
-    if not text:
-        raise ApiError(400, "empty_text", "there is no title or message to speak; compat attachments are unsupported",
-                       "message")
+    text = incoming.text if incoming.audio is None else ""
+    if incoming.audio is None and not text:
+        raise ApiError(400, "empty_text", "there is no title or message to speak", "message")
     hygiene = hygiene_params(request)
+    if incoming.audio is not None and hygiene:
+        incoming.ignore(*(f"earshot_{n}" for n in hygiene))  # audio is never normalized, tagged or coalesced
+        hygiene = {}
     async with relay.idempotency(idem_header) as idem:
         if idem.replay is not None:
             result = idem.replay
             headers["Idempotent-Replayed"] = "true"
+        elif incoming.audio is not None:
+            fileobj, size, ext = incoming.audio
+            result = await relay.send_audio(fileobj=fileobj, size=size, ext=ext, channel=channel, idem_key=idem.digest)
         else:
             try:
                 result = await relay.send_text(text=text, channel=channel, idem_key=idem.digest, compat=True, **hygiene)
@@ -513,6 +519,14 @@ def ntfy_success(result: dict, topic: str, title: str, message: str, priority: i
     return body
 
 
+def _audio_ext(filename: str, media: str) -> str | None:
+    name = filename.rsplit("/", 1)[-1]
+    if "." in name.lstrip("."):
+        ext = name.rsplit(".", 1)[1].lower()
+        return ext if ext in AUDIO_EXTENSIONS else None
+    return MEDIA_TYPE_EXTENSIONS.get(media) if not filename else None
+
+
 def _ntfy_routes(app: FastAPI, relay: Relay, prefix: str, include_in_schema: bool) -> None:
     topics = relay.settings.ntfy_topics
 
@@ -574,23 +588,31 @@ def _ntfy_routes(app: FastAPI, relay: Relay, prefix: str, include_in_schema: boo
             incoming.title = params.get("title")
             param_message = params.get("message")
             filename = params.get("filename")
-            cap = max(MAX_TEXT_UTF8_BYTES, min(relay.settings.max_audio_bytes, 1024 * 1024))
+            cap = max(relay.settings.max_audio_bytes, MAX_TEXT_UTF8_BYTES)
             body_file, size = await spool_capped(request, cap)
             media = _media(request)
+            ext = _audio_ext(filename, media) if size else None
             message = param_message
-            attachment = bool(filename or media.startswith("audio/") or media == "application/octet-stream")
-            if size and (attachment or param_message):
-                incoming.ignore("attachment")
+            if ext is not None:
+                incoming.audio = (body_file, size, ext)
+                for name, value in (("title", incoming.title), ("message", param_message)):
+                    if value:
+                        incoming.ignore(name)
+                message = f"You received a file: {filename or 'audio.' + ext}"
+            elif size and (filename or param_message):
+                incoming.ignore("attachment")  # ntfy reads the body as an attachment here; Earshot cannot speak it
             elif size:
                 if size > MAX_TEXT_UTF8_BYTES:
                     raise ApiError(413, "text_too_long", f"message is over {MAX_TEXT_UTF8_BYTES} bytes")
                 try:
                     message = body_file.read().decode("utf-8").strip()
                 except UnicodeDecodeError:
-                    raise ApiError(400, "bad_request", "the body is not UTF-8 text; compat attachments are unsupported") from None
-            if filename:
+                    raise ApiError(400, "bad_request", "the body is not UTF-8 text; to send audio, add a Filename "
+                                                       "header ending in " + "/".join("." + e for e in AUDIO_EXTENSIONS)
+                                   ) from None
+            if filename and ext is None:
                 incoming.ignore("filename")
-            incoming.message = message
+            incoming.message = message if ext is None else ""
             delivered = await deliver(relay, request, incoming, "ntfy")
             body = ntfy_success(delivered.result, topic, incoming.title, message, priority, params.get("tags"))
             return JSONResponse(body, headers=delivered.headers)
