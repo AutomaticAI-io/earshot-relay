@@ -147,6 +147,33 @@ def test_normalize_env_default_and_request_override(make_relay, auth, s3_admin, 
         assert status == {"normalize": "basic", "max_words": 6, "coalescing_pending": 0, "coalescing_failed": 0}
 
 
+def test_channel_hygiene_inherits_globals_and_request_override(make_relay, auth, s3_admin, chan):
+    other = "alt" + chan[1:]
+    relay = make_relay(EARSHOT_RELAY_CHANNELS=f"{chan},{other}", EARSHOT_RELAY_DEFAULT_CHANNEL=chan,
+                       EARSHOT_RELAY_NORMALIZE="off", EARSHOT_RELAY_MAX_WORDS="10",
+                       EARSHOT_RELAY_CHANNEL_HYGIENE=json.dumps({chan: {"normalize": "basic", "max_words": 3},
+                                                                 other: {"max_words": 2}}))
+    with TestClient(create_app(relay)) as c:
+        first = post(c, auth, text="✅ one two three four.").json()
+        assert first["normalized"] and first["truncated"]
+        assert objects(s3_admin, chan)[first["key"]] == b"one two three."
+        plain = post(c, auth, text="✅ one two three four.", channel=other).json()
+        assert not plain["normalized"] and not plain["truncated"]
+        forced = post(c, auth, text="✅ one two three four.", channel=other, normalize=True).json()
+        assert forced["normalized"] and forced["truncated"]
+        assert objects(s3_admin, other)[forced["key"]] == b"one two."
+        raw = post(c, auth, text="✅ one two three four.", normalize=False).json()
+        assert not raw["normalized"] and not raw["truncated"]
+
+
+@pytest.mark.parametrize("value", ["[]", '{"missing":{"normalize":"basic"}}',
+                                    '{"phone":{"normalize":"invalid"}}', '{"phone":{"max_words":true}}',
+                                    '{"phone":{"extra":1}}'])
+def test_channel_hygiene_rejects_invalid_config(moto_endpoint, tmp_path, value):
+    with pytest.raises(ConfigError, match="EARSHOT_RELAY_CHANNEL_HYGIENE"):
+        load_settings(base_env(moto_endpoint, str(tmp_path), EARSHOT_RELAY_CHANNEL_HYGIENE=value), check_ffmpeg=False)
+
+
 def test_normalize_emoji_only_is_refused_and_flag_must_be_bool(client, auth):
     r = post(client, auth, text="\U0001F389\U0001F389", normalize=True)
     assert r.status_code == 422 and r.json()["error"]["code"] == "empty_text"
@@ -197,7 +224,7 @@ def test_burst_of_five_writes_exactly_one_object_with_the_latest_text(make_relay
     c = TestClient(create_app(relay))  # no lifespan: the test drives the flush
     ids = set()
     for n in range(5):
-        r = post(c, auth, text=f"progress {n} of 5", tag="build", coalesce_s=30)
+        r = post(c, auth, text=f"progress {n} of 5", tag="build", coalesce_window_s=30)
         assert r.status_code == 202, r.text
         body = r.json()
         assert body["status"] == "coalescing" and body["key"] is None and body["tag"] == "build"
@@ -219,14 +246,29 @@ def test_burst_of_five_writes_exactly_one_object_with_the_latest_text(make_relay
     assert run(relay.flush_due()) == 0  # nothing left
 
 
+def test_window_boundary_flushes_old_payload_before_new_request(make_relay, auth, s3_admin, chan):
+    clock = Clock()
+    relay = coalescing_relay(make_relay, chan, clock)
+    c = TestClient(create_app(relay))  # no flush task; request itself must honor the fixed end
+    first = post(c, auth, text="old", tag="fixed", coalesce_window_s=10).json()
+    clock.advance(11)
+    second = post(c, auth, text="new", tag="fixed", coalesce_window_s=10).json()
+    assert first["id"] != second["id"]
+    assert list(objects(s3_admin, chan).values()) == [b"old"]
+    assert relay.store.get_pending(chan, "fixed").text == "new"
+    clock.advance(11)
+    assert run(relay.flush_due()) == 1
+    assert sorted(objects(s3_admin, chan).values()) == [b"new", b"old"]
+
+
 def test_a_window_that_closed_starts_a_new_one(make_relay, auth, s3_admin, chan):
     clock = Clock()
     relay = coalescing_relay(make_relay, chan, clock)
     c = TestClient(create_app(relay))
-    first = post(c, auth, text="one", tag="t", coalesce_s=10).json()
+    first = post(c, auth, text="one", tag="t", coalesce_window_s=10).json()
     clock.advance(11)
     run(relay.flush_due())
-    second = post(c, auth, text="two", tag="t", coalesce_s=10).json()
+    second = post(c, auth, text="two", tag="t", coalesce_window_s=10).json()
     assert second["id"] != first["id"] and second["status"] == "coalescing"
     clock.advance(11)
     run(relay.flush_due())
@@ -238,7 +280,7 @@ def test_tags_are_per_channel_and_per_tag(make_relay, auth, s3_admin, chan):
     other = chan + "x"
     relay = make_relay(EARSHOT_RELAY_CHANNELS=f"{chan},{other}", EARSHOT_RELAY_DEFAULT_CHANNEL=chan, clock=clock)
     c = TestClient(create_app(relay))
-    ids = {post(c, auth, text=t, tag=tag, channel=ch, coalesce_s=5).json()["id"]
+    ids = {post(c, auth, text=t, tag=tag, channel=ch, coalesce_window_s=5).json()["id"]
            for t, tag, ch in [("a", "x", chan), ("b", "y", chan), ("c", "x", other)]}
     assert len(ids) == 3
     clock.advance(6)
@@ -255,7 +297,7 @@ def test_the_latest_message_wins_including_its_speech(make_relay, auth, s3_admin
         relay = coalescing_relay(make_relay, chan, clock, **extra)
         c = TestClient(create_app(relay))
         for n in range(4):  # server speech: TTS must run once, for the last text only
-            r = post(c, auth, text=f"update {n}", tag="s", coalesce_s=5, speech="server")
+            r = post(c, auth, text=f"update {n}", tag="s", coalesce_window_s=5, speech="server")
             assert r.status_code == 202 and r.json()["speech"] == "server"
         assert stub.requests == []
         clock.advance(6)
@@ -270,7 +312,7 @@ def test_pending_receipt_and_long_poll_follow_the_write(make_relay, auth, chan):
     clock = Clock()
     relay = coalescing_relay(make_relay, chan, clock)
     c = TestClient(create_app(relay))
-    msg = post(c, auth, text="hold", tag="r", coalesce_s=10).json()
+    msg = post(c, auth, text="hold", tag="r", coalesce_window_s=10).json()
     r = c.get(f"/v1/messages/{msg['id']}", headers=auth).json()
     assert r["status"] == "coalescing" and r["key"] is None and "nothing is in the bucket yet" in r["hint"]
     assert c.get("/v1/messages", headers=auth).json()["items"] == []  # the index lists written messages only
@@ -290,11 +332,11 @@ def test_coalescing_counts_one_send_against_the_rate_limit(make_relay, auth, cha
     clock = Clock()
     relay = coalescing_relay(make_relay, chan, clock, EARSHOT_RELAY_RATE_LIMIT="2/min")
     c = TestClient(create_app(relay))
-    assert all(post(c, auth, text=f"u{n}", tag="g", coalesce_s=30).status_code == 202 for n in range(8))
+    assert all(post(c, auth, text=f"u{n}", tag="g", coalesce_window_s=30).status_code == 202 for n in range(8))
     assert post(c, auth, text="solo").status_code == 202  # the second of two in the window
     assert post(c, auth, text="solo2").status_code == 429  # and the third is over the limit
     # a rate-limited window opening is refused up front, before anything is held
-    r = post(c, auth, text="x", tag="other", coalesce_s=30)
+    r = post(c, auth, text="x", tag="other", coalesce_window_s=30)
     assert r.status_code == 429 and relay.store.pending_count() == 1
     clock.advance(31)
     assert run(relay.flush_due()) == 1  # the flush is not counted again
@@ -307,7 +349,7 @@ def test_idempotency_with_coalescing(make_relay, auth, s3_admin, chan):
 
     def send(text, key):
         return c.post("/v1/messages", headers={**auth, "Idempotency-Key": key},
-                      json={"text": text, "tag": "i", "coalesce_s": 20})
+                      json={"text": text, "tag": "i", "coalesce_window_s": 20})
 
     a = send("first", "key-a")
     b = send("second", "key-b")
@@ -337,8 +379,8 @@ def test_pending_survives_a_restart_and_overdue_ones_flush_at_startup(moto_endpo
 
     relay, store = boot()
     c = TestClient(create_app(relay))
-    short = post(c, auth, text="due soon", tag="a", coalesce_s=10).json()
-    long = post(c, auth, text="due later", tag="b", coalesce_s=600).json()
+    short = post(c, auth, text="due soon", tag="a", coalesce_window_s=10).json()
+    long = post(c, auth, text="due later", tag="b", coalesce_window_s=600).json()
     store.close()  # the relay stops here
 
     clock.advance(60)
@@ -356,12 +398,45 @@ def test_pending_survives_a_restart_and_overdue_ones_flush_at_startup(moto_endpo
         store2.close()
 
 
+def test_pending_compat_alarm_revalidated_after_restart(moto_endpoint, tmp_path, s3_admin, auth):
+    from earshot_relay.api import create_compat_app
+
+    clock = Clock()
+    env = base_env(moto_endpoint, str(tmp_path / "alarm-restart"), EARSHOT_RELAY_CHANNELS="phone,alarm",
+                   EARSHOT_RELAY_COMPAT="ntfy", EARSHOT_RELAY_COMPAT_ALARM="1")
+    before = set(objects(s3_admin, "alarm"))
+    first_settings = load_settings(env, check_ffmpeg=False)
+    first_store = Store(first_settings.db_path)
+    first = Relay(first_settings, first_store, S3Writer(first_settings), None, clock=clock)
+    c = TestClient(create_compat_app(first))
+    held = c.post("/phone?earshot_tag=urgent&earshot_coalesce_window_s=5", content="danger",
+                  headers={**auth, "Priority": "5"})
+    assert held.status_code == 200 and held.headers["x-earshot-status"] == "coalescing"
+    mid = held.headers["x-earshot-message-id"]
+    assert (pending := first_store.get_pending_by_id(mid)) is not None and pending.compat
+    first_store.close()
+
+    env["EARSHOT_RELAY_COMPAT_ALARM"] = "0"
+    new_settings = load_settings(env, check_ffmpeg=False)
+    new_store = Store(new_settings.db_path)
+    try:
+        restarted = Relay(new_settings, new_store, S3Writer(new_settings), None, clock=clock)
+        clock.advance(6)
+        assert run(restarted.flush_due()) == 0
+        assert set(objects(s3_admin, "alarm")) == before
+        # Refused for good, not retried: the message is gone from pending and shows as write_failed.
+        assert new_store.get_pending_by_id(mid) is None
+        assert restarted.receipt(mid)["status"] == "write_failed"
+    finally:
+        new_store.close()
+
+
 def test_text_is_gone_from_the_database_files_after_the_write(make_relay, auth, chan):
     clock = Clock()
     relay = coalescing_relay(make_relay, chan, clock)
     c = TestClient(create_app(relay))
-    post(c, auth, text="zebra-first-text-9941", tag="p", coalesce_s=5)
-    post(c, auth, text="zebra-latest-text-9941", tag="p", coalesce_s=5)
+    post(c, auth, text="zebra-first-text-9941", tag="p", coalesce_window_s=5)
+    post(c, auth, text="zebra-latest-text-9941", tag="p", coalesce_window_s=5)
     db = Path(relay.settings.db_path)
     assert b"zebra-latest-text-9941" in db.read_bytes() + Path(str(db) + "-wal").read_bytes()  # held, as documented
     clock.advance(6)
@@ -374,7 +449,7 @@ def test_failed_writes_retry_then_drop(make_relay, auth, s3_admin, chan, monkeyp
     clock = Clock()
     relay = coalescing_relay(make_relay, chan, clock)
     c = TestClient(create_app(relay))
-    msg = post(c, auth, text="flaky", tag="f", coalesce_s=5).json()
+    msg = post(c, auth, text="flaky", tag="f", coalesce_window_s=5).json()
     real_put = relay.writer.put
     failing = {"on": True}
 
@@ -396,7 +471,7 @@ def test_failed_writes_retry_then_drop(make_relay, auth, s3_admin, chan, monkeyp
     assert list(objects(s3_admin, chan).values()) == [b"flaky"] and msg["id"]
 
     failing["on"] = True  # and a write that never works is dropped after the last retry
-    doomed = post(c, auth, text="doomed", tag="d", coalesce_s=1).json()
+    doomed = post(c, auth, text="doomed", tag="d", coalesce_window_s=1).json()
     for delay in (2, *FLUSH_RETRY_S, 1):
         clock.advance(delay)
         run(relay.flush_due())
@@ -429,6 +504,22 @@ def test_cooldown_drops_repeats_and_names_the_message_that_started_it(make_relay
     assert len(objects(s3_admin, chan)) == 3
 
 
+def test_suppressed_idempotency_replays_after_cooldown(make_relay, auth, s3_admin, chan):
+    clock = Clock()
+    relay = coalescing_relay(make_relay, chan, clock)
+    c = TestClient(create_app(relay))
+    first = post(c, auth, text="first", tag="x", cooldown_s=10).json()
+    headers = {**auth, "Idempotency-Key": "suppressed-once"}
+    suppressed = c.post("/v1/messages", headers=headers,
+                        json={"text": "ignored", "tag": "x", "cooldown_s": 10})
+    assert suppressed.status_code == 200 and suppressed.json()["status"] == "suppressed"
+    clock.advance(11)
+    again = c.post("/v1/messages", headers=headers, json={"text": "new", "tag": "x", "cooldown_s": 10})
+    assert again.status_code == 200 and again.headers["idempotent-replayed"] == "true"
+    assert again.json() == suppressed.json() and again.json()["id"] == first["id"]
+    assert list(objects(s3_admin, chan).values()) == [b"first"]
+
+
 def test_suppressed_sends_do_not_use_the_rate_limit(make_relay, auth, chan):
     clock = Clock()
     relay = coalescing_relay(make_relay, chan, clock, EARSHOT_RELAY_RATE_LIMIT="2/min")
@@ -442,16 +533,16 @@ def test_cooldown_after_a_coalesced_write_and_against_a_pending_one(make_relay, 
     clock = Clock()
     relay = coalescing_relay(make_relay, chan, clock)
     c = TestClient(create_app(relay))
-    held = post(c, auth, text="a", tag="k", coalesce_s=30, cooldown_s=3600).json()
+    held = post(c, auth, text="a", tag="k", coalesce_window_s=30, cooldown_s=3600).json()
     assert held["status"] == "coalescing"
-    update = post(c, auth, text="b", tag="k", coalesce_s=30, cooldown_s=3600).json()
+    update = post(c, auth, text="b", tag="k", coalesce_window_s=30, cooldown_s=3600).json()
     assert update["status"] == "coalescing" and update["id"] == held["id"]  # coalescing wins inside an open window
     only_cooldown = post(c, auth, text="c", tag="k", cooldown_s=3600)
     assert only_cooldown.status_code == 200 and only_cooldown.json()["status"] == "suppressed"
     assert only_cooldown.json()["id"] == held["id"] and only_cooldown.json()["key"] is None
     clock.advance(31)
     run(relay.flush_due())
-    after = post(c, auth, text="d", tag="k", coalesce_s=30, cooldown_s=3600)
+    after = post(c, auth, text="d", tag="k", coalesce_window_s=30, cooldown_s=3600)
     assert after.status_code == 200 and after.json()["status"] == "suppressed" and after.json()["key"]
     assert list(objects(s3_admin, chan).values()) == [b"b"]
 
@@ -463,16 +554,16 @@ def test_a_tag_alone_only_labels_the_message(client, auth):
 
 
 @pytest.mark.parametrize("body, code, field", [
-    ({"coalesce_s": 5}, "tag_required", "tag"),
+    ({"coalesce_window_s": 5}, "tag_required", "tag"),
     ({"cooldown_s": 5}, "tag_required", "tag"),
-    ({"tag": "bad tag!", "coalesce_s": 5}, "invalid_tag", "tag"),
-    ({"tag": "", "coalesce_s": 5}, "invalid_tag", "tag"),
-    ({"tag": 5, "coalesce_s": 5}, "invalid_tag", "tag"),
-    ({"tag": "t" * 65, "coalesce_s": 5}, "invalid_tag", "tag"),
-    ({"tag": "t", "coalesce_s": -1}, "invalid_field", "coalesce_s"),
-    ({"tag": "t", "coalesce_s": "5"}, "invalid_field", "coalesce_s"),
-    ({"tag": "t", "coalesce_s": True}, "invalid_field", "coalesce_s"),
-    ({"tag": "t", "coalesce_s": 3601}, "invalid_field", "coalesce_s"),
+    ({"tag": "bad tag!", "coalesce_window_s": 5}, "invalid_tag", "tag"),
+    ({"tag": "", "coalesce_window_s": 5}, "invalid_tag", "tag"),
+    ({"tag": 5, "coalesce_window_s": 5}, "invalid_tag", "tag"),
+    ({"tag": "t" * 65, "coalesce_window_s": 5}, "invalid_tag", "tag"),
+    ({"tag": "t", "coalesce_window_s": -1}, "invalid_field", "coalesce_window_s"),
+    ({"tag": "t", "coalesce_window_s": "5"}, "invalid_field", "coalesce_window_s"),
+    ({"tag": "t", "coalesce_window_s": True}, "invalid_field", "coalesce_window_s"),
+    ({"tag": "t", "coalesce_window_s": 3601}, "invalid_field", "coalesce_window_s"),
     ({"tag": "t", "cooldown_s": 86401}, "invalid_field", "cooldown_s"),
 ])
 def test_hygiene_field_validation(client, auth, body, code, field):
@@ -482,14 +573,14 @@ def test_hygiene_field_validation(client, auth, body, code, field):
 
 
 def test_zero_seconds_means_off(client, auth):
-    r = post(client, auth, text="hi", tag="z", coalesce_s=0, cooldown_s=0)
+    r = post(client, auth, text="hi", tag="z", coalesce_window_s=0, cooldown_s=0)
     assert r.status_code == 202 and r.json()["status"] == "stored"
 
 
 def test_background_loop_flushes_a_closed_window(make_relay, auth, s3_admin, chan):
     relay = make_relay(EARSHOT_RELAY_CHANNELS=chan, EARSHOT_RELAY_DEFAULT_CHANNEL=chan)
     with TestClient(create_app(relay)) as c:  # lifespan on: the flush loop runs on the real clock
-        msg = post(c, auth, text="loop me", tag="loop", coalesce_s=0.2).json()
+        msg = post(c, auth, text="loop me", tag="loop", coalesce_window_s=0.2).json()
         deadline = time.time() + 4
         while time.time() < deadline and not objects(s3_admin, chan):
             time.sleep(0.1)
@@ -525,18 +616,18 @@ def test_compat_coalesce_and_cooldown_by_header_or_query(compat, auth, s3_admin,
     relay, clock, c = compat
     ids = set()
     for n in range(3):
-        r = c.post("/compat/ntfy/phone", headers={**auth, "X-Earshot-Tag": "backup", "X-Earshot-Coalesce-S": "30"},
+        r = c.post("/compat/ntfy/phone", headers={**auth, "X-Earshot-Tag": "backup", "X-Earshot-Coalesce-Window-S": "30"},
                    content=f"backup step {n}".encode())
         assert r.status_code == 200 and r.headers["x-earshot-status"] == "coalescing", r.text
         ids.add(r.headers["x-earshot-message-id"])
-    gotify = c.post("/compat/gotify/message?earshot_tag=backup&earshot_coalesce_s=30", headers={"X-Gotify-Key": TOKEN},
+    gotify = c.post("/compat/gotify/message?earshot_tag=backup&earshot_coalesce_window_s=30", headers={"X-Gotify-Key": TOKEN},
                     json={"message": "backup step 3", "title": ""})
     assert gotify.status_code == 200 and gotify.headers["x-earshot-status"] == "coalescing"
     ids.add(gotify.headers["x-earshot-message-id"])
-    pushover = c.post("/compat/pushover/1/messages.json?earshot_tag=backup&earshot_coalesce_s=30",
+    pushover = c.post("/compat/pushover/1/messages.json?earshot_tag=backup&earshot_coalesce_window_s=30",
                       data={"token": TOKEN, "user": "u", "message": "backup step 4"})
     join = c.get("/compat/join/_ah/api/messaging/v1/sendPush", params={
-        "apikey": TOKEN, "text": "backup step 5", "earshot_tag": "backup", "earshot_coalesce_s": "30"})
+        "apikey": TOKEN, "text": "backup step 5", "earshot_tag": "backup", "earshot_coalesce_window_s": "30"})
     assert pushover.json()["status"] == 1 and join.json()["success"] is True
     assert "x-earshot-ignored" not in join.headers  # the earshot_ parameters are ours, not ignored fields
     ids.add(pushover.headers["x-earshot-message-id"])
@@ -550,12 +641,12 @@ def test_compat_coalesce_and_cooldown_by_header_or_query(compat, auth, s3_admin,
     assert len(objects(s3_admin, chan)) == 1
 
 
-def test_compat_audio_ignores_hygiene_options_by_name(compat, auth, s3_admin, chan):
+def test_compat_audio_attachment_is_unsupported(compat, auth, s3_admin, chan):
     _, _, c = compat
-    r = c.post("/compat/ntfy/phone?earshot_tag=x&earshot_coalesce_s=30", headers={**auth, "Filename": "ding.wav"},
+    r = c.post("/compat/ntfy/phone?earshot_tag=x&earshot_coalesce_window_s=30", headers={**auth, "Filename": "ding.wav"},
                content=b"RIFF" + b"\x00" * 400)
-    assert r.status_code == 200 and "x-earshot-status" not in r.headers
-    assert "earshot_tag" in r.headers["x-earshot-ignored"]
+    assert r.status_code == 400 and "attachments are unsupported" in r.json()["error"]
+    assert objects(s3_admin, chan) == {}
 
 
 # ---- MCP and CLI --------------------------------------------------------------------------------------------------------
@@ -570,13 +661,13 @@ def test_cli_say_carries_the_hygiene_flags(live_relay, monkeypatch, capsys, s3_a
     sent = json.loads(capsys.readouterr().out)
     assert sent["normalized"] is True
     assert s3_admin.get_object(Bucket=BUCKET, Key=sent["key"])["Body"].read() == b"bold text"
-    assert main(["say", "--json", "--tag", "cli-t", "--coalesce-s", "300", "held"]) == 0
+    assert main(["say", "--json", "--tag", "cli-t", "--coalesce-window-s", "300", "held"]) == 0
     held = json.loads(capsys.readouterr().out)
     assert held["status"] == "coalescing" and held["tag"] == "cli-t"
     assert main(["say", "--tag", "cli-t", "--cooldown-s", "300", "again"]) == 0
     out = capsys.readouterr()
     assert out.out.strip() == held["id"] and "suppressed" in out.err
-    assert main(["say", "--coalesce-s", "5", "no tag"]) == 1
+    assert main(["say", "--coalesce-window-s", "5", "no tag"]) == 1
     assert "tag_required" in capsys.readouterr().err
     assert main(["status"]) == 0
     assert "1 message(s) held for coalescing" in capsys.readouterr().out
@@ -589,10 +680,10 @@ def test_mcp_say_exposes_and_forwards_the_options(make_relay, chan):
     relay = coalescing_relay(make_relay, chan, clock)
     with TestClient(create_app(relay), base_url="http://relay.example.com") as c:
         tools = {t["name"]: t for t in rpc(c, "tools/list")["result"]["tools"]}
-        assert {"normalize", "tag", "coalesce_s", "cooldown_s"} <= set(tools["say"]["inputSchema"]["properties"])
+        assert {"normalize", "tag", "coalesce_window_s", "cooldown_s"} <= set(tools["say"]["inputSchema"]["properties"])
         assert "coalescing" in tools["say"]["description"]
         sent = call(c, "say", {"text": "\u2705 deploying", "normalize": True, "tag": "mcp",
-                               "coalesce_s": 60})["structuredContent"]
+                               "coalesce_window_s": 60})["structuredContent"]
         assert sent["status"] == "coalescing" and sent["tag"] == "mcp" and sent["normalized"] is True
         assert "nothing is in the bucket yet" in sent["next"]
         again = call(c, "say", {"text": "x", "tag": "mcp", "cooldown_s": 60})["structuredContent"]

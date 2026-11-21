@@ -53,10 +53,10 @@ the messages a `tag` and say what to do with repeats.
 | Field | Meaning |
 | --- | --- |
 | `tag` | 1 to 64 characters, `A-Za-z0-9._:-`, starting with a letter or digit. Scopes to the channel: the same tag on two channels is two tags. |
-| `coalesce_s` | 0 to 3600. Hold the write. Every message with the tag inside the window replaces the text; one object, carrying the latest text, is written when the window closes. |
+| `coalesce_window_s` | 0 to 3600. Hold the write. Every message with the tag inside the window replaces the text; one object, carrying the latest text, is written when the window closes. |
 | `cooldown_s` | 0 to 86400. A message with the tag within this many seconds of the last written (or held) one is dropped. |
 
-`coalesce_s` or `cooldown_s` without a `tag` is `422 tag_required`. `0` or `null` turns either off.
+`coalesce_window_s` or `cooldown_s` without a `tag` is `422 tag_required`. `0` or `null` turns either off.
 
 **Coalescing answers `202` with `"status": "coalescing"`**, the message `id` that will exist when the window closes, and
 `write_at`. `key` is `null` until then; the key is `<channel>/<hex of id>.<ext>`. Every message that merges into the
@@ -77,7 +77,7 @@ holds the text before writing and writes once. The consequences are all delibera
   checkpointed so it does not linger). This is the one exception to "the relay keeps no message text on disk".
 - Held messages survive a restart. At startup the relay writes every message whose window has already closed; windows
   still open keep waiting out the remainder.
-- The window delays delivery by up to `coalesce_s`. Do not coalesce anything urgent (an `alarm` message you
+- The window delays delivery by up to `coalesce_window_s`. Do not coalesce anything urgent (an `alarm` message you
   tagged would wait out its window too).
 - One send is counted against the rate limit per window, when it opens. Updates merged into an open window are free.
 - A write that fails is retried after 10, 30 and 60 seconds, then given up on (log line `coalesce_dropped`). The
@@ -85,20 +85,28 @@ holds the text before writing and writes once. The consequences are all delibera
   `write_failed` (nothing is stored; send it again), `GET /v1/status` counts it in `hygiene.coalescing_failed`, and a
   configured watchdog sends one notice (`earshot.watchdog.write_failed`). The record is pruned with the other index rows
   after `EARSHOT_RELAY_RETENTION_DAYS`. Nothing is retried forever.
+- The write re-checks the policy that admitted the message. If the relay restarted with its channel removed from
+  `EARSHOT_RELAY_CHANNELS`, with compat alarm switched off (for a compat sender's top priority promoted to `alarm`), or
+  without server speech, nothing is written: the receipt reads `write_failed` at once (log line `coalesce_refused`),
+  with the same status count and watchdog notice.
+- The window is fixed: it ends `coalesce_window_s` after the first message, whether or not the relay has written it
+  yet. A send that arrives after the end writes the closed window first (with its own text) and then opens a new
+  window; it never replaces the text of a window that has closed. If that closed window's write is waiting for a
+  retry, a new `coalesce_window_s` send under the tag is `503 coalesce_busy` (with `Retry-After`) until it is written.
 - `Idempotency-Key` works across merges: a retried request replays the same `202`.
-- Coalescing is for text. The audio upload has no such fields; on the compat routes, hygiene options sent with an
-  audio file are ignored and listed in `X-Earshot-Ignored`.
+- Coalescing is for text. The native audio upload has no hygiene fields; compat attachments are unsupported
+  (ignored and named when separate message text is present, rejected otherwise).
 
 ntfy's sequence id and Gotify's extras are **not** mapped: they promise to replace a delivered notification, which
 this relay cannot do, and mapping them would claim more than it does. Producers on those routes use the
-`X-Earshot-Tag`, `X-Earshot-Coalesce-S`, `X-Earshot-Cooldown-S` and `X-Earshot-Normalize` headers (or the query
-parameters `earshot_tag`, `earshot_coalesce_s`, `earshot_cooldown_s`, `earshot_normalize`). A success then carries
+`X-Earshot-Tag`, `X-Earshot-Coalesce-Window-S`, `X-Earshot-Cooldown-S` and `X-Earshot-Normalize` headers (or the query
+parameters `earshot_tag`, `earshot_coalesce_window_s`, `earshot_cooldown_s`, `earshot_normalize`). A success then carries
 `X-Earshot-Status: coalescing|suppressed`; the protocol's own body still says it accepted the request.
 
 ```sh
 # every "disk full" within 60 s is one spoken message, the latest
 curl -fsS -X POST http://127.0.0.1:8080/v1/messages -H "Authorization: Bearer $EARSHOT_API_TOKEN" \
-  -H "Content-Type: application/json" -d '{"text": "Disk 91 percent full", "tag": "disk", "coalesce_s": 60}'
+  -H "Content-Type: application/json" -d '{"text": "Disk 91 percent full", "tag": "disk", "coalesce_window_s": 60}'
 earshot-relay say --tag disk --cooldown-s 600 "Disk is still full"
 ```
 
@@ -114,19 +122,22 @@ EARSHOT_RELAY_WATCHDOG_COOLDOWN_S=1800             # minimum seconds between not
 EARSHOT_RELAY_WATCHDOG_FORMAT=auto                 # auto, json or text
 ```
 
-It needs [receipts](receipts.md) set up (`EARSHOT_RELAY_BEACON_TOKEN`): without beacons the relay cannot tell a silent
-phone from a phone with no beacon URL, so it refuses to start rather than cry wolf.
+It needs [receipts](receipts.md) set up (`EARSHOT_RELAY_BEACON_TOKEN`). Without a beacon token the relay starts, but
+disables the watchdog; status reports it disabled. With a watchdog URL and no threshold, the threshold defaults to 120 s.
 
-**What it watches is sends, not phones.** A message that has been stored for `WATCHDOG_S` seconds with no beacon
-from any device (no `detected`, `started`, `finished`, `failed` or `missed`) opens an incident, and the relay POSTs
-one notice. The app sends no heartbeat, so **an idle dead phone raises nothing**: with no traffic the watchdog is
-silent. A notice means "no device reported on this message in time", not "the phone is off" (it may be offline, not
-listening, or the beacon URL may be wrong).
+**What it watches is sends, not phones.** A stored key with no matching `detected` beacon after `WATCHDOG_S` seconds
+opens an incident. A beacon for another key, or a `started`/`failed` beacon, cannot clear that missing detection.
+The app sends no heartbeat, so **an idle dead phone raises nothing**.
 
 - **A held message that was never written** (see coalescing above) is its own incident: one notice, then closed. A
   playback beacon from another message does not clear it, because that message will not play.
-- **One notice per incident.** The incident closes when any playback beacon arrives from any device (a late, parked
-  beacon counts); more undetected sends meanwhile do not notify again.
+- **Per message, never a global cursor.** Only a beacon for a message's own key reports on it. A receipt for a later
+  message does not cover an earlier one that got none, and a beacon for a key the relay never stored covers nothing.
+- **One notice per incident.** Until the notice goes out (it may wait for the cooldown or a webhook retry), the
+  incident follows the oldest overdue message that still has no report, and closes silently if they all report late.
+  Once announced, it covers every message that falls overdue while it is open (more undetected sends do not notify
+  again), and it closes when a beacon received after the notice reports on its message or on any later one: the phone
+  is reporting again. A message with no report is announced at most once.
 - **Cooldown delays, it does not mute.** A new incident inside `WATCHDOG_COOLDOWN_S` of the last notice waits it out
   and is announced then, if it is still open. One that clears in the meantime sends nothing.
 - **Body.** `json` (the default) is `{"event": "earshot.watchdog.no_playback_report", "text", "message_id", "channel",

@@ -204,7 +204,7 @@ def check_tag(tag: object) -> str | None:
 
 
 def check_seconds(name: str, value: object, maximum: float) -> float | None:
-    """coalesce_s and cooldown_s: a number of seconds above 0 and at most `maximum`. null and 0 mean off."""
+    """coalesce_window_s and cooldown_s: positive seconds up to `maximum`; null and 0 mean off."""
     if value is None:
         return None
     if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -212,6 +212,25 @@ def check_seconds(name: str, value: object, maximum: float) -> float | None:
     if value != value or value < 0 or value > maximum:  # NaN, negative, too long
         raise ApiError(422, "invalid_field", f"{name} must be between 0 and {maximum:g} seconds", name)
     return float(value) or None
+
+
+# 1.1.0 shipped the coalescing window as `coalesce_s` (JSON field, MCP argument, --coalesce-s, X-Earshot-Coalesce-S,
+# earshot_coalesce_s). The specified name is `coalesce_window_s`; the old one is still accepted everywhere.
+LEGACY_COALESCE_NAME = "coalesce_s"
+
+
+def check_window(window: object, legacy: object = None) -> float | None:
+    """coalesce_window_s, or its 1.1.0 name coalesce_s. Both at once must say the same thing."""
+    if legacy is None:
+        return check_seconds("coalesce_window_s", window, MAX_COALESCE_S)
+    old = check_seconds(LEGACY_COALESCE_NAME, legacy, MAX_COALESCE_S)
+    if window is None:
+        return old
+    new = check_seconds("coalesce_window_s", window, MAX_COALESCE_S)
+    if new != old:
+        raise ApiError(422, "invalid_field", "coalesce_window_s and coalesce_s (its 1.1.0 name) disagree; send only "
+                                             "coalesce_window_s", LEGACY_COALESCE_NAME)
+    return new
 
 
 def check_flag(name: str, value: object) -> bool | None:

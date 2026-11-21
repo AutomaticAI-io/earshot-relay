@@ -307,8 +307,6 @@ def test_the_background_loop_is_wired_into_the_app(setup, auth):
 
 @pytest.mark.parametrize("extra, expect", [
     ({"EARSHOT_RELAY_WATCHDOG_S": "120"}, "EARSHOT_RELAY_WATCHDOG_URL is required"),
-    ({"EARSHOT_RELAY_WATCHDOG_S": "120", "EARSHOT_RELAY_WATCHDOG_URL": HOOK, "EARSHOT_RELAY_BEACON_TOKEN": None},
-     "EARSHOT_RELAY_WATCHDOG_S needs receipts"),
     ({"EARSHOT_RELAY_WATCHDOG_S": "5", "EARSHOT_RELAY_WATCHDOG_URL": HOOK}, "between 10 and 86400"),
     ({"EARSHOT_RELAY_WATCHDOG_S": "abc", "EARSHOT_RELAY_WATCHDOG_URL": HOOK}, "must be a whole number"),
     ({"EARSHOT_RELAY_WATCHDOG_S": "120", "EARSHOT_RELAY_WATCHDOG_URL": "ftp://x/y"}, "http\\(s\\) URL"),
@@ -316,12 +314,32 @@ def test_the_background_loop_is_wired_into_the_app(setup, auth):
      "FORMAT must be one of"),
     ({"EARSHOT_RELAY_WATCHDOG_S": "120", "EARSHOT_RELAY_WATCHDOG_URL": HOOK, "EARSHOT_RELAY_WATCHDOG_COOLDOWN_S": "5"},
      "COOLDOWN_S must be between"),
-    ({"EARSHOT_RELAY_WATCHDOG_URL": HOOK}, "EARSHOT_RELAY_WATCHDOG_URL is set but EARSHOT_RELAY_WATCHDOG_S is not"),
     ({"EARSHOT_RELAY_WATCHDOG_COOLDOWN_S": "100"}, "COOLDOWN_S is set but EARSHOT_RELAY_WATCHDOG_S is not"),
 ])
 def test_watchdog_config_errors(moto_endpoint, tmp_path, extra, expect):
     with pytest.raises(ConfigError, match=expect):
         load_settings(base_env(moto_endpoint, str(tmp_path), **extra), check_ffmpeg=False)
+
+
+def test_watchdog_url_uses_default_threshold_and_missing_beacons_disable_it(make_relay, moto_endpoint, tmp_path):
+    s = load_settings(base_env(moto_endpoint, str(tmp_path), EARSHOT_RELAY_WATCHDOG_URL=HOOK), check_ffmpeg=False)
+    assert s.watchdog_s == 120
+    disabled = make_relay(EARSHOT_RELAY_WATCHDOG_URL=HOOK, EARSHOT_RELAY_BEACON_TOKEN=None)
+    assert disabled.watchdog is None and disabled.status()["watchdog"]["reason"] == "beacon_token_missing"
+
+
+def test_unrelated_detection_never_clears_missing_key(setup, auth):
+    relay, clock, hook, c = setup()
+    first = post(c, auth, text="missing").json()
+    second = post(c, auth, text="detected").json()
+    beacon(relay, second["key"], clock)
+    clock.advance(121)
+    check(relay)
+    assert len(hook.requests) == 1
+    assert relay.watchdog.status()["incident_message"] == first["id"]
+    beacon(relay, first["key"], clock)
+    check(relay)
+    assert relay.watchdog.status()["state"] == "idle"
 
 
 def test_watchdog_off_values_and_url_file(moto_endpoint, tmp_path):

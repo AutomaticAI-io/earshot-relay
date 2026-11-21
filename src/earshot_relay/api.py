@@ -21,7 +21,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from . import RECEIPT_WORDING, __version__
 from . import compat
 from .beacons import MAX_BODY_BYTES as BEACON_MAX_BYTES
-from .beacons import validate_beacon
+from .beacons import parse_rfc3339, validate_beacon
 from .compat import read_capped
 from .config import COMPAT_PROTOCOLS
 from .keys import AUDIO_EXTENSIONS, ApiError, audio_extension
@@ -32,7 +32,8 @@ log = logging.getLogger("earshot_relay")
 MAX_JSON_BYTES = 256 * 1024
 MULTIPART_OVERHEAD = 64 * 1024
 BEACON_PATH_RE = re.compile(r"^/v1/beacons/[^/]+$")
-TEXT_FIELDS = {"text", "channel", "speech", "voice", "normalize", "tag", "coalesce_s", "cooldown_s"}
+TEXT_FIELDS = {"text", "channel", "speech", "voice", "normalize", "tag", "coalesce_window_s", "cooldown_s",
+               "coalesce_s"}  # coalesce_s: the 1.1.0 name of coalesce_window_s, still accepted
 IDEMPOTENCY_KEY_RE = re.compile(r"^[\x20-\x7e]{1,255}$")
 # JSON parse failures: RecursionError is what json.loads raises on very deep nesting.
 JSON_ERRORS = (ValueError, UnicodeDecodeError, RecursionError)
@@ -49,6 +50,7 @@ ERROR_DESCRIPTIONS = {
     422: "Invalid field",
     429: "Rate limited (see Retry-After)",
     502: "Storage or TTS failure",
+    503: "A held (coalescing) message is past its window and not yet written; retry after Retry-After",
     504: "TTS timeout",
 }
 
@@ -84,13 +86,16 @@ class TextMessageRequest(BaseModel):
         None, description="true: strip emoji and markdown, say URLs as 'link', collapse whitespace and cut at "
                           "EARSHOT_RELAY_MAX_WORDS (at a sentence end). false: send the text as given. Omitted: the "
                           "relay's EARSHOT_RELAY_NORMALIZE default. Text only; audio is never touched.")
-    tag: str | None = Field(None, description="A label for coalesce_s and cooldown_s: letters, digits and . _ : -, "
+    tag: str | None = Field(None, description="A label for coalesce_window_s and cooldown_s: letters, digits and . _ : -, "
                                               "up to 64, unique per channel. Alone it only labels the message.")
-    coalesce_s: float | None = Field(
+    coalesce_window_s: float | None = Field(
         None, description="Needs tag. Hold the write for this many seconds (up to 3600) from the first message under "
                           "the tag; only the latest text sent in the window is written, once. Answers 202 "
                           "status=coalescing with the id the object will have. Pre-write only: an object already "
                           "written cannot be replaced.")
+    coalesce_s: float | None = Field(
+        None, deprecated=True, description="The 1.1.0 name of coalesce_window_s, still accepted. Send only one of them; "
+                                           "if both are sent they must be equal.")
     cooldown_s: float | None = Field(
         None, description="Needs tag. Drop this message if the tag was written (or is being held) within this many "
                           "seconds (up to 86400): answers 200 status=suppressed with the id of the message that "
@@ -183,7 +188,7 @@ class StatusBucket(BaseModel):
 class StatusSpeech(BaseModel):
     default: Literal["device", "server"]
     server_configured: bool
-    provider: Literal["openai", "elevenlabs"] | None = Field(default=None, description="The TTS provider, when server speech is configured")
+    provider: Literal["openai", "elevenlabs", "gemini"] | None = Field(default=None, description="The TTS provider, when server speech is configured")
 
 
 class StatusDevice(BaseModel):
@@ -233,13 +238,15 @@ class StatusHygiene(BaseModel):
     normalize: Literal["off", "basic"] = Field(description="EARSHOT_RELAY_NORMALIZE: the default for text; a "
                                                            "request's normalize field overrides it")
     max_words: int | None = Field(description="EARSHOT_RELAY_MAX_WORDS (applies when text is normalized)")
-    coalescing_pending: int = Field(description="Messages held right now for coalesce_s")
+    coalescing_pending: int = Field(description="Messages held right now for coalesce_window_s")
     coalescing_failed: int = Field(description="Held messages whose write failed every retry, still inside "
                                                "retention (their receipt reads write_failed)")
 
 
 class StatusWatchdog(BaseModel):
     enabled: bool = Field(description="EARSHOT_RELAY_WATCHDOG_S is set (it needs receipts and a notice URL)")
+    reason: Literal["beacon_token_missing", "not_configured"] | None = Field(
+        None, description="Why the watchdog is disabled, when enabled=false")
     after_s: int | None = None
     cooldown_s: int | None = None
     format: Literal["json", "text"] | None = Field(None, description="Body of the notice: JSON webhook, or plain "
@@ -499,21 +506,21 @@ def _api_routes(app: FastAPI, relay: Relay) -> None:
             "multipart/form-data: an audio file. The relay finishes PutObject (and TTS) before it answers, so 202 "
             "means stored in the bucket; delivery to the phone is asynchronous. Location points at the receipt. "
             "With an Idempotency-Key header, a repeat of the same key within 24 hours returns the original 202 body "
-            "(with Idempotent-Replayed: true) and writes nothing. Text can also carry tag with coalesce_s (hold the "
+            "(with Idempotent-Replayed: true) and writes nothing. Text can also carry tag with coalesce_window_s (hold the "
             "write, write only the latest text: 202 status=coalescing) or cooldown_s (drop a repeat: 200 "
             "status=suppressed), and normalize (strip emoji, markdown and URLs before storing)."
         ),
         responses={
             200: {"description": "Suppressed by cooldown_s: nothing was written (status=suppressed)",
                   "model": MessageAccepted},
-            202: {"description": "Stored in the bucket (status=stored), or held for coalesce_s "
+            202: {"description": "Stored in the bucket (status=stored), or held for coalesce_window_s "
                                  "(status=coalescing)", "headers": {
                 "Location": {"description": "/v1/messages/{id}", "schema": {"type": "string"}},
                 "Idempotent-Replayed": {"description": "true when this is the original response to an earlier "
                                                        "request with the same Idempotency-Key",
                                         "schema": {"type": "string"}},
             }},
-            **_errors(400, 401, 403, 413, 415, 422, 429, 502, 504),
+            **_errors(400, 401, 403, 413, 415, 422, 429, 502, 503, 504),
         },
         openapi_extra={"requestBody": {"required": True, "content": {
             "application/json": {"schema": TextMessageRequest.model_json_schema()},
@@ -564,8 +571,8 @@ def _api_routes(app: FastAPI, relay: Relay) -> None:
                     raise ApiError(422, "invalid_field", f"{name} must be a string", name)
             return await relay.send_text(text=data["text"], channel=data.get("channel"), speech=data.get("speech"),
                                          voice=data.get("voice"), idem_key=idem_key, normalize=data.get("normalize"),
-                                         tag=data.get("tag"), coalesce_s=data.get("coalesce_s"),
-                                         cooldown_s=data.get("cooldown_s"))
+                                         tag=data.get("tag"), coalesce_window_s=data.get("coalesce_window_s"),
+                                         cooldown_s=data.get("cooldown_s"), coalesce_s=data.get("coalesce_s"))
         if media == "multipart/form-data":
             return await _send_multipart(request, relay, idem_key)
         raise ApiError(415, "unsupported_media_type",
@@ -720,6 +727,11 @@ def create_app(relay: Relay, *, serve_beacons: bool | None = None, mcp: bool = T
             else:
                 yield
             tg.cancel_scope.cancel()
+        if relay.watchdog is not None:
+            try:  # the watchdog sleeps while nothing is due: stamp it alive so a quick restart keeps its state
+                relay.watchdog.mark_alive()
+            except Exception as exc:  # noqa: BLE001 - shutting down regardless
+                log.warning(json.dumps({"event": "watchdog_state_not_saved", "error": type(exc).__name__}))
 
     app = _base_app("earshot-relay", lifespan)
     _install_error_handlers(app)
@@ -764,14 +776,17 @@ def openapi_document(relay: Relay) -> dict:
 
 
 async def _flush_loop(relay: Relay) -> None:
-    """Writes coalesced messages when their window closes. The first pass is the startup flush: anything that came
-    due while the relay was down is written now, and a window still open keeps waiting out its remainder."""
+    """Flush at the earliest persisted due time, or wake when a send changes the queue."""
     while True:
         try:
+            version = relay.signal.version
             await relay.flush_due()
+            due = relay.store.next_pending_at()
+            seconds = max(0.01, ((parse_rfc3339(due) or relay.clock()) - relay.clock()).total_seconds()) if due else None
+            await relay.signal.wait(seconds, since=version)
         except Exception as exc:  # noqa: BLE001 - flushing must never take the relay down
             log.warning(json.dumps({"event": "flush_failed", "error": type(exc).__name__}))
-        await anyio.sleep(1)
+            await relay.signal.wait(30)
 
 
 async def _prune_loop(relay: Relay) -> None:

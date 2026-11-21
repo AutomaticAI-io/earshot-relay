@@ -29,7 +29,7 @@ Other MCP clients use the same two shapes: a URL plus an `Authorization` header,
 
 | Tool | Purpose |
 | --- | --- |
-| `say(text, channel?, speech?, voice?, normalize?, tag?, coalesce_s?, cooldown_s?)` | Store a short message for the phone to speak. A success means stored, not played; with `coalesce_s` it means held, to be written once when the window closes ([hygiene](hygiene.md)). Refuses the `alarm` channel (and the default channel can never be `alarm`). |
+| `say(text, channel?, speech?, voice?, normalize?, tag?, coalesce_window_s?, cooldown_s?)` (`coalesce_s`, the 1.1.0 name of `coalesce_window_s`, is still accepted) | Store a short message for the phone to speak. A success means stored, not played; with `coalesce_window_s` it means held, to be written once when the window closes ([hygiene](hygiene.md)). Refuses the `alarm` channel (and the default channel can never be `alarm`). |
 | `alarm(text)` | LOUD. Exists only when `alarm` is in `EARSHOT_RELAY_CHANNELS`. See the caveat below. |
 | `receipt(id="latest", wait_seconds=0)` | What the phone did with a message, plus `final` (whether waiting longer could still change it). Describes device playback, not that a person heard it. |
 | `recent(limit=10, channel?)` | Recent messages with their status. |

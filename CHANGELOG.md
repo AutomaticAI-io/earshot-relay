@@ -1,7 +1,46 @@
 # Changelog
 
-All notable changes. Versions follow semver. A `202` always means stored (or, with `coalesce_s`, held), never played;
+All notable changes. Versions follow semver. A `202` always means stored (or, with `coalesce_window_s`, held), never played;
 receipts describe device playback, never that a person heard anything.
+
+## Unreleased (1.1.1)
+
+Reconciles 1.1.0 with the spec-gap corrections that had been left on the `ears25-spec-gaps` branch. Both sets are kept.
+
+### Fixed
+
+- **The watchdog correlates per message.** A beacon only ever accounts for its own message: a receipt for B no longer
+  clears or hides an earlier A that got none, and a beacon for a key the relay never stored covers nothing. A message
+  never reported on is announced once and no longer blocks later notices (a `covered_until` watermark in the saved
+  state; a state saved by 1.1.0 loads unchanged). The notice says how many later messages it also covers.
+- **Held writes re-check policy when they flush**, including after a restart: a message held for a channel that was
+  since removed from `EARSHOT_RELAY_CHANNELS`, a compat alarm after `EARSHOT_RELAY_COMPAT_ALARM` was switched off, or
+  server speech that is no longer configured, is not written. It reads `write_failed` in its receipt, is counted in
+  `hygiene.coalescing_failed` and raises one watchdog notice that names the reason.
+- **A coalescing window is fixed.** It ends `coalesce_window_s` after its first message. A send under a tag whose
+  window has closed but is not yet flushed writes the old text first, then starts a new window; if that write is
+  waiting for a retry the send is `503 coalesce_busy` with `Retry-After`. Replacement text can no longer slip into a
+  window that has expired.
+- **A suppressed request keeps its `Idempotency-Key` outcome** (schema v5, `suppressed_idem`), so a retry after the
+  cooldown replays `suppressed` instead of being written, also across a restart.
+- The flush loop and the watchdog run on events (a send, a beacon, the next deadline), not on a polling timer.
+
+### Added
+
+- Per-channel text hygiene: `EARSHOT_RELAY_CHANNEL_HYGIENE`, a JSON object `{channel: {normalize, max_words}}`.
+- **Gemini TTS adapter** (`EARSHOT_RELAY_TTS_PROVIDER=gemini`, `GEMINI_API_KEY`). Tested against a stub server only; no
+  live Gemini call has been made.
+- `EARSHOT_RELAY_WATCHDOG_URL` alone now enables the watchdog at 120 s. Without a beacon token it stays off and
+  `GET /v1/status` says why (`reason: beacon_token_missing`) instead of refusing to start.
+
+### Changed
+
+- The coalescing field is `coalesce_window_s` everywhere (JSON, MCP, CLI `--coalesce-window-s`, `X-Earshot-Coalesce-Window-S`,
+  `earshot_coalesce_window_s`). The 1.1.0 name `coalesce_s` is still accepted on every one of them; sending both with
+  different values is `422`.
+- Compat routes are text only: a ntfy, Gotify, Pushover or Join request that carries an attachment instead of text is
+  `400 empty_text` (1.1.0 could play an audio attachment). Send audio through `POST /v1/messages`.
+- Schema v5 adds `pending.compat`, `pending.window_end_at` and the `suppressed_idem` table, migrated in place.
 
 ## 1.1.0
 
@@ -16,7 +55,7 @@ Producer compatibility and hygiene for every sender (HTTP, MCP, CLI and the comp
 - **Text normalizer**: `EARSHOT_RELAY_NORMALIZE=off|basic` (default `off`), a per-request `normalize` true/false,
   and `EARSHOT_RELAY_MAX_WORDS`. Strips emoji and markdown, says URLs as "link", collapses whitespace, cuts at a
   sentence boundary. Text only, never audio. Responses report `normalized` and `truncated`.
-- **Coalesce and cooldown by tag**: `tag` with `coalesce_s` holds the write and writes only the latest text once
+- **Coalesce and cooldown by tag**: `tag` with `coalesce_window_s` holds the write and writes only the latest text once
   (`202`, status `coalescing`, the eventual id); `tag` with `cooldown_s` drops repeats (`200`, status `suppressed`).
   Held messages persist in SQLite and flush at startup. Pre-write by design: the relay holds `PutObject` only and
   cannot replace an object. ntfy sequence ids and Gotify extras are not mapped. Compat routes take the same options as
@@ -29,7 +68,7 @@ Producer compatibility and hygiene for every sender (HTTP, MCP, CLI and the comp
   environment only, voice id required, model id configurable, mp3 or opus, then the existing lead-in to Ogg/Opus.
   Tested against a stub server only. Docs for local OpenAI-compatible voices (Kokoro-FastAPI, openedai-speech, LocalAI),
   marked untested.
-- MCP `say` and CLI `say` take `normalize`, `tag`, `coalesce_s` and `cooldown_s`; `GET /v1/status` reports the TTS
+- MCP `say` and CLI `say` take `normalize`, `tag`, `coalesce_window_s` and `cooldown_s`; `GET /v1/status` reports the TTS
   provider, hygiene settings and watchdog state; `earshot-relay doctor` checks the watchdog.
 
 ### Fixed (review round 2)

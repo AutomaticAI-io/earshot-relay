@@ -171,7 +171,8 @@ def cmd_token(args) -> int:
 def cmd_say(args) -> int:
     with _client() as c:
         result = c.say(_read_text(args.text), args.channel, args.speech, args.voice, args.idempotency_key,
-                       normalize=args.normalize, tag=args.tag, coalesce_s=args.coalesce_s, cooldown_s=args.cooldown_s)
+                       normalize=args.normalize, tag=args.tag, coalesce_window_s=args.coalesce_window_s, cooldown_s=args.cooldown_s,
+                       coalesce_s=args.coalesce_s)
         _print_sent(result, args)
     if result.get("status") == "coalescing" and not args.quiet and not args.json:
         print(f"# held until {result['write_at']}; only the latest text under tag '{result['tag']}' is written",
@@ -361,9 +362,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--speech", choices=["device", "server"], default=None)
     sp.add_argument("--voice", default=None, help="server TTS voice")
     normalize_flag(sp)
-    sp.add_argument("--tag", default=None, help="label for --coalesce-s and --cooldown-s")
-    sp.add_argument("--coalesce-s", type=float, default=None, metavar="SECONDS",
+    sp.add_argument("--tag", default=None, help="label for --coalesce-window-s and --cooldown-s")
+    sp.add_argument("--coalesce-window-s", type=float, default=None, metavar="SECONDS",
                     help="needs --tag: hold the write this long and write only the latest text sent under the tag")
+    sp.add_argument("--coalesce-s", type=float, default=None, metavar="SECONDS",
+                    help="the 1.1.0 name of --coalesce-window-s, still accepted")
     sp.add_argument("--cooldown-s", type=float, default=None, metavar="SECONDS",
                     help="needs --tag: drop this message if the tag was written within this many seconds")
     idem_flag(sp)

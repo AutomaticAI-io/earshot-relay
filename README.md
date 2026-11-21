@@ -63,12 +63,12 @@ Retrying a send? Pass an `Idempotency-Key` header (CLI: `--idempotency-key`): th
 
 | | |
 | --- | --- |
-| `POST /v1/messages` | Text (`{"text": ...}`) or an audio file (multipart). Returns 202 once the object is stored in the bucket, or held (`status: coalescing`) when sent with `coalesce_s`. Optional `Idempotency-Key` header. |
+| `POST /v1/messages` | Text (`{"text": ...}`) or an audio file (multipart). Returns 202 once the object is stored in the bucket, or held (`status: coalescing`) when sent with `coalesce_window_s`. Optional `Idempotency-Key` header. |
 | `GET /v1/messages/{id}` | The receipt: `stored`, `detected`, `started`, `finished`, `skipped`, `failed`, `missed` or `unconfirmed`, with a timeline. `?wait=30` long-polls. |
 | `GET /v1/messages`, `GET /v1/status` | Recent messages; relay, bucket and device state. |
 | `POST /v1/doctor` | Checks configuration and the bucket write. |
 | `POST /v1/beacons/{token}` | Where the phone reports what it did. This is what makes receipts possible. |
-| `tag`, `coalesce_s`, `cooldown_s`, `normalize` | Hygiene for every sender: strip emoji, markdown and URLs before speaking, merge a burst under one tag into one message, drop repeats, and an optional delivery watchdog that posts a notice when sends get no playback report ([docs/hygiene.md](docs/hygiene.md)). |
+| `tag`, `coalesce_window_s`, `cooldown_s`, `normalize` | Hygiene for every sender: strip emoji, markdown and URLs before speaking, merge a burst under one tag into one message, drop repeats, and an optional delivery watchdog that posts a notice when sends get no playback report ([docs/hygiene.md](docs/hygiene.md)). |
 | `/compat/...` | Optional ntfy, Gotify, Pushover and Join request shapes, so existing producers switch by changing a URL ([docs/compat.md](docs/compat.md)). Off by default. |
 | `/mcp` | An MCP server over streamable HTTP, same bearer token. A stdio mode is `earshot-relay mcp`. |
 
@@ -122,7 +122,7 @@ A receipt records what the phone did (device playback). It is **not** proof that
 - The relay needs only `s3:PutObject` on the channel prefixes. It never reads your bucket and never holds the phone's read key ([docs/permissions.md](docs/permissions.md)).
 - The default channel list is `phone` only. The loud `alarm` channel cannot be sent to unless you list it in `EARSHOT_RELAY_CHANNELS`, the MCP `alarm` tool exists only then, and `alarm` can never be the default channel.
 - What `alarm` does on the phone: a siren, then the message on the alarm stream at high volume, ahead of normal items. It plays during a phone call (unless the app's **Alarms can interrupt calls** is off) and the other party may hear it. Do Not Disturb set to "Total silence", an Android refusal, a stopped service, a powered-off phone, battery restrictions or no network can still silence it. It is **not** an emergency or life-safety service.
-- Message text is not stored in the relay's database and is not logged, with one exception: text held for `coalesce_s` sits in SQLite until its window closes, then is deleted ([docs/hygiene.md](docs/hygiene.md)). Tokens are never logged. Secrets can be supplied as files (`EARSHOT_RELAY_TOKEN_FILE`, ...).
+- Message text is not stored in the relay's database and is not logged, with one exception: text held for `coalesce_window_s` sits in SQLite until its window closes, then is deleted ([docs/hygiene.md](docs/hygiene.md)). Tokens are never logged. Secrets can be supplied as files (`EARSHOT_RELAY_TOKEN_FILE`, ...).
 - Bind to localhost (the compose file does) and put a tunnel or an HTTPS reverse proxy in front. Do not expose the plain-HTTP port to the internet.
 - The beacon route has its own rate limit (`EARSHOT_RELAY_BEACON_RATE_LIMIT`, 600 per minute) and accepts at most 16 devices per message, so a leaked beacon URL can forge receipts but cannot flood the relay.
 - Messages sit in your bucket as plain objects. Anyone who can read the bucket can read them.

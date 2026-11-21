@@ -12,7 +12,7 @@ curl -fsS -X POST http://127.0.0.1:8080/v1/messages \
   -d '{"text": "Deploy finished", "channel": "phone"}'
 ```
 
-JSON fields: `text` (required), `channel`, `speech` (`device` or `server`), `voice` (server speech only), and the [hygiene](hygiene.md) fields `normalize` (true/false), `tag`, `coalesce_s` and `cooldown_s`. Unknown fields are rejected. Text is trimmed and must be 1 to 4000 UTF-16 code units and at most 64 KiB, the limits the phone enforces.
+JSON fields: `text` (required), `channel`, `speech` (`device` or `server`), `voice` (server speech only), and the [hygiene](hygiene.md) fields `normalize` (true/false), `tag`, `coalesce_window_s` and `cooldown_s`. Unknown fields are rejected. Text is trimmed and must be 1 to 4000 UTF-16 code units and at most 64 KiB, the limits the phone enforces.
 
 Send audio (multipart, one `file` part, optional `channel`):
 
@@ -34,7 +34,7 @@ Success is `202`:
 
 `202` means the object is in the bucket (`stored`), not that the phone has played it. Object keys are always random (`<channel>/<32 hex>.<ext>`), never derived from the text, and the message id is the same hex.
 
-The response also carries `tag`, `normalized` and `truncated`. With `coalesce_s` the `202` has `"status": "coalescing"`, `"key": null` and `write_at`: the text is held and written once when the window closes, so it is **not stored yet**. With `cooldown_s` a repeat of the tag inside the cooldown is `200` with `"status": "suppressed"`, `cooldown_until`, and the `id` and `key` of the message that started it; nothing is written. A coalesced message the relay could not write after its retries reads `write_failed` in its receipt (nothing is stored; send it again) and is counted in `hygiene.coalescing_failed`. See [hygiene](hygiene.md).
+The response also carries `tag`, `normalized` and `truncated`. With `coalesce_window_s` the `202` has `"status": "coalescing"`, `"key": null` and `write_at`: the text is held and written once when the window closes, so it is **not stored yet** (`coalesce_s`, the 1.1.0 name, is still accepted). With `cooldown_s` a repeat of the tag inside the cooldown is `200` with `"status": "suppressed"`, `cooldown_until`, and the `id` and `key` of the message that started it; nothing is written. A coalesced message the relay could not write after its retries, or whose channel or compat alarm was switched off before its window closed, reads `write_failed` in its receipt (nothing is stored; send it again) and is counted in `hygiene.coalescing_failed`. A send to a tag whose window has closed but whose write is waiting for a retry is `503 coalesce_busy` with `Retry-After`. See [hygiene](hygiene.md).
 
 **Retries.** Send an `Idempotency-Key` header (1 to 255 printable ASCII characters) to make a send safe to retry. The same key within 24 hours returns the original `202` body, with `Idempotent-Replayed: true`, writes nothing and does not count toward the rate limit. Concurrent requests with one key wait for the first and get its answer. The relay stores only a SHA-256 hash of the key. The first request's body wins: a reused key with a different body still returns the original message. A send that fails (for example `502`) does not use up its key.
 

@@ -9,7 +9,13 @@ device `.say`, because the caller asked for server speech.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
+import io
+import json
+import re
 import tempfile
+import wave
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote
@@ -39,6 +45,10 @@ class TtsClient:
         self._transport = transport
 
     def _request_body(self, text: str, voice: str | None) -> dict:
+        if self.settings.provider == "gemini":
+            return {"contents": [{"parts": [{"text": text}]}], "generationConfig": {
+                "responseModalities": ["AUDIO"], "speechConfig": {"voiceConfig": {
+                    "prebuiltVoiceConfig": {"voiceName": voice or self.settings.voice}}}}}
         if self.settings.provider == "elevenlabs":
             return {"text": text, "model_id": self.settings.model}
         body = {"model": self.settings.model, "input": text, "response_format": self.settings.response_format}
@@ -50,6 +60,14 @@ class TtsClient:
     def _endpoint(self, voice: str | None) -> tuple[str, dict[str, str]]:
         """The request URL and headers for the configured provider. The API key goes only in a header."""
         key = self.settings.api_key
+        if self.settings.provider == "gemini":
+            headers = {"Content-Type": "application/json", "Accept": "application/json"}
+            if key:
+                headers["x-goog-api-key"] = key
+            model = self.settings.model
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", model):
+                raise ApiError(422, "invalid_model", "Gemini model must be a model id, not a path")
+            return f"{self.settings.url}/models/{model}:generateContent", headers
         if self.settings.provider == "elevenlabs":
             # A dot is encoded too: a voice of "." or ".." must stay one path segment, not rewrite the request path.
             voice_id = quote(voice or self.settings.voice or "", safe="").replace(".", "%2E")
@@ -75,7 +93,9 @@ class TtsClient:
                         chunks, total = [], 0
                         async for chunk in resp.aiter_bytes():
                             total += len(chunk)
-                            if total > self.max_bytes:
+                            limit = (4 * ((self.max_bytes + 2) // 3) + 64 * 1024
+                                     if self.settings.provider == "gemini" else self.max_bytes)
+                            if total > limit:
                                 raise ApiError(502, "tts_failed", "the TTS result is larger than EARSHOT_RELAY_MAX_AUDIO_BYTES")
                             chunks.append(chunk)
         except (httpx.TimeoutException, TimeoutError):
@@ -83,16 +103,62 @@ class TtsClient:
         except httpx.HTTPError as exc:
             raise ApiError(502, "tts_failed", f"the TTS server could not be reached ({type(exc).__name__})") from None
         data = b"".join(chunks)
+        if self.settings.provider == "gemini":
+            return self._gemini_wav(data)
         if len(data) < MIN_AUDIO_BYTES:
             raise ApiError(502, "tts_failed", f"the TTS server returned {len(data)} bytes, not audio")
         return data
 
+    def _gemini_wav(self, data: bytes) -> bytes:
+        """Decode generateContent's single-speaker PCM, bounded before and after base64 expansion.
+
+        Provider errors, safety refusals and malformed replies are deliberately not echoed: they may contain input
+        text or credentials. Gemini's documented audio/L16 output is 24 kHz mono little-endian signed 16-bit PCM.
+        """
+        try:
+            reply = json.loads(data)
+            candidates = reply["candidates"]
+            if len(candidates) != 1 or candidates[0].get("finishReason", "STOP") != "STOP":
+                raise ValueError
+            parts = candidates[0]["content"]["parts"]
+            if not isinstance(parts, list) or not 1 <= len(parts) <= 64:
+                raise ValueError
+            chunks, total = [], 0
+            for part in parts:
+                inline = part["inlineData"]
+                mime = inline["mimeType"].lower().replace(" ", "")
+                if mime not in ("audio/l16;codec=pcm;rate=24000", "audio/l16;rate=24000;codec=pcm",
+                                "audio/l16;rate=24000"):
+                    raise ValueError
+                encoded = inline["data"]
+                if not isinstance(encoded, str) or len(encoded) > 4 * ((self.max_bytes + 2) // 3):
+                    raise ValueError
+                chunk = base64.b64decode(encoded, validate=True)
+                total += len(chunk)
+                if total > self.max_bytes or len(chunk) % 2:
+                    raise ValueError
+                chunks.append(chunk)
+            if total < MIN_AUDIO_BYTES:
+                raise ValueError
+        except (ValueError, TypeError, KeyError, IndexError, AttributeError, RecursionError, binascii.Error):
+            raise ApiError(502, "tts_failed", "Gemini returned no valid bounded 24 kHz mono PCM audio") from None
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as out:
+            out.setnchannels(1)
+            out.setsampwidth(2)
+            out.setframerate(24000)
+            out.writeframes(b"".join(chunks))
+        return buf.getvalue()
+
     async def render(self, text: str, voice: str | None) -> SynthResult:
         raw = await self.synthesize(text, voice)
-        fmt = self.settings.response_format
-        if self.settings.leadin_ms <= 0:
+        fmt = "wav" if self.settings.provider == "gemini" else self.settings.response_format
+        if self.settings.leadin_ms <= 0 and self.settings.provider != "gemini":
             return SynthResult(raw, fmt, CONTENT_TYPES[fmt])
-        return SynthResult(await add_leadin(raw, fmt, self.settings.leadin_ms), "opus", "audio/ogg")
+        data = await add_leadin(raw, fmt, self.settings.leadin_ms)
+        if len(data) > self.max_bytes:
+            raise ApiError(502, "tts_failed", "the encoded TTS result exceeds EARSHOT_RELAY_MAX_AUDIO_BYTES")
+        return SynthResult(data, "opus", "audio/ogg")
 
 
 async def add_leadin(audio: bytes, input_ext: str, ms: int, timeout_s: float = 120) -> bytes:

@@ -33,7 +33,7 @@ paths:
         it answers, so 202 means stored in the bucket; delivery to the phone is asynchronous. Location
         points at the receipt. With an Idempotency-Key header, a repeat of the same key within 24 hours
         returns the original 202 body (with Idempotent-Replayed: true) and writes nothing. Text can also
-        carry tag with coalesce_s (hold the write, write only the latest text: 202 status=coalescing)
+        carry tag with coalesce_window_s (hold the write, write only the latest text: 202 status=coalescing)
         or cooldown_s (drop a repeat: 200 status=suppressed), and normalize (strip emoji, markdown and
         URLs before storing).'
       operationId: post_message_v1_messages_post
@@ -52,7 +52,7 @@ paths:
           202 body instead of sending again, so a retried request never plays twice.
       responses:
         '202':
-          description: Stored in the bucket (status=stored), or held for coalesce_s (status=coalescing)
+          description: Stored in the bucket (status=stored), or held for coalesce_window_s (status=coalescing)
           content:
             application/json:
               schema:
@@ -121,6 +121,13 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: A held (coalescing) message is past its window and not yet written; retry after
+            Retry-After
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '504':
           description: TTS timeout
           content:
@@ -174,10 +181,10 @@ paths:
                   anyOf:
                   - type: string
                   - type: 'null'
-                  description: 'A label for coalesce_s and cooldown_s: letters, digits and . _ : -, up
-                    to 64, unique per channel. Alone it only labels the message.'
+                  description: 'A label for coalesce_window_s and cooldown_s: letters, digits and . _
+                    : -, up to 64, unique per channel. Alone it only labels the message.'
                   title: Tag
-                coalesce_s:
+                coalesce_window_s:
                   anyOf:
                   - type: number
                   - type: 'null'
@@ -185,6 +192,14 @@ paths:
                     first message under the tag; only the latest text sent in the window is written, once.
                     Answers 202 status=coalescing with the id the object will have. Pre-write only: an
                     object already written cannot be replaced.'
+                  title: Coalesce Window S
+                coalesce_s:
+                  anyOf:
+                  - type: number
+                  - type: 'null'
+                  deprecated: true
+                  description: The 1.1.0 name of coalesce_window_s, still accepted. Send only one of them;
+                    if both are sent they must be equal.
                   title: Coalesce S
                 cooldown_s:
                   anyOf:
@@ -1853,7 +1868,7 @@ components:
         coalescing_pending:
           type: integer
           title: Coalescing Pending
-          description: Messages held right now for coalesce_s
+          description: Messages held right now for coalesce_window_s
         coalescing_failed:
           type: integer
           title: Coalescing Failed
@@ -2007,6 +2022,7 @@ components:
             enum:
             - openai
             - elevenlabs
+            - gemini
           - type: 'null'
           title: Provider
           description: The TTS provider, when server speech is configured
@@ -2021,6 +2037,15 @@ components:
           type: boolean
           title: Enabled
           description: EARSHOT_RELAY_WATCHDOG_S is set (it needs receipts and a notice URL)
+        reason:
+          anyOf:
+          - type: string
+            enum:
+            - beacon_token_missing
+            - not_configured
+          - type: 'null'
+          title: Reason
+          description: Why the watchdog is disabled, when enabled=false
         after_s:
           anyOf:
           - type: integer

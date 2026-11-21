@@ -43,6 +43,22 @@ in the test suite. **What was not:** a real ElevenLabs account. No real key was 
 plan's limits and the `opus_48000_64` format are unverified; if `opus` fails for you, use `mp3`. Failures behave as
 for any server TTS (below): `502 tts_failed`, nothing written, no fallback.
 
+## Gemini PCM
+
+```sh
+EARSHOT_RELAY_TTS_PROVIDER=gemini
+GEMINI_API_KEY=...                 # environment or GEMINI_API_KEY_FILE, never committed
+EARSHOT_RELAY_TTS_VOICE=Kore       # Gemini prebuilt voice; a request can override it
+# optional: EARSHOT_RELAY_TTS_MODEL=gemini-2.5-flash-preview-tts
+```
+
+The relay calls Gemini `models/<model>:generateContent` with `responseModalities=["AUDIO"]` and
+`prebuiltVoiceConfig.voiceName`. It accepts one completed 24 kHz mono signed-16-bit PCM inline audio part,
+bounds the JSON and decoded bytes, converts the PCM to WAV and then Ogg/Opus with the configured lead-in.
+Gemini always requires ffmpeg, even when lead-in is zero. Provider errors and malformed replies return sanitized
+`tts_failed` errors with no provider text, input or key reflected. Fixture tests exercise request shape, size,
+malformed responses and decoded lead-in; no paid Gemini request or phone playback was run here.
+
 ## Local voices (no cloud, no key)
 
 Any local server that speaks the OpenAI `/audio/speech` shape works through the default provider. These are the
