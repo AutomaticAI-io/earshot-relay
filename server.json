@@ -9,6 +9,15 @@
     "id": "1465639784"
   },
   "websiteUrl": "https://store.automaticai.io/earshot/",
+  "icons": [
+    {
+      "src": "https://raw.githubusercontent.com/AutomaticAI-io/earshot-relay/main/plugins/earshot/icon.png",
+      "mimeType": "image/png",
+      "sizes": [
+        "1024x1024"
+      ]
+    }
+  ],
   "version": "1.1.2",
   "packages": [
     {

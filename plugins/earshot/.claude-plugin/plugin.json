@@ -13,6 +13,8 @@
   "keywords": ["mcp", "tts", "notifications", "android", "voice", "earshot"],
   "documentationUrl": "https://github.com/AutomaticAI-io/earshot-relay/blob/main/docs/mcp.md",
   "supportUrl": "https://github.com/AutomaticAI-io/earshot-relay/issues",
+  "privacyPolicyUrl": "https://store.automaticai.io/earshot/privacy/",
+  "icon": "./icon.png",
   "userConfig": {
     "mcp_url": {
       "type": "string",
