@@ -10,6 +10,8 @@
 | [`home-assistant.md`](home-assistant.md) | **Untested.** |
 | [`apprise.md`](apprise.md) (Apprise `ntfy://`, `ntfys://`, `gotify://`) | **Tested** with Apprise 2.3.0 against a live relay (`scripts/compat_clients.py`); the requests are replayed in `tests/test_compat.py`. |
 | [`uptime-kuma.md`](uptime-kuma.md) (ntfy and Gotify providers) | **Tested** with Uptime Kuma 1.23.16 (its notification Test call). Version 2 was **not** run. |
+| Hermes `send --to ntfy:phone` → [ntfy compat spike](../docs/verification/ears-56-hermes-ntfy.md) | **Tested: outbound transport only** (2026-11-24, Hermes `d6525ab`, relay 1.1.2, Moto private bucket). Exit 0; correlated object/receipt `stored`, **no device or Android**, `devices=[]`: playback **Untested**, not a voice demo. Legacy `hermes send ntfy:phone "text"` is unsupported (exit 2); use `--to`. |
+| Hermes one-shot cron `--no-agent --deliver ntfy:phone` → [ntfy compat spike](../docs/verification/ears-56-hermes-ntfy.md) | **Tested: explicit scheduler run and outbound transport only** (same date/revs; `hermes cron run` completed; separately correlated stored object). **Untested**: automatic wall-clock trigger and Android playback; no device or Android. Recurring scheduling, if later needed, belongs to Candybar. |
 
 The agent examples send a slice of agent text to your bucket. Use a private bucket (see
 [docs/permissions.md](../docs/permissions.md)).
