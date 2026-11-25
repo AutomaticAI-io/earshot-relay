@@ -162,6 +162,7 @@ class Settings:
     watchdog_url: str | None = field(default=None, repr=False)  # may carry a topic or token: never logged or shown
     watchdog_cooldown_s: int = 1800
     watchdog_format: str = "auto"
+    control_db: str | None = None
 
     @property
     def normalize_default(self) -> bool:
@@ -263,8 +264,10 @@ def load_settings(environ: dict[str, str] | None = None, *, check_ffmpeg: bool =
     for name in re.split(r"[\s,;]+", raw_channels.strip()):
         if not name:
             continue
-        if not CHANNEL_RE.fullmatch(name):
-            problems.append(f"EARSHOT_RELAY_CHANNELS has an invalid channel name {name!r} "
+        if name == "replies":
+            problems.append("EARSHOT_RELAY_CHANNELS contains a reserved channel")
+        elif not CHANNEL_RE.fullmatch(name):
+            problems.append("EARSHOT_RELAY_CHANNELS has an invalid channel name "
                             "(lowercase letters, digits, - and _, 1-32 chars, starting with a letter or digit)")
         elif name not in channels:
             channels.append(name)
@@ -321,6 +324,7 @@ def load_settings(environ: dict[str, str] | None = None, *, check_ffmpeg: bool =
 
     hygiene = _hygiene_settings(e, take, problems, channels=channels)
     watchdog = _watchdog_settings(e, take, problems, beacon_token=beacon_token)
+    control_db = take(env, "EARSHOT_RELAY_CONTROL_DB", e)
     compat = _compat_settings(e, take, problems, channels=channels, port=port, beacon_port=beacon_port,
                               main_token=token, beacon_token=beacon_token)
 
@@ -332,7 +336,7 @@ def load_settings(environ: dict[str, str] | None = None, *, check_ffmpeg: bool =
         public_url=public_url, data_dir=data_dir, host=host, port=port, beacon_port=beacon_port,
         retention_days=retention, receipt_wait_min=wait_min, max_audio_bytes=max_audio, rate_limit=rate,
         alarm_rate_limit=alarm_rate, beacon_rate_limit=beacon_rate, default_speech=default_speech, tts=tts,
-        allow_http_s3=allow_http, **compat, **hygiene, **watchdog,
+        allow_http_s3=allow_http, control_db=control_db, **compat, **hygiene, **watchdog,
     )
 
 

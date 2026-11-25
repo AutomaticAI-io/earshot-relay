@@ -19,6 +19,7 @@ from starlette.concurrency import run_in_threadpool
 
 from . import RECEIPT_WORDING, __version__
 from .beacons import HEARTBEAT, PHASE_ORDER, TERMINAL, iso_ms, parse_rfc3339, receipt_is_final
+from .control import Control
 from .config import RateLimit, Settings
 from .hygiene import (
     MAX_COOLDOWN_S,
@@ -337,6 +338,7 @@ class Relay:
     def __init__(self, settings: Settings, store: Store, writer: S3Writer, tts: TtsClient | None = None,
                  clock=now_utc, monotonic=time.monotonic, watchdog_transport=None):
         self.settings = settings
+        self.control = Control(settings.control_db, settings) if settings.control_db else None
         self.store = store
         self.writer = writer
         self.tts = tts
@@ -356,7 +358,9 @@ class Relay:
 
     def resolve_channel(self, channel: object) -> str:
         if channel is None:
-            return self.settings.default_channel
+            channel = self.settings.default_channel
+        if channel == "replies":
+            raise ApiError(403, "channel_not_allowed", "channel is reserved", "channel")
         if not is_valid_channel(channel):
             raise ApiError(422, "invalid_channel",
                            "channel must match ^[a-z0-9][a-z0-9_-]{0,31}$", "channel")

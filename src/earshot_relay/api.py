@@ -20,6 +20,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from . import RECEIPT_WORDING, __version__
 from . import compat
+from .auth import authenticate, use_principal
 from .beacons import MAX_BODY_BYTES as BEACON_MAX_BYTES
 from .beacons import parse_rfc3339, validate_beacon
 from .compat import read_capped
@@ -340,9 +341,10 @@ class BearerAuth:
     low-code tools that send `bearer <token>` work. The token itself is compared in constant time.
     """
 
-    def __init__(self, app, token: str, exempt_prefixes: tuple[str, ...] = ()):
+    def __init__(self, app, relay: Relay, exempt_prefixes: tuple[str, ...] = ()):
         self.app = app
-        self.token = token.encode()
+        self.relay = relay
+        self.token = relay.settings.token.encode()
         # Compat routes (compat.py) check their protocol's own token placement (Basic password, X-Gotify-Key, ...).
         self.exempt_prefixes = exempt_prefixes
 
@@ -366,12 +368,24 @@ class BearerAuth:
             if name == b"authorization":
                 presented = value
                 break
-        if not self._accepts(presented):
+        parts = presented.strip().split(None, 1)
+        token = None
+        if len(parts) == 2 and parts[0].lower() == b"bearer":
+            try:
+                token = parts[1].strip().decode("utf-8")
+            except UnicodeDecodeError:
+                pass
+        principal = authenticate(self.relay, token)
+        if principal is None:
             scope.setdefault("state", {})["auth_failed"] = True
             resp = error_json(401, "unauthorized", "missing or invalid bearer token",
                               headers={"WWW-Authenticate": 'Bearer realm="earshot-relay"'})
             return await resp(scope, receive, send)
-        return await self.app(scope, receive, send)
+        if principal.kind == "scoped":
+            resp = error_json(403, "forbidden", "scoped access is not enabled")
+            return await resp(scope, receive, send)
+        with use_principal(principal, token):
+            return await self.app(scope, receive, send)
 
 
 class AccessLog:
@@ -743,7 +757,7 @@ def create_app(relay: Relay, *, serve_beacons: bool | None = None, mcp: bool = T
     if mcp:
         mcp_server, mcp_routes = build_http_mcp(app, relay)
         app.router.routes.extend(mcp_routes)
-    app.add_middleware(BearerAuth, token=relay.settings.token, exempt_prefixes=compat.exempt_prefixes(compat_protocols))
+    app.add_middleware(BearerAuth, relay=relay, exempt_prefixes=compat.exempt_prefixes(compat_protocols))
     app.add_middleware(AccessLog)
     app.state.relay = relay
     return app

@@ -413,6 +413,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(fn=cmd_doctor)
 
     sub.add_parser("mcp", help="run a stdio MCP server backed by the relay's HTTP API").set_defaults(fn=cmd_mcp)
+    from .admin import install as install_admin
+    install_admin(sub)
     return p
 
 
