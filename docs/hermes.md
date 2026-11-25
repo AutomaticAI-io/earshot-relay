@@ -1,6 +1,22 @@
-# Hermes → Earshot (EARS-48, 2026-11-24)
+# Hermes → Earshot (EARS-48)
 
-**Partial real-turn verification.** Hermes v0.23.4+386 (`d6525ab61b9f`), relay 1.1.2 (`4bd761a`), Android buyer beta 0.1.12 (1012) on S24 Ultra SM-S928U / Android 17. A private R2 rehearsal bucket and distinct writer/phone reader identities were used. The bucket had three existing objects; this was **not** a clean installation. The throwaway relay was local HTTP `127.0.0.1:18848`, channel `phone`, server TTS off. It forwarded only receipts for keys in its own SQLite index from the existing HTTPS receipt sink. No production Hermes profile, S26, existing EARS-29 relay, release or deploy was changed.
+## Follow-up on 2026-11-25: queued Telegram turn (current hook)
+
+This is **partial verification**, not a G1 pass. Hermes `v0.23.4+387.gf421dc0.dirty` (`f421dc027a2d6bdd3925a7cc59ada4dc90a16e6a`, untracked files present), relay 1.1.2 at `4206b81bdc789d7f166a1c4580c681d8292e9768`, S24 Ultra `SM-S928U` / Android 17 / buyer beta 0.1.12 (1012). The current hook's SHA-256 was `fa730115f8befe3092a0594cea2639d207926e5dd7303fbc2dbeded32591aceb`. Before the turn the buyer UI showed the approved private rehearsal bucket name, SigV4, service running, and `Last poll: OK at 11:50:44 (2.1 s ago)`, three objects, `phone, alarm`. The writer and reader were separate approved credentials for the same bucket. Screen on; no settings changed.
+
+The dedicated bot's real queued owner DM requested two distinct texts. Session `20261125_115121_f8e9b774` called `mcp__earshot__say` (`call_ccbfb8a92bc141bbbd8c2e74`), with input `text: EARS48 telegram MCP check` and tool result `status: stored`, `channel: phone`, `speech: device`, and stored exact `EARS48 telegram MCP check`, ID `msg_3dbfe85909514004b7c76b436a9bb9c6`, key `phone/3dbfe85909514004b7c76b436a9bb9c6.say`: `detected` 16:51:34.040, `started` 16:51:35.252, `finished` 16:51:38.773 UTC.
+
+The actual current hook received `.extra.platform: telegram`; its `.extra.assistant_response` started `EARS48 telegram hook check` but **also contained an unsolicited first-contact profile-offer paragraph**. Therefore the owner's exact-one-sentence instruction failed. The full normalized actual response was stored under distinct `msg_be14e09068e245be8ff0ac0ee315dde8`, key `phone/be14e09068e245be8ff0ac0ee315dde8.say`, and reached `detected` 16:51:39.261, `started` 16:51:39.966, `finished` 16:51:54.087 UTC. This proves the hook ran with the actual final response, **not** that the exact requested reply was followed.
+
+The pre-existing HTTPS rehearsal sink supplied beacons; a new private forwarder joined exact keys against this relay's SQLite index and forwarded each phase with HTTP 200. The private device ID matched the historical S24 finished receipt. Both indexed objects were removed; all three baseline keys/ETags were preserved. `finished` is device playback completion, not human hearing or locked-screen proof.
+
+**Multiplexed ntfy warning:** a subsequent isolated gateway attempt, configured for `https://ntfy.delo.sh`, instead attempted `https://ntfy.sh` and returned 401; one retry repeated it. Its profile contained the real ntfy credential and the adapter builds an authorization header from it. Treat that credential as **potentially disclosed**, rotate via its owner, and do not repeat this test or configure a production gateway until the effective destination is independently verified using nonsecret credentials. The current-hook ntfy/multiplexed credential retest is **blocked**, not passed; its earlier row below concerns the historical hook, not this corrected script. No claim of exact root cause is made. Desktop remains untested. No production Hermes profile, S26, board, deploy, release, bucket policy or credential was changed.
+
+---
+
+## Historical run: 2026-11-24
+
+**Historical partial real-turn verification.** Hermes v0.23.4+386 (`d6525ab61b9f`), relay 1.1.2 (`4bd761a`), Android buyer beta 0.1.12 (1012) on S24 Ultra SM-S928U / Android 17. A private R2 rehearsal bucket and distinct writer/phone reader identities were used. The bucket had three existing objects; this was **not** a clean installation. The throwaway relay was local HTTP `127.0.0.1:18848`, channel `phone`, server TTS off. It forwarded only receipts for keys in its own SQLite index from the existing HTTPS receipt sink. No production Hermes profile, S26, existing EARS-29 relay, release or deploy was changed.
 
 ## Path A: agent-directed MCP
 

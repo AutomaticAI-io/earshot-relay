@@ -3,7 +3,7 @@
 | Example | Status |
 | --- | --- |
 | [`curl.sh`](curl.sh) | **Tested** in the test suite against a live relay and a moto bucket (needs `curl` and `jq`). |
-| [`hermes/`](hermes/) (`earshot-say.sh`, [recipe](../docs/hermes.md)) | **Partially tested.** See the per-recipe/per-surface matrix below; Telegram and Desktop remain Untested. |
+| [`hermes/`](hermes/) (`earshot-say.sh`, [recipe](../docs/hermes.md)) | **Partially tested.** Current Telegram MCP and hook reached S24 `finished`; exact reply failed, current multiplexed ntfy retest blocked, Desktop untested. |
 | [`claude-code/`](claude-code) hook (`earshot_hook.py`, `settings.hooks.json`) | **Tested**: the script runs against a live relay in the test suite (each Notification type, Stop gist, transcript fallback, `stop_hook_active`, always exit 0). The hook JSON is checked for shape only; it was **not** run inside a real Claude Code session. |
 | [`codex-notify.py`](codex-notify.py) | **Tested** with a hand-built `agent-turn-complete` event following the Codex `notify` documentation. **Not** run inside a real Codex session. |
 | [`github-actions.yml`](github-actions.yml) | **Untested.** No workflow was run. |
@@ -14,7 +14,15 @@
 | Hermes `send --to ntfy:phone` → [ntfy compat spike](../docs/verification/ears-56-hermes-ntfy.md) / [device follow-up](../docs/verification/ears-56-hermes-ntfy.md#fresh-espeak-emulator-follow-up--playback-completion-2026-11-25-00340035-utc) | **Tested: isolated emulator playback completion.** On 2026-11-25, Hermes `d6525ab`, relay 1.1.2 frozen `e1021e8`, Earshot beta-debug 0.1.12, Android 16 / API 36 and eSpeak NG 1.52.0: manual `msg_6e0e746418b0428786cbc8f4700f3fb3`, object `phone/6e0e746418b0428786cbc8f4700f3fb3.say` / `EARS56-device-manual-20261125T003451Z`, selected-device `detected → started → finished` at **00:35:12.083 UTC**. Earlier selected-device attempt failed TTS initialization. No-audio emulator: not physical phone, audibility or locked-screen proof. Positional `hermes send ntfy:phone "text"` is unsupported; use `--to`. |
 | Hermes one-shot cron `--no-agent --deliver ntfy:phone` → [ntfy compat spike](../docs/verification/ears-56-hermes-ntfy.md) / [device follow-up](../docs/verification/ears-56-hermes-ntfy.md#fresh-espeak-emulator-follow-up--playback-completion-2026-11-25-00340035-utc) | **Tested: explicit trigger and isolated emulator playback completion.** Same versions and 2026-11-25 setup: `hermes cron run b3d93b9f831c`, fire `cb5818ad86e5492a9915108f774de14f` completed (`source=direct`), distinct `msg_e3d5cb29ed6d4c7081a38c617e664f7d`, object `phone/e3d5cb29ed6d4c7081a38c617e664f7d.say` / `EARS56-device-cron-d5715f2f61bc5f1bb0f9`; selected-device `detected → started → finished` at **00:35:23.013 UTC**. Earlier attempt failed TTS. Automatic wall-clock firing, real phone, audibility and locked-screen playback **untested**. Recurring scheduling belongs to Candybar. |
 
-**Partial verification, not a Hermes claims-gate pass:** the retained runtime hook is executable-line-equivalent to historical reference commit `a53d3400967bb33e4aa8288401f809014257aee0`, but exact executed bytes per turn are unproven. The post-live credential/fallback correction is **isolated-fixture-tested only**, not rerun on device; see [recipe](../docs/hermes.md#path-b-final-reply-hook).
+**Partial verification, not a Hermes claims-gate pass:** the corrected hook was rerun on Telegram as detailed in the [self-contained receipt](../docs/hermes.md#follow-up-on-2026-11-25-queued-telegram-turn-current-hook). A current multiplexed ntfy attempt used the wrong host and potentially disclosed its credential; the owner must rotate it before further use. Historical exact executed bytes for the earlier CLI/ntfy/TUI rows remain unproven. Desktop is untested.
+
+| Current follow-up / surface | Status, 2026-11-25 | Evidence and limits |
+| --- | --- | --- |
+| Telegram HTTP MCP | **Tested** | Actual owner DM and `say` transcript; `msg_3dbfe85909514004b7c76b436a9bb9c6`, key `phone/3dbfe85909514004b7c76b436a9bb9c6.say`, exact text `EARS48 telegram MCP check`, S24 `finished` 16:51:38.773 UTC. |
+| Telegram current hook | **Tested with reply failure** | Current hook hash `fa730115f8befe3092a0594cea2639d207926e5dd7303fbc2dbeded32591aceb`; actual `.extra.platform: telegram` and final text included an unsolicited onboarding paragraph despite the exact-reply instruction. Distinct `msg_be14e09068e245be8ff0ac0ee315dde8`, key `phone/be14e09068e245be8ff0ac0ee315dde8.say`, S24 `finished` 16:51:54.087 UTC. |
+| Current multiplexed ntfy hook | **Blocked; security action required** | Configured self-host destination resolved to public `ntfy.sh` with 401 twice; credential may have been disclosed. Stop and rotate before further use. |
+
+The following rows are **historical** and do not establish current corrected-hook results:
 
 | Recipe / surface | Status, 2026-11-24 | Evidence and limits |
 | --- | --- | --- |
