@@ -29,8 +29,11 @@ user with mode `0700`. Its ancestors must not be writable by other users (unless
 protected by an earlier private directory); do not use a shared temporary directory.
 
 Write a contract matching [`control-v1.schema.json`](../schemas/control-v1.schema.json)
-into a protected file. This example is illustrative: replace the endpoint, bucket,
-region and channel with the configured writer values and use an agent ID of your choice.
+into a protected file. This schema and validator are part of the
+[local checkpoint](verification/ears-64-local-checkpoint.md), not on main through
+this work; consumers need the matching candidate version. This example is
+illustrative: replace the endpoint, bucket, region and channel with the configured
+writer values and use an agent ID of your choice.
 The workspace binding must match the relay configuration exactly.
 
 ```json
@@ -82,6 +85,12 @@ also granted. Direct alarm topics require an alarm grant. Legacy
 `EARSHOT_RELAY_COMPAT_TOKEN` and `EARSHOT_RELAY_COMPAT_PUSHOVER_TOKEN` remain
 broad **send-only** compatibility credentials, not owner or scoped credentials;
 they cannot access native HTTP, MCP or receipts. Owner tokens retain owner access.
+
+Legacy pre-scoping history remains owner-only. Ambiguous old compat idempotency
+keys, and a compat coalescing request whose channel and tag match an owner pending
+row, fail closed with 409 until the relevant ambiguity or pending work is resolved.
+See the [migration restriction](verification/ears-64-local-checkpoint.md#legacy-migration-restriction)
+for the no-duplicate rationale and local test evidence.
 
 Compatibility protocols may place credentials in query strings or form bodies.
 The relay access log avoids raw URLs and bodies, but reverse proxies, tracing,
