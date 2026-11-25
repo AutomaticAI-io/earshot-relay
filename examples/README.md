@@ -12,7 +12,7 @@
 | [`apprise.md`](apprise.md) (Apprise `ntfy://`, `ntfys://`, `gotify://`) | **Tested** with Apprise 2.3.0 against a live relay (`scripts/compat_clients.py`); the requests are replayed in `tests/test_compat.py`. |
 | [`uptime-kuma.md`](uptime-kuma.md) (ntfy and Gotify providers) | **Tested** with Uptime Kuma 1.23.16 (its notification Test call). Version 2 was **not** run. |
 
-**Partial verification, not a Hermes claims-gate pass:**
+**Partial verification, not a Hermes claims-gate pass:** the hook rows below used relay commit `a53d3400967bb33e4aa8288401f809014257aee0`. The post-live credential/fallback correction is **isolated-fixture-tested only**, not rerun on device; see [recipe](../docs/hermes.md#path-b-final-reply-hook).
 
 | Recipe / surface | Status, 2026-11-24 | Evidence and limits |
 | --- | --- | --- |

@@ -4,8 +4,16 @@ set -u
 # Keep this 0600 file inside the active profile, including multiplexed gateways.
 settings="${HERMES_HOME:?}/earshot.env"
 [ -r "$settings" ] || exit 0
-. "$settings"
+# Do not inherit a URL, token or file-based relay setting from the launcher.
+unset EARSHOT_API_URL EARSHOT_API_TOKEN EARSHOT_API_URL_FILE EARSHOT_API_TOKEN_FILE \
+  EARSHOT_RELAY_TOKEN EARSHOT_RELAY_TOKEN_FILE EARSHOT_RELAY_PORT EARSHOT_RELAY_PORT_FILE
+. "$settings" || exit 0
+# Profile settings must supply both direct values; reject CLI fallback/normalization to localhost.
 [ -n "${EARSHOT_API_URL:-}" ] && [ -n "${EARSHOT_API_TOKEN:-}" ] || exit 0
+case "$EARSHOT_API_URL" in *[[:space:]]*) exit 0 ;; esac
+case "$EARSHOT_API_TOKEN" in *[[:space:]]*) exit 0 ;; esac
+case "$EARSHOT_API_URL" in http://?*|https://?*) ;; *) exit 0 ;; esac
+[ -z "${EARSHOT_API_URL_FILE:-}${EARSHOT_API_TOKEN_FILE:-}${EARSHOT_RELAY_TOKEN:-}${EARSHOT_RELAY_TOKEN_FILE:-}${EARSHOT_RELAY_PORT:-}${EARSHOT_RELAY_PORT_FILE:-}" ] || exit 0
 export EARSHOT_API_URL EARSHOT_API_TOKEN
 payload=$(cat)
 platform=$(printf '%s' "$payload" | jq -r '.extra.platform // ""')
