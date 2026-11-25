@@ -280,6 +280,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Channel not allowed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '404':
           description: Not found
           content:
@@ -334,6 +340,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Channel not allowed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '404':
           description: Not found
           content:
@@ -342,6 +354,25 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
         '422':
           description: Invalid field
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /v1/capabilities:
+    get:
+      tags:
+      - core
+      summary: Caller-authorized sendable channels
+      operationId: get_capabilities_v1_capabilities_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CapabilitiesResponse'
+        '401':
+          description: Missing or invalid bearer token
           content:
             application/json:
               schema:
@@ -365,6 +396,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Channel not allowed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
   /v1/doctor:
     post:
       tags:
@@ -381,6 +418,12 @@ paths:
                 $ref: '#/components/schemas/DoctorResponse'
         '401':
           description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Channel not allowed
           content:
             application/json:
               schema:
@@ -1276,6 +1319,25 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
 components:
   schemas:
+    CapabilitiesResponse:
+      properties:
+        channels:
+          items:
+            type: string
+          type: array
+          title: Channels
+          description: Channels the caller may send to
+        default_channel:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Default Channel
+          description: Relay default, only when authorized for this caller
+      type: object
+      required:
+      - channels
+      - default_channel
+      title: CapabilitiesResponse
     DeviceStateModel:
       properties:
         device:

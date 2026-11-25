@@ -20,7 +20,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from . import RECEIPT_WORDING, __version__
 from . import compat
-from .auth import authenticate, use_principal
+from .auth import authenticate, authorize, use_principal
 from .beacons import MAX_BODY_BYTES as BEACON_MAX_BYTES
 from .beacons import parse_rfc3339, validate_beacon
 from .compat import read_capped
@@ -268,6 +268,11 @@ class StatusWatchdog(BaseModel):
     note: str | None = Field(None, description="It watches sends, not idle phones: the app sends no heartbeat.")
 
 
+class CapabilitiesResponse(BaseModel):
+    channels: list[str] = Field(description="Channels the caller may send to")
+    default_channel: str | None = Field(description="Relay default, only when authorized for this caller")
+
+
 class StatusResponse(BaseModel):
     relay: StatusRelay
     bucket: StatusBucket
@@ -381,11 +386,69 @@ class BearerAuth:
             resp = error_json(401, "unauthorized", "missing or invalid bearer token",
                               headers={"WWW-Authenticate": 'Bearer realm="earshot-relay"'})
             return await resp(scope, receive, send)
-        if principal.kind == "scoped":
-            resp = error_json(403, "forbidden", "scoped access is not enabled")
-            return await resp(scope, receive, send)
+        scope.setdefault("state", {})["principal"] = principal
+        try:
+            check_workspace(Request(scope), self.relay)
+        except ApiError as exc:
+            return await error_json(exc.status, exc.code, exc.message)(scope, receive, send)
         with use_principal(principal, token):
+            if scope.get("path") == "/mcp" and scope.get("method") == "POST":
+                request = Request(scope, receive)
+                try:
+                    raw = await read_capped(request, MAX_JSON_BYTES)
+                    data = compat.parse_json(raw)
+                    pending = [data]
+                    while pending:
+                        item = pending.pop()
+                        if isinstance(item, dict):
+                            for key, value in item.items():
+                                if key in ("workspace", "workspace_id") and (
+                                    self.relay.control is None or value != self.relay.control.workspace_id
+                                ):
+                                    raise ApiError(403, "forbidden", "request not permitted")
+                                pending.append(value)
+                        elif isinstance(item, list):
+                            pending.extend(item)
+                except ApiError as exc:
+                    return await error_json(exc.status, exc.code, exc.message)(scope, receive, send)
+                except JSON_ERRORS:
+                    return await error_json(400, "bad_json", "body is not valid JSON")(scope, receive, send)
+                sent = False
+                async def replay_body():
+                    nonlocal sent
+                    if sent:
+                        return await receive()
+                    sent = True
+                    return {"type": "http.request", "body": raw, "more_body": False}
+                return await self.app(scope, replay_body, send)
             return await self.app(scope, receive, send)
+
+
+def check_workspace(request: Request, relay: Relay) -> None:
+    """Explicit workspace selectors may confirm the binding, never change it."""
+    values = (request.headers.getlist("x-earshot-workspace") + request.headers.getlist("x-earshot-workspace-id")
+              + request.query_params.getlist("workspace") + request.query_params.getlist("workspace_id"))
+    workspace = relay.control.workspace_id if relay.control is not None else None
+    if values and (workspace is None or any(value != workspace for value in values)):
+        raise ApiError(403, "forbidden", "request not permitted")
+
+
+def require_scoped_core(relay: Relay, principal) -> None:
+    # Never use legacy owner-default service methods as a scoped fallback.
+    if principal.kind != "owner" and not all(callable(getattr(relay, name, None)) for name in
+            ("check_replay", "get_message", "recent_messages", "wait_message")):
+        raise ApiError(503, "scoped_unavailable", "scoped access is unavailable")
+
+
+def resolved_send_channel(relay: Relay, principal, channel: object) -> str:
+    try:
+        resolved = relay.resolve_channel(channel)
+    except ApiError as exc:
+        if exc.code == "channel_not_allowed" and channel not in ("alarm", "replies"):
+            raise ApiError(403, "channel_not_allowed", "channel is not allowed", "channel") from None
+        raise
+    authorize(relay, resolved, principal=principal)
+    return resolved
 
 
 class AccessLog:
@@ -439,6 +502,13 @@ def _install_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(ApiError)
     async def _api_error(_request: Request, exc: ApiError):
         headers = {"Retry-After": str(exc.retry_after)} if exc.retry_after else None
+        if exc.code == "storage_error":
+            from .storage import HINTS
+            known = next((code for code in HINTS if exc.message.startswith(f"PutObject failed: {code}: ")), None)
+            message = f"PutObject failed: {known}: {HINTS[known]}" if known else "request could not be completed"
+            return error_json(exc.status, exc.code, message, headers=headers)
+        if exc.code == "coalesce_busy":
+            return error_json(exc.status, exc.code, "request could not be completed", headers=headers)
         return error_json(exc.status, exc.code, exc.message, exc.field, headers)
 
     @app.exception_handler(RequestValidationError)
@@ -446,8 +516,10 @@ def _install_error_handlers(app: FastAPI) -> None:
         errs = exc.errors()
         first = errs[0] if errs else {}
         loc = [str(p) for p in first.get("loc", []) if p not in ("query", "path", "body", "header")]
-        field = loc[-1] if loc else None
-        return error_json(422, "invalid_field", str(first.get("msg", "invalid request"))[:200], field)
+        safe_fields = {"text", "tag", "coalesce_window_s", "coalesce_s", "cooldown_s", "normalize", "file", "limit", "since",
+            "channel", "speech", "voice", "wait", "Idempotency-Key"}
+        field = loc[-1] if loc and loc[-1] in safe_fields else None
+        return error_json(422, "invalid_field", "invalid request", field)
 
     codes = {400: "bad_request", 401: "unauthorized", 404: "not_found", 405: "method_not_allowed", 413: "too_large"}
 
@@ -552,43 +624,63 @@ def _api_routes(app: FastAPI, relay: Relay) -> None:
         if idempotency_key is not None and not IDEMPOTENCY_KEY_RE.fullmatch(idempotency_key):
             raise ApiError(422, "invalid_field", "Idempotency-Key must be 1-255 printable ASCII characters",
                            "Idempotency-Key")
-        async with relay.idempotency(idempotency_key) as idem:
-            if idem.replay is not None:
-                result = idem.replay
-                response.headers["Idempotent-Replayed"] = "true"
-            else:
-                result = await _send(request, relay, idem.digest)
+        principal = request.state.principal
+        require_scoped_core(relay, principal)
+        if principal.kind == "owner":
+            async with relay.idempotency(idempotency_key, principal=principal) as idem:
+                result = await _send(request, relay, idempotency_key, idem)
+                replayed = idem.replay is not None
+        else:
+            result, replayed = await _send(request, relay, idempotency_key)
+        if replayed:
+            response.headers["Idempotent-Replayed"] = "true"
         if result["status"] == "suppressed":
             response.status_code = 200  # nothing was written
         request.state.message_id = result["id"]
         response.headers["Location"] = result["receipt_url"]
         return result
 
-    async def _send(request: Request, relay: Relay, idem_key: str | None) -> dict:
+    async def _send(request: Request, relay: Relay, idem_header: str | None, owner_idem=None):
         media = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
         if media == "application/json" or media.endswith("+json"):
             raw = await read_capped(request, MAX_JSON_BYTES)
             try:
-                data = json.loads(raw)
+                data = compat.parse_json(raw)
             except JSON_ERRORS:
                 raise ApiError(400, "bad_json", "body is not valid JSON") from None
             if not isinstance(data, dict):
                 raise ApiError(400, "bad_json", "body must be a JSON object")
+            compat.check_body_workspace(relay, data)
+            if owner_idem is not None and owner_idem.replay is not None:
+                return owner_idem.replay
             unknown = sorted(set(data) - TEXT_FIELDS)
             if unknown:
-                raise ApiError(422, "unknown_field",
-                               f"unknown field '{unknown[0]}' (allowed: {', '.join(sorted(TEXT_FIELDS))})", unknown[0])
+                # Preserve the established typo response without reflecting arbitrary field names.
+                if unknown == ["txt"]:
+                    raise ApiError(422, "unknown_field", "unknown field in request", "txt")
+                raise ApiError(422, "unknown_field", "unknown field in request")
             if "text" not in data:
                 raise ApiError(422, "invalid_field", "text is required", "text")
             for name in ("channel", "speech", "voice"):
                 if data.get(name) is not None and not isinstance(data[name], str):
                     raise ApiError(422, "invalid_field", f"{name} must be a string", name)
-            return await relay.send_text(text=data["text"], channel=data.get("channel"), speech=data.get("speech"),
-                                         voice=data.get("voice"), idem_key=idem_key, normalize=data.get("normalize"),
-                                         tag=data.get("tag"), coalesce_window_s=data.get("coalesce_window_s"),
-                                         cooldown_s=data.get("cooldown_s"), coalesce_s=data.get("coalesce_s"))
+            principal = request.state.principal
+            channel = resolved_send_channel(relay, principal, data.get("channel"))
+            async def send(idem):
+                return await relay.send_text(text=data["text"], channel=channel, speech=data.get("speech"),
+                                             voice=data.get("voice"), idem_key=idem.digest, normalize=data.get("normalize"),
+                                             tag=data.get("tag"), coalesce_window_s=data.get("coalesce_window_s"),
+                                             cooldown_s=data.get("cooldown_s"), coalesce_s=data.get("coalesce_s"),
+                                             principal=principal)
+            if owner_idem is not None:
+                return await send(owner_idem)
+            async with relay.check_replay(idem_header, channel, principal=principal) as idem:
+                if idem.replay is not None:
+                    authorize(relay, idem.replay["channel"], principal=principal)
+                    return idem.replay, True
+                return await send(idem), False
         if media == "multipart/form-data":
-            return await _send_multipart(request, relay, idem_key)
+            return await _send_multipart(request, relay, idem_header, owner_idem)
         raise ApiError(415, "unsupported_media_type",
                        "send application/json (text) or multipart/form-data (an audio file named 'file')")
 
@@ -602,11 +694,17 @@ def _api_routes(app: FastAPI, relay: Relay) -> None:
             "or the time is up. " + RECEIPT_STATUS_DOC + " A message with no beacon after EARSHOT_RELAY_RECEIPT_WAIT_MIN "
             "reads unconfirmed, which can still change if a beacon the phone parked while offline arrives."
         ),
-        responses=_errors(401, 404, 422),
+        responses=_errors(401, 403, 404, 422),
     )
     async def get_message(request: Request, message_id: str,
                           wait: int = Query(0, ge=0, le=60, description="Seconds to long-poll for a terminal status")):
-        receipt = await relay.wait_receipt(message_id, wait) if wait else relay.receipt(message_id)
+        principal = request.state.principal
+        if principal.kind == "scoped":
+            require_scoped_core(relay, principal)
+            receipt = (await relay.wait_message(message_id, wait, principal=principal) if wait
+                       else relay.get_message(message_id, principal=principal))
+        else:
+            receipt = await relay.wait_receipt(message_id, wait) if wait else relay.receipt(message_id)
         request.state.message_id = receipt["id"]
         return receipt
 
@@ -615,18 +713,41 @@ def _api_routes(app: FastAPI, relay: Relay) -> None:
         response_model=MessageList,
         tags=["core"],
         summary="Recent messages from the relay's index (newest first; oldest first after since)",
-        responses=_errors(401, 404, 422),
+        responses=_errors(401, 403, 404, 422),
     )
     async def list_messages(
+        request: Request,
         channel: str | None = Query(None, description="Only this channel"),
         limit: int = Query(20, ge=1, le=200),
         since: str | None = Query(None, description="RFC 3339 time or message id (exclusive). Switches to oldest first."),
     ):
+        principal = request.state.principal
+        if principal.kind == "scoped":
+            require_scoped_core(relay, principal)
+            if channel is not None:
+                resolved_send_channel(relay, principal, channel)
+                authorize(relay, channel, receipt=True, principal=principal)
+            return relay.recent_messages(channel=channel, limit=limit, since=since, principal=principal)
         return relay.list_messages(channel=channel, limit=limit, since=since)
 
+    @app.get("/v1/capabilities", tags=["core"], summary="Caller-authorized sendable channels",
+             response_model=CapabilitiesResponse, responses=_errors(401))
+    async def get_capabilities(request: Request):
+        principal = request.state.principal
+        if principal.kind == "owner":
+            channels = list(relay.settings.channels)
+        else:
+            channels = [c for c in relay.settings.channels if c != "replies" and relay.control is not None
+                        and relay.control.permits(principal, c)]
+        return JSONResponse({"channels": channels, "default_channel": relay.settings.default_channel
+                             if relay.settings.default_channel in channels else None},
+                            headers={"Cache-Control": "no-store"})
+
     @app.get("/v1/status", response_model=StatusResponse, tags=["core"], summary="Relay, bucket, channels and receipts",
-             responses=_errors(401))
-    async def get_status():
+             responses=_errors(401, 403))
+    async def get_status(request: Request):
+        if request.state.principal.kind != "owner":
+            raise ApiError(403, "forbidden", "request not permitted")
         return relay.status()
 
     @app.post(
@@ -635,13 +756,15 @@ def _api_routes(app: FastAPI, relay: Relay) -> None:
         tags=["relay"],
         summary="Write one inert .txt to the default channel and report configuration sanity",
         description="The phone never plays a lone .txt, so this proves the writer key without making a sound.",
-        responses=_errors(401),
+        responses=_errors(401, 403),
     )
-    async def post_doctor():
+    async def post_doctor(request: Request):
+        if request.state.principal.kind != "owner":
+            raise ApiError(403, "forbidden", "request not permitted")
         return await relay.doctor()
 
 
-async def _send_multipart(request: Request, relay: Relay, idem_key: str | None = None) -> dict:
+async def _send_multipart(request: Request, relay: Relay, idem_header: str | None, owner_idem=None):
     cap = relay.settings.max_audio_bytes + MULTIPART_OVERHEAD
     declared = request.headers.get("content-length")
     if declared and declared.isdigit() and int(declared) > cap:
@@ -665,20 +788,39 @@ async def _send_multipart(request: Request, relay: Relay, idem_key: str | None =
         raise ApiError(413, "too_large", f"the upload is over EARSHOT_RELAY_MAX_AUDIO_BYTES ({relay.settings.max_audio_bytes})",
                        "file") from None
     try:
-        unknown = sorted(set(form.keys()) - {"file", "channel"})
+        workspaces = form.getlist("workspace") + form.getlist("workspace_id")
+        if workspaces and (relay.control is None or any(w != relay.control.workspace_id for w in workspaces)):
+            raise ApiError(403, "forbidden", "request not permitted")
+        if owner_idem is not None and owner_idem.replay is not None:
+            return owner_idem.replay
+        unknown = sorted(set(form.keys()) - {"file", "channel", "workspace", "workspace_id"})
         if unknown:
-            raise ApiError(422, "unknown_field", f"unknown form field '{unknown[0]}' (allowed: file, channel)", unknown[0])
+            raise ApiError(422, "unknown_field", "unknown form field (allowed: file, channel)")
         upload = form.get("file")
         if not isinstance(upload, UploadFile):
             raise ApiError(422, "missing_file", "multipart field 'file' (an audio file) is required", "file")
         channel = form.get("channel")
         if channel is not None and not isinstance(channel, str):
             raise ApiError(422, "invalid_field", "channel must be a text field", "channel")
-        ext = audio_extension(upload.filename, upload.content_type)
+        try:
+            ext = audio_extension(upload.filename, upload.content_type)
+        except ApiError:
+            raise ApiError(415, "unsupported_media_type", "the file is not a supported audio type", "file") from None
         size = upload.size if upload.size is not None else _measure(upload)
         # An empty channel field is an invalid channel (422), not "use the default": a templated `-F channel=$CHAN`
         # with an unset variable must not quietly land somewhere else.
-        return await relay.send_audio(fileobj=upload.file, size=size, ext=ext, channel=channel, idem_key=idem_key)
+        principal = request.state.principal
+        channel = resolved_send_channel(relay, principal, channel)
+        async def send(idem):
+            return await relay.send_audio(fileobj=upload.file, size=size, ext=ext, channel=channel,
+                                          idem_key=idem.digest, principal=principal)
+        if owner_idem is not None:
+            return await send(owner_idem)
+        async with relay.check_replay(idem_header, channel, principal=principal) as idem:
+            if idem.replay is not None:
+                authorize(relay, idem.replay["channel"], principal=principal)
+                return idem.replay, True
+            return await send(idem), False
     finally:
         await form.close()
 

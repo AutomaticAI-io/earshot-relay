@@ -30,7 +30,6 @@ from __future__ import annotations
 import base64
 import binascii
 import email.header
-import hmac
 import json
 import logging
 import re
@@ -45,6 +44,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from starlette.datastructures import UploadFile
 
+from .auth import authenticate
 from .beacons import parse_rfc3339
 from .config import NTFY_TOPIC_RE
 from .keys import AUDIO_EXTENSIONS, MAX_TEXT_UTF8_BYTES, MEDIA_TYPE_EXTENSIONS, ApiError
@@ -57,10 +57,16 @@ MAX_FORM_BYTES = 256 * 1024
 PUSHOVER_MAX_BYTES = 5 * 1024 * 1024 + 64 * 1024  # Pushover's 5 MB attachment limit plus form overhead
 IDEMPOTENCY_KEY_RE = re.compile(r"^[\x20-\x7e]{1,255}$")
 TERMINAL_PUNCT = ".!?:;…。！？"
-FIELD_NAME_RE = re.compile(r"[^A-Za-z0-9_.:-]")
 REASONS = {400: "Bad Request", 401: "Unauthorized", 403: "Forbidden", 404: "Not Found", 413: "Request Entity Too Large",
            415: "Unsupported Media Type", 429: "Too Many Requests", 500: "Internal Server Error", 502: "Bad Gateway",
            504: "Gateway Timeout"}
+
+
+SAFE_IGNORED_FIELDS = {"attachment", "actions", "attach", "cache", "call", "click", "delay", "device", "deviceId",
+                       "earshot_tag", "earshot_coalesce_s", "earshot_coalesce_window_s", "earshot_cooldown_s",
+                       "earshot_normalize", "email", "extras", "filename", "firebase", "icon", "image", "markdown",
+                       "message", "poll_id", "sequence_id", "sound", "tags", "template", "text", "title",
+                       "unifiedpush", "url"}
 
 
 @dataclass
@@ -76,7 +82,7 @@ class Incoming:
 
     def ignore(self, *names: str) -> None:
         for n in names:
-            clean = FIELD_NAME_RE.sub("", str(n))[:40] or "?"
+            clean = n if n in SAFE_IGNORED_FIELDS else "other"
             if clean not in self.ignored and len(self.ignored) < 20:
                 self.ignored.append(clean)
 
@@ -123,18 +129,18 @@ def header_text(value: str) -> str:
 
 
 def token_matches(relay: Relay, presented: str | None, *, pushover: bool = False) -> bool:
-    """Constant-time check against the relay token, the send-only compat token (any compat route: it opens nothing
-    else) and, on the Pushover route only, the Pushover-shaped token."""
-    expected = [relay.settings.token]
-    if relay.settings.compat_token:
-        expected.append(relay.settings.compat_token)
-    if pushover and relay.settings.compat_pushover_token:
-        expected.append(relay.settings.compat_pushover_token)
-    got = (presented or "").encode("utf-8", "replace")
-    ok = False
-    for e in expected:
-        ok = hmac.compare_digest(got, e.encode()) or ok
-    return ok and bool(presented)
+    return authenticate(relay, presented, compat=True, pushover=pushover) is not None
+
+
+def bind_compat(relay: Relay, request: Request, secret: str | None, *, pushover: bool = False):
+    from .api import check_workspace
+
+    principal = authenticate(relay, secret, compat=True, pushover=pushover)
+    if principal is None:
+        raise ApiError(401, "unauthorized", "unauthorized")
+    check_workspace(request, relay)
+    request.state.principal = principal
+    return principal
 
 
 def authorization_secret(value: str | None) -> str | None:
@@ -207,6 +213,19 @@ async def spool_capped(request: Request, cap: int) -> tuple[IO[bytes], int]:
     return f, total
 
 
+def _json_object(pairs):
+    obj = {}
+    for key, value in pairs:
+        if key in ("workspace", "workspace_id") and key in obj:
+            raise ValueError("duplicate workspace selector")
+        obj[key] = value
+    return obj
+
+
+def parse_json(raw: bytes):
+    return json.loads(raw, object_pairs_hook=_json_object)
+
+
 async def _form_from_bytes(request: Request, raw: bytes):
     sent = False
 
@@ -236,6 +255,10 @@ async def read_fields(request: Request, cap: int) -> tuple[dict[str, Any], list[
             fields: dict[str, Any] = {}
             files: list[str] = []
             for k, v in form.multi_items():
+                if k in ("workspace", "workspace_id") and isinstance(v, UploadFile):
+                    raise ApiError(400, "invalid_field", "invalid workspace selector")
+                if k in ("workspace", "workspace_id") and k in fields:
+                    raise ApiError(400, "invalid_field", "duplicate workspace selector")
                 if isinstance(v, UploadFile):
                     files.append(k)
                 else:
@@ -246,7 +269,7 @@ async def read_fields(request: Request, cap: int) -> tuple[dict[str, Any], list[
     if media == "application/json" or media.endswith("+json") or (
             media != "application/x-www-form-urlencoded" and raw.lstrip()[:1] == b"{"):
         try:
-            data = json.loads(raw)
+            data = parse_json(raw)
         except (ValueError, UnicodeDecodeError, RecursionError):
             raise ApiError(400, "bad_json", "body is not valid JSON") from None
         if not isinstance(data, dict):
@@ -258,8 +281,18 @@ async def read_fields(request: Request, cap: int) -> tuple[dict[str, Any], list[
         raise ApiError(400, "bad_request", "form body is not UTF-8") from None
     fields = {}
     for k, v in parse_qsl(text, keep_blank_values=True):
+        if k in ("workspace", "workspace_id") and k in fields:
+            raise ApiError(400, "invalid_field", "duplicate workspace selector")
         fields.setdefault(k, v)
     return fields, []
+
+
+def check_body_workspace(relay: Relay, fields: dict) -> None:
+    for name in ("workspace", "workspace_id"):
+        if name in fields:
+            workspace = fields.pop(name)
+            if relay.control is None or workspace != relay.control.workspace_id:
+                raise ApiError(403, "forbidden", "request not permitted")
 
 
 def _str_field(data: dict, name: str, *, required: bool = False) -> str:
@@ -321,17 +354,22 @@ async def deliver(relay: Relay, request: Request, incoming: Incoming, protocol: 
     if idem_header is not None and not IDEMPOTENCY_KEY_RE.fullmatch(idem_header):
         raise ApiError(400, "invalid_field", "Idempotency-Key must be 1-255 printable ASCII characters",
                        "Idempotency-Key")
+    from .api import require_scoped_core, resolved_send_channel
+
+    principal = request.state.principal
+    require_scoped_core(relay, principal)
     headers: dict[str, str] = {}
-    channel = incoming.channel
+    normal = relay.resolve_channel(incoming.channel)
+    channel = normal
     if incoming.high and channel != "alarm":
-        if not relay.settings.compat_alarm_allowed:
-            headers["X-Earshot-Downgraded"] = "alarm"
-        elif relay.alarm_rate_limited():
-            # Over the alarm budget: a flapping monitor must not lose its alert. Store it as a normal item.
+        alarm_permitted = (principal.kind != "scoped" or
+                           (relay.control is not None and relay.control.permits(principal, "alarm")))
+        if not relay.settings.compat_alarm_allowed or not alarm_permitted or relay.alarm_rate_limited():
             headers["X-Earshot-Downgraded"] = "alarm"
         else:
             channel = "alarm"
             headers["X-Earshot-Promoted"] = "alarm"
+    channel = resolved_send_channel(relay, principal, channel)
     text = incoming.text if incoming.audio is None else ""
     if incoming.audio is None and not text:
         raise ApiError(400, "empty_text", "there is no title or message to speak", "message")
@@ -339,16 +377,25 @@ async def deliver(relay: Relay, request: Request, incoming: Incoming, protocol: 
     if incoming.audio is not None and hygiene:
         incoming.ignore(*(f"earshot_{n}" for n in hygiene))  # audio is never normalized, tagged or coalesced
         hygiene = {}
-    async with relay.idempotency(idem_header) as idem:
+    async with relay.check_replay(idem_header, channel, principal=principal) as idem:
         if idem.replay is not None:
+            if principal.kind != "owner":
+                resolved_send_channel(relay, principal, idem.replay["channel"])
+                headers.pop("X-Earshot-Promoted", None)
+                headers.pop("X-Earshot-Downgraded", None)
+                if incoming.high and normal != "alarm":
+                    headers["X-Earshot-Promoted" if idem.replay["channel"] == "alarm"
+                            else "X-Earshot-Downgraded"] = "alarm"
             result = idem.replay
             headers["Idempotent-Replayed"] = "true"
         elif incoming.audio is not None:
             fileobj, size, ext = incoming.audio
-            result = await relay.send_audio(fileobj=fileobj, size=size, ext=ext, channel=channel, idem_key=idem.digest)
+            result = await relay.send_audio(fileobj=fileobj, size=size, ext=ext, channel=channel,
+                                            idem_key=idem.digest, principal=principal)
         else:
             try:
-                result = await relay.send_text(text=text, channel=channel, idem_key=idem.digest, compat=True, **hygiene)
+                result = await relay.send_text(text=text, channel=channel, idem_key=idem.digest, compat=True,
+                                               principal=principal, **hygiene)
             except ApiError as exc:
                 if exc.field == "text":
                     exc.field = "message"
@@ -422,10 +469,14 @@ NTFY_CODES = {400: 40000, 401: 40101, 403: 40301, 404: 40401, 413: 41301, 415: 4
 NTFY_LINKS = {401: "https://ntfy.sh/docs/publish/#authentication", 429: "https://ntfy.sh/docs/publish/#limitations"}
 
 
+def safe_error_message(exc: ApiError) -> str:
+    return "request could not be completed" if exc.code in ("coalesce_busy", "storage_error") else exc.message
+
+
 def ntfy_error(exc: ApiError) -> JSONResponse:
     status = 413 if exc.code == "text_too_long" else _client_status(exc)
     code = {"invalid_priority": 40007, "invalid_topic": 40009}.get(exc.code, NTFY_CODES.get(status, status * 100))
-    body: dict[str, Any] = {"code": code, "http": status, "error": exc.message}
+    body: dict[str, Any] = {"code": code, "http": status, "error": safe_error_message(exc)}
     if status in NTFY_LINKS:
         body["link"] = NTFY_LINKS[status]
     return JSONResponse(body, status_code=status, headers=_retry_headers(exc))
@@ -483,7 +534,8 @@ def ntfy_authorized(relay: Relay, request: Request) -> bool:
     if not header:
         q = request.query_params.get("auth") or request.query_params.get("authorization")
         header = ntfy_query_auth(q) if q else None
-    return token_matches(relay, authorization_secret(header))
+    bind_compat(relay, request, authorization_secret(header))
+    return True
 
 
 def _ntfy_common(params: NtfyParams, incoming: Incoming) -> int:
@@ -543,11 +595,12 @@ def _ntfy_routes(app: FastAPI, relay: Relay, prefix: str, include_in_schema: boo
                 raise ApiError(401, "unauthorized", "unauthorized")
             raw = await read_capped(request, MAX_FORM_BYTES)
             try:
-                data = json.loads(raw)
+                data = parse_json(raw)
             except (ValueError, UnicodeDecodeError, RecursionError):
                 raise ApiError(400, "bad_json", "invalid request: request body must be message JSON") from None
             if not isinstance(data, dict):
                 raise ApiError(400, "bad_json", "invalid request: request body must be message JSON")
+            check_body_workspace(relay, data)
             topic = data.get("topic")
             incoming = Incoming(channel=channel_for(topic))
             for key in data:
@@ -651,7 +704,7 @@ GOTIFY_READ_ONLY = {"id", "appid", "date"}
 
 def gotify_error(exc: ApiError) -> JSONResponse:
     status = _client_status(exc)
-    return JSONResponse({"error": REASONS.get(status, "Error"), "errorCode": status, "errorDescription": exc.message},
+    return JSONResponse({"error": REASONS.get(status, "Error"), "errorCode": status, "errorDescription": safe_error_message(exc)},
                         status_code=status, headers=_retry_headers(exc))
 
 
@@ -680,10 +733,9 @@ def _gotify_routes(app: FastAPI, relay: Relay, prefix: str, include_in_schema: b
         try:
             secret = (request.headers.get("x-gotify-key") or request.query_params.get("token")
                       or authorization_secret(request.headers.get("authorization")))
-            if not token_matches(relay, secret):
-                raise ApiError(401, "unauthorized",
-                               "you need to provide a valid access token or user credentials to access this api")
+            bind_compat(relay, request, secret)
             data, files = await read_fields(request, MAX_FORM_BYTES)
+            check_body_workspace(relay, data)
             incoming = Incoming()
             incoming.message = _str_field(data, "message", required=True)
             if not incoming.message.strip():
@@ -720,7 +772,7 @@ PUSHOVER_FIELDS = {"token", "user", "message", "title", "priority"}
 
 def pushover_error(exc: ApiError) -> JSONResponse:
     status = _client_status(exc)
-    body: dict[str, Any] = {"status": 0, "request": "", "errors": [exc.message]}
+    body: dict[str, Any] = {"status": 0, "request": "", "errors": [safe_error_message(exc)]}
     if exc.field in ("token", "user", "message", "title", "priority"):
         body[exc.field] = "invalid"
     return JSONResponse(body, status_code=status, headers=_retry_headers(exc))
@@ -741,8 +793,8 @@ def _pushover_routes(app: FastAPI, relay: Relay, prefix: str, include_in_schema:
         try:
             data, files = await read_fields(request, PUSHOVER_MAX_BYTES)
             token = data.get("token")
-            if not isinstance(token, str) or not token_matches(relay, token, pushover=True):
-                raise ApiError(401, "unauthorized", "application token is invalid", "token")
+            bind_compat(relay, request, token if isinstance(token, str) else None, pushover=True)
+            check_body_workspace(relay, data)
             incoming = Incoming()
             incoming.message = _str_field(data, "message", required=True)
             if not incoming.message.strip():
@@ -777,7 +829,7 @@ JOIN_SPOKEN = {"text", "title", "say"}
 
 def join_error(exc: ApiError) -> JSONResponse:
     status = _client_status(exc)
-    return JSONResponse({"success": False, "userAuthError": status == 401, "errorMessage": exc.message},
+    return JSONResponse({"success": False, "userAuthError": status == 401, "errorMessage": safe_error_message(exc)},
                         status_code=status, headers=_retry_headers(exc))
 
 
@@ -785,15 +837,19 @@ def _join_routes(app: FastAPI, relay: Relay, prefix: str, include_in_schema: boo
     async def send_push(request: Request):
         try:
             data: dict[str, Any] = {}
+            if any(relay.control is None or w != relay.control.workspace_id
+                   for w in request.query_params.getlist("workspace") + request.query_params.getlist("workspace_id")):
+                raise ApiError(403, "forbidden", "request not permitted")
             for k, v in request.query_params.multi_items():
                 data.setdefault(k, v)
             if request.method == "POST":
                 body, files = await read_fields(request, MAX_FORM_BYTES)
+                check_body_workspace(relay, body)
                 data.update({k: v for k, v in body.items()})
                 data.update({f: "file" for f in files})
             apikey = data.get("apikey")
-            if not isinstance(apikey, str) or not token_matches(relay, apikey):
-                raise ApiError(401, "unauthorized", "User Not Authenticated", "apikey")
+            bind_compat(relay, request, apikey if isinstance(apikey, str) else None)
+            check_body_workspace(relay, data)
             incoming = Incoming()
             say, text, title = (_str_field(data, n) for n in ("say", "text", "title"))
             if say.strip():
@@ -810,6 +866,8 @@ def _join_routes(app: FastAPI, relay: Relay, prefix: str, include_in_schema: boo
             return JSONResponse({"success": True, "userAuthError": False, "messageId": delivered.result["id"]},
                                 headers=delivered.headers)
         except ApiError as exc:
+            if exc.status == 401:
+                exc.message = "User Not Authenticated"
             return join_error(exc)
 
     _add(app, prefix + "/_ah/api/messaging/v1/sendPush", send_push, ["GET", "POST"], "join_send_push",

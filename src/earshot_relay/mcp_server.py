@@ -7,15 +7,18 @@ deliberately no file or audio tool: a prompt-injected agent must not be able to 
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import httpx
 from mcp.server.mcpserver import MCPServer
-from mcp.server.mcpserver.exceptions import ToolError
+from mcp.server.mcpserver.exceptions import ToolError, UnexpectedToolError
 from mcp.server.transport_security import TransportSecuritySettings
-from mcp.types import ToolAnnotations
+from pydantic import ValidationError
+from mcp.types import CallToolResult, TextContent, ToolAnnotations
 
 from . import RECEIPT_WORDING, __version__
+from .auth import current_token
 from .beacons import receipt_is_final
 
 INSTRUCTIONS = (
@@ -75,10 +78,16 @@ SUMMARIES = {
 class Backend:
     """REST client used by the tools. Errors become ToolError with the relay's error code and message."""
 
-    def __init__(self, client: httpx.AsyncClient):
+    def __init__(self, client: httpx.AsyncClient, *, caller_context: bool = False):
         self.client = client
+        self.caller_context = caller_context
 
     async def _call(self, method: str, path: str, **kwargs) -> dict:
+        if self.caller_context:
+            token = current_token.get()
+            if not token:
+                raise ToolError("unauthorized: caller credential is unavailable")
+            kwargs["headers"] = {"Authorization": f"Bearer {token}"}
         try:
             resp = await self.client.request(method, path, **kwargs)
         except httpx.TimeoutException:
@@ -102,6 +111,8 @@ class Backend:
         return await self._call("POST", "/v1/messages", json={k: v for k, v in body.items() if v is not None})
 
     async def receipt(self, message_id: str, wait: int) -> dict:
+        if message_id != "latest" and not re.fullmatch(r"msg_[0-9a-f]{32}", message_id):
+            raise ToolError("not_found: no message with that id")
         params = {"wait": wait} if wait else None
         return await self._call("GET", f"/v1/messages/{message_id}", params=params, timeout=wait + 15)
 
@@ -113,6 +124,9 @@ class Backend:
 
     async def status(self) -> dict:
         return await self._call("GET", "/v1/status")
+
+    async def capabilities(self) -> dict:
+        return await self._call("GET", "/v1/capabilities")
 
 
 def _sent(result: dict) -> dict[str, Any]:
@@ -143,9 +157,48 @@ def _sent(result: dict) -> dict[str, Any]:
     return out
 
 
+class CallerMCPServer(MCPServer):
+    def __init__(self, backend: Backend, **kwargs):
+        self.backend = backend
+        super().__init__(**kwargs)
+
+    async def _handle_call_tool(self, ctx, params):
+        if self._tool_manager.get_tool(params.name) is None:
+            return CallToolResult(content=[TextContent(type="text", text="unknown tool")], is_error=True)
+        return await super()._handle_call_tool(ctx, params)
+
+    async def call_tool(self, name, arguments, context=None):
+        tool = self._tool_manager.get_tool(name)
+        if tool is None:
+            raise ToolError("unknown tool")
+        allowed = set(tool.parameters.get("properties", {}))
+        if not isinstance(arguments, dict) or set(arguments) - allowed:
+            raise ToolError("invalid tool arguments")
+        try:
+            return await super().call_tool(name, arguments, context)
+        except ToolError as exc:
+            if isinstance(exc, UnexpectedToolError):
+                raise ToolError("tool execution failed") from None
+            if isinstance(exc.__cause__, ValidationError):
+                raise ToolError("invalid tool arguments") from None
+            raise
+        except Exception:
+            raise ToolError("tool execution failed") from None
+
+    async def list_tools(self):
+        tools = await super().list_tools()
+        if not any(tool.name == "alarm" for tool in tools):
+            return tools
+        try:
+            allowed = "alarm" in (await self.backend.capabilities()).get("channels", [])
+        except ToolError:
+            allowed = False
+        return [tool for tool in tools if tool.name != "alarm" or allowed]
+
+
 def build_mcp(backend: Backend, *, alarm_allowed: bool) -> MCPServer:
-    mcp = MCPServer(name="earshot", title="Earshot", instructions=INSTRUCTIONS, version=__version__, log_level="WARNING",
-                    website_url="https://store.automaticai.io/earshot/")
+    mcp = CallerMCPServer(backend, name="earshot", title="Earshot", instructions=INSTRUCTIONS, version=__version__, log_level="WARNING",
+                          website_url="https://store.automaticai.io/earshot/")
 
     @mcp.tool(description=SAY_DESCRIPTION,
               annotations=ToolAnnotations(title="Say on phone", readOnlyHint=False, destructiveHint=False,
@@ -156,7 +209,7 @@ def build_mcp(backend: Backend, *, alarm_allowed: bool) -> MCPServer:
         """text: what to speak. channel: optional, default the relay's default. speech: device or server. voice: server
         only. normalize: strip emoji, markdown and URLs. tag + coalesce_window_s: write only the latest text sent under the tag
         within that many seconds (coalesce_s is the 1.1.0 name of coalesce_window_s). tag + cooldown_s: drop a repeat of the tag inside that many seconds."""
-        if channel == "alarm":
+        if channel == "alarm" or (channel is None and (await backend.capabilities()).get("default_channel") == "alarm"):
             hint = "use the alarm tool" if alarm_allowed else "alarm is not enabled on this relay"
             raise ToolError(f"say does not send to the alarm channel; {hint}")
         return _sent(await backend.send({"text": text, "channel": channel, "speech": speech, "voice": voice,
@@ -213,14 +266,13 @@ def build_mcp(backend: Backend, *, alarm_allowed: bool) -> MCPServer:
 
 
 def build_http_mcp(app, relay) -> tuple[MCPServer, list]:
-    """The `/mcp` route for the main app. Tools call the same app in-process with the relay's own token."""
+    """The `/mcp` route forwards the authenticated request's credential in-process."""
     client = httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app),
         base_url="http://earshot-relay.internal",
-        headers={"Authorization": f"Bearer {relay.settings.token}"},
         timeout=httpx.Timeout(120),
     )
-    mcp = build_mcp(Backend(client), alarm_allowed=relay.settings.alarm_allowed)
+    mcp = build_mcp(Backend(client, caller_context=True), alarm_allowed=relay.settings.alarm_allowed)
     # Bearer auth on every request already blocks DNS-rebinding style access, and the Host header is whatever the
     # user's tunnel or proxy sends, so the SDK's localhost-only Host check is off.
     starlette_app = mcp.streamable_http_app(
@@ -238,7 +290,7 @@ def run_stdio(api_url: str, token: str) -> None:
     alarm_allowed = False
     try:
         with httpx.Client(base_url=api_url, headers=headers, timeout=10) as c:
-            resp = c.get("/v1/status")
+            resp = c.get("/v1/capabilities")
             if resp.status_code == 200:
                 alarm_allowed = "alarm" in resp.json().get("channels", [])
     except (httpx.HTTPError, ValueError):

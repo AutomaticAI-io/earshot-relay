@@ -67,7 +67,7 @@ class ApiError(Exception):
 
 
 def is_valid_channel(name: object) -> bool:
-    return isinstance(name, str) and CHANNEL_RE.fullmatch(name) is not None
+    return isinstance(name, str) and name != "replies" and CHANNEL_RE.fullmatch(name) is not None
 
 
 def utf16_units(text: str) -> int:
