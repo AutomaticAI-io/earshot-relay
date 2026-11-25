@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import errno
 import fcntl
 import json
 import os
@@ -18,6 +20,10 @@ from urllib.parse import urlsplit
 CHANNEL = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}\Z")
 WORKSPACE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,52}[a-z0-9])?\Z")
 BUCKET = re.compile(r"[a-z0-9][a-z0-9-]{1,61}[a-z0-9]\Z")
+
+
+RENAME_NOREPLACE = 1
+AT_FDCWD = -100
 
 
 class Refusal(Exception):
@@ -94,24 +100,137 @@ def private_dir(path):
     return path
 
 
-def atomic_json(path, value):
-    directory = path.parent
-    fd, name = tempfile.mkstemp(prefix=".pending-", dir=directory)
+def rename_noreplace(source, destination):
+    try:
+        func = ctypes.CDLL(None, use_errno=True).renameat2
+    except AttributeError:
+        raise Refusal("atomic no-replace publication unavailable on this platform") from None
+    func.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    func.restype = ctypes.c_int
+    if func(AT_FDCWD, os.fsencode(source), AT_FDCWD, os.fsencode(destination), RENAME_NOREPLACE) != 0:
+        error = ctypes.get_errno()
+        if error == errno.EEXIST:
+            raise Refusal("output appeared during publication; refusing to overwrite")
+        raise OSError(error, "atomic no-replace publication failed")
+
+
+def sync_dir(directory):
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def protected_json_temp(directory, prefix, value):
+    fd, name = tempfile.mkstemp(prefix=prefix, dir=directory)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(value, f, sort_keys=True, indent=2)
             f.write("\n")
             f.flush()
             os.fsync(f.fileno())
-        os.replace(name, path)
-        dir_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
+            st = os.fstat(f.fileno())
+        sync_dir(directory)
+        return Path(name), st
+    except BaseException:
+        os.unlink(name)
+        raise
+
+
+def atomic_json(path, value, *, create_only=False):
+    name, _ = protected_json_temp(path.parent, ".pending-", value)
+    try:
+        if create_only:
+            rename_noreplace(name, path)
+        else:
+            os.replace(name, path)
+        sync_dir(path.parent)
     finally:
         if os.path.exists(name):
             os.unlink(name)
+
+
+def expected_handoffs(spec, endpoint, state):
+    outputs = {}
+    for label, identity in state["identities"].items():
+        outputs[f"{label}.json"] = {"version": 1, "provider": "minio", "workspace": spec["workspace"], "endpoint": endpoint, "region": "us-east-1", "bucket": spec["bucket"], "role": "reader" if identity["reader"] else "writer", "device": label[7:] if identity["reader"] else None, "channels": identity["channels"], "access_key": identity["access_key"], "secret_key": identity["secret_key"]}
+    return outputs
+
+
+def validate_input_paths(state_dir, names, input_paths):
+    sources = [Path(value).resolve(strict=True) for value in input_paths]
+    for name in names:
+        destination = state_dir / name
+        for source in sources:
+            if source == destination.resolve(strict=False):
+                raise Refusal("input collides with a reserved state or handoff path")
+            if os.path.lexists(destination) and os.path.samefile(source, destination):
+                raise Refusal("input aliases a reserved state or handoff path")
+
+
+def preflight_outputs(state_dir, spec, endpoint, state, input_paths):
+    outputs = expected_handoffs(spec, endpoint, state)
+    validate_input_paths(state_dir, {"state.json", ".lock", *outputs}, input_paths)
+    records = state.get("handoffs")
+    if not isinstance(records, dict) or not set(records) <= set(outputs):
+        raise Refusal("invalid handoff journal; manual reconciliation required")
+    temporary = []
+    for name, record in records.items():
+        if not isinstance(record, dict) or set(record) != {"temp", "device", "inode"} or not isinstance(record["temp"], str) or not re.fullmatch(r"\.handoff-[a-zA-Z0-9_-]+", record["temp"]) or not isinstance(record["device"], int) or not isinstance(record["inode"], int):
+            raise Refusal("invalid handoff provenance; manual reconciliation required")
+        temporary.append(state_dir / record["temp"])
+    if len(set(temporary)) != len(temporary):
+        raise Refusal("duplicate handoff provenance")
+    for source in map(lambda x: Path(x).resolve(strict=True), input_paths):
+        for temp in temporary:
+            if source == temp.resolve(strict=False) or (os.path.lexists(temp) and os.path.samefile(source, temp)):
+                raise Refusal("input collides with a journal-owned temporary handoff")
+    for name, expected in outputs.items():
+        target = state_dir / name
+        record = records.get(name)
+        if record:
+            temp = state_dir / record["temp"]
+            if os.path.lexists(target) and os.path.lexists(temp):
+                raise Refusal("both temporary and published handoff exist; manual reconciliation required")
+            if not os.path.lexists(target) and not os.path.lexists(temp):
+                raise Refusal("journal-owned handoff is missing; manual reconciliation required")
+        else:
+            temp = None
+        for path in (target, temp):
+            if path is None or not os.path.lexists(path):
+                continue
+            if record is None:
+                raise Refusal("pre-existing handoff is not journal-owned; refusing overwrite")
+            try:
+                st = path.lstat()
+                if (st.st_dev, st.st_ino) != (record["device"], record["inode"]):
+                    raise Refusal("handoff provenance mismatch")
+                actual = protected_file(path)
+            except (OSError, ValueError, Refusal):
+                raise Refusal("existing handoff is not a protected journal-owned file") from None
+            if actual != expected:
+                raise Refusal("existing handoff differs from journal; refusing overwrite")
+    return outputs
+
+
+def publish_handoffs(state_dir, state, outputs, save):
+    for name, handoff in outputs.items():
+        target = state_dir / name
+        record = state["handoffs"].get(name)
+        if not record:
+            temp, st = protected_json_temp(state_dir, ".handoff-", handoff)
+            record = {"temp": temp.name, "device": st.st_dev, "inode": st.st_ino}
+            state["handoffs"][name] = record
+            save()
+        else:
+            temp = state_dir / record["temp"]
+        if os.path.lexists(target):
+            continue
+        if not os.path.lexists(temp):
+            raise Refusal("journal-owned handoff is missing; manual reconciliation required")
+        rename_noreplace(temp, target)
+        sync_dir(state_dir)
 
 
 def policy(bucket, channels, reader):
@@ -133,7 +252,7 @@ def canonical(value):
 def new_state(spec, endpoint):
     def identity(grants, reader):
         return {"access_key": "es" + secrets.token_hex(12), "secret_key": secrets.token_hex(24), "policy": "earshot-" + secrets.token_hex(16), "channels": grants, "reader": reader, "user_attempted": False, "user_confirmed": False, "policy_attempted": False, "policy_confirmed": False, "attachment_confirmed": False}
-    return {"version": 1, "spec": spec, "endpoint": endpoint, "binding": secrets.token_hex(32), "bucket_phase": "new", "progress": "initialized", "identities": {"writer": identity(spec["channels"], False), **{f"reader-{device}": identity(grants, True) for device, grants in spec["readers"].items()}}, "complete": False}
+    return {"version": 2, "spec": spec, "endpoint": endpoint, "binding": secrets.token_hex(32), "bucket_phase": "new", "progress": "initialized", "identities": {"writer": identity(spec["channels"], False), **{f"reader-{device}": identity(grants, True) for device, grants in spec["readers"].items()}}, "handoffs": {}, "complete": False}
 
 
 class Minio:
@@ -196,26 +315,76 @@ class Minio:
         self.mc(["admin", "policy", "attach", "setup", identity["policy"], "--user", identity["access_key"]])
 
 
+def bucket_creation_time(admin, bucket):
+    matches = [item for item in admin.s3.list_buckets().get("Buckets", []) if item.get("Name") == bucket]
+    if len(matches) != 1 or not matches[0].get("CreationDate"):
+        raise Refusal("cannot verify bucket creation time; inspect provider state")
+    return matches[0]["CreationDate"].isoformat()
+
+
+def require_bucket_continuity(admin, bucket, state, save):
+    try:
+        observed = state.get("bucket_created_at")
+        if not observed or bucket_creation_time(admin, bucket) != observed:
+            raise Refusal("bucket creation time missing or changed; continuity unknown")
+    except Refusal:
+        state["progress"] = "bucket continuity unknown"
+        save()
+        raise
+
+
+def fresh_bucket_contents(admin, bucket, expected_keys):
+    versioning = admin.s3.get_bucket_versioning(Bucket=bucket)
+    if versioning.get("Status") or versioning.get("MFADelete"):
+        return False
+    response = admin.s3.list_objects_v2(Bucket=bucket, MaxKeys=2)
+    if response.get("IsTruncated") or sorted(item["Key"] for item in response.get("Contents", [])) != expected_keys:
+        return False
+    versions = admin.s3.list_object_versions(Bucket=bucket, MaxKeys=2)
+    version_items = versions.get("Versions", [])
+    if versions.get("IsTruncated") or versions.get("DeleteMarkers") or sorted(item["Key"] for item in version_items) != expected_keys:
+        return False
+    if any(not item.get("IsLatest") or item.get("VersionId") != "null" for item in version_items):
+        return False
+    uploads = admin.s3.list_multipart_uploads(Bucket=bucket, MaxUploads=1)
+    return not uploads.get("Uploads") and not uploads.get("IsTruncated")
+
+
+def fresh_bucket_is_empty(admin, bucket):
+    return fresh_bucket_contents(admin, bucket, [])
+
+
+def fresh_bucket_has_only_marker(admin, bucket, marker_key):
+    return fresh_bucket_contents(admin, bucket, [marker_key])
+
+
 def error_code(exc):
     return getattr(exc, "response", {}).get("Error", {}).get("Code", "")
 
 
-def apply(spec, endpoint, credentials, state_dir):
+def apply(spec, endpoint, credentials, state_dir, input_paths):
     # Python's TLS contexts honor this inherited variable even with certificate verification enabled.
     os.environ.pop("SSLKEYLOGFILE", None)
     from botocore.exceptions import ClientError
-    state_dir = private_dir(state_dir)
+    state_dir = Path(state_dir)
     path = state_dir / "state.json"
+    reserved = {"state.json", ".lock", "writer.json", *(f"reader-{device}.json" for device in spec["readers"])}
+    validate_input_paths(state_dir, reserved, input_paths)
+    state_dir = private_dir(state_dir)
     lock_fd = os.open(state_dir / ".lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    journal_ready = False
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         if os.path.lexists(path):
             state = protected_file(path)
-            if state.get("version") != 1 or state.get("spec") != spec or state.get("endpoint") != endpoint:
+            if state.get("version") != 2 or state.get("spec") != spec or state.get("endpoint") != endpoint:
                 raise Refusal("state workspace, spec, endpoint or version mismatch; no changes made")
+            preflight_outputs(state_dir, spec, endpoint, state, input_paths)
         else:
             state = new_state(spec, endpoint)
-            atomic_json(path, state)
+            preflight_outputs(state_dir, spec, endpoint, state, input_paths)
+            atomic_json(path, state, create_only=True)
+        journal_ready = True
         def save():
             atomic_json(path, state)
         state["complete"] = False
@@ -247,6 +416,7 @@ def apply(spec, endpoint, credentials, state_dir):
                 save()
                 admin.s3.create_bucket(Bucket=bucket)
                 created_this_run = True
+                state["bucket_created_at"] = bucket_creation_time(admin, bucket)
                 state["bucket_phase"] = "created"
                 state["progress"] = "bucket created; binding pending"
                 save()
@@ -259,16 +429,24 @@ def apply(spec, endpoint, credentials, state_dir):
                     state["progress"] = "bucket continuity unknown"
                     save()
                     raise Refusal("unbound bucket continuity unknown; no binding or IAM changes made")
+                require_bucket_continuity(admin, bucket, state, save)
+                if not fresh_bucket_is_empty(admin, bucket):
+                    state["progress"] = "fresh bucket is not empty"
+                    save()
+                    raise Refusal("fresh bucket is not empty; refusing binding")
+                require_bucket_continuity(admin, bucket, state, save)
                 try:
                     admin.s3.put_object(Bucket=bucket, Key=marker_key, Body=json.dumps(marker).encode(), IfNoneMatch="*")
                 except ClientError as exc:
                     if error_code(exc) not in ("PreconditionFailed", "412"):
                         raise
+            require_bucket_continuity(admin, bucket, state, save)
             obj = admin.s3.get_object(Bucket=bucket, Key=marker_key)
             if json.loads(obj["Body"].read()) != marker:
                 raise Refusal("bucket binding mismatch; refusing provider changes")
             if state["bucket_phase"] == "created":
                 state["bucket_phase"] = "bound"
+                state["fresh_bucket_guard"] = True
                 state["progress"] = "bucket binding confirmed"
                 save()
             try:
@@ -278,7 +456,19 @@ def apply(spec, endpoint, credentials, state_dir):
                     raise Refusal("cannot verify anonymous bucket policy") from None
             else:
                 raise Refusal("bucket has a policy; private-only setup refuses to proceed")
-            for label, identity in state["identities"].items():
+            if state.get("fresh_bucket_guard") and not fresh_bucket_has_only_marker(admin, bucket, marker_key):
+                state["progress"] = "fresh bucket contains unexpected objects"
+                save()
+                raise Refusal("fresh bucket contains unexpected objects; refusing identity issuance")
+            for label, identity in sorted(state["identities"].items(), key=lambda pair: pair[0] == "writer"):
+                require_bucket_continuity(admin, bucket, state, save)
+                obj = admin.s3.get_object(Bucket=bucket, Key=marker_key)
+                if json.loads(obj["Body"].read()) != marker:
+                    raise Refusal("bucket binding mismatch; refusing identity issuance")
+                if state.get("fresh_bucket_guard") and not fresh_bucket_has_only_marker(admin, bucket, marker_key):
+                    state["progress"] = "fresh bucket contains unexpected objects"
+                    save()
+                    raise Refusal("fresh bucket contains unexpected objects; refusing identity issuance")
                 state["progress"] = "checking " + label
                 save()
                 expected = policy(bucket, identity["channels"], identity["reader"])
@@ -305,6 +495,14 @@ def apply(spec, endpoint, credentials, state_dir):
                         state["progress"] = "attempted user missing for " + label
                         save()
                         raise Refusal("attempted user is missing; outcome or revocation unknown; refusing recreation")
+                    require_bucket_continuity(admin, bucket, state, save)
+                    obj = admin.s3.get_object(Bucket=bucket, Key=marker_key)
+                    if json.loads(obj["Body"].read()) != marker:
+                        raise Refusal("bucket binding mismatch; refusing identity issuance")
+                    if state.get("fresh_bucket_guard") and not fresh_bucket_has_only_marker(admin, bucket, marker_key):
+                        state["progress"] = "fresh bucket contains unexpected objects"
+                        save()
+                        raise Refusal("fresh bucket contains unexpected objects; refusing identity issuance")
                     identity["user_attempted"] = True
                     state["progress"] = "creating user for " + label
                     save()
@@ -325,6 +523,17 @@ def apply(spec, endpoint, credentials, state_dir):
                 if not policies:
                     if identity["attachment_confirmed"] or identity["user_confirmed"]:
                         raise Refusal("confirmed policy attachment is missing; refusing to reattach")
+                    if not identity["reader"] and state.get("fresh_bucket_guard"):
+                        require_bucket_continuity(admin, bucket, state, save)
+                        obj = admin.s3.get_object(Bucket=bucket, Key=marker_key)
+                        if json.loads(obj["Body"].read()) != marker:
+                            raise Refusal("bucket binding mismatch; refusing identity issuance")
+                        if not fresh_bucket_has_only_marker(admin, bucket, marker_key):
+                            state["progress"] = "fresh bucket contains unexpected objects"
+                            save()
+                            raise Refusal("fresh bucket contains unexpected objects; refusing identity issuance")
+                        state["fresh_bucket_guard"] = False
+                        save()
                     try:
                         admin.client(identity).list_objects_v2(Bucket=bucket, Prefix=identity["channels"][0] + "/", MaxKeys=1)
                     except ClientError as exc:
@@ -352,14 +561,14 @@ def apply(spec, endpoint, credentials, state_dir):
                         raise Refusal("writer unexpectedly has list permission")
             state["progress"] = "handoff files pending"
             save()
-            for label, identity in state["identities"].items():
-                handoff = {"version": 1, "provider": "minio", "workspace": spec["workspace"], "endpoint": endpoint, "region": "us-east-1", "bucket": bucket, "role": "reader" if identity["reader"] else "writer", "device": label[7:] if identity["reader"] else None, "channels": identity["channels"], "access_key": identity["access_key"], "secret_key": identity["secret_key"]}
-                atomic_json(state_dir / f"{label}.json", handoff)
+            outputs = preflight_outputs(state_dir, spec, endpoint, state, input_paths)
+            publish_handoffs(state_dir, state, outputs, save)
+            preflight_outputs(state_dir, spec, endpoint, state, input_paths)
             state["progress"] = "complete"
             state["complete"] = True
             save()
     except KeyboardInterrupt:
-        if os.path.lexists(path):
+        if journal_ready and os.path.lexists(path):
             state = protected_file(path)
             state["complete"] = False
             state["progress"] = "interrupted: " + state.get("progress", "unknown")
@@ -389,7 +598,7 @@ def main(argv=None):
         credentials = protected_file(args.admin_file)
         if not isinstance(credentials, dict) or set(credentials) != {"access_key", "secret_key"} or any(not isinstance(credentials[k], str) or not credentials[k] or "\n" in credentials[k] or "\r" in credentials[k] for k in credentials):
             raise Refusal("admin file must contain nonempty access_key and secret_key strings")
-        apply(spec, endpoint, credentials, args.state_dir)
+        apply(spec, endpoint, credentials, args.state_dir, [args.spec, args.admin_file])
         print("apply complete; protected handoffs and recovery state are in the state directory")
         return 0
     except (Refusal, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:

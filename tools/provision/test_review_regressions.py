@@ -193,6 +193,357 @@ m.Minio.__init__=init
     assert not (state / "writer.json").exists()
 
 
+def test_same_process_bucket_replacement_with_foreign_data_is_refused(fixture):
+    f = fixture
+    manifest_file, state = f["dir"] / "spec.json", f["dir"] / "state"
+    write_json(manifest_file, manifest("sameprocess"))
+    injected = """original=m.fresh_bucket_is_empty
+def pause(admin,bucket):
+ os.kill(os.getpid(), 19)
+ return original(admin,bucket)
+m.fresh_bucket_is_empty=pause
+"""
+    process = crash_script(f, manifest_file, state, injected)
+    try:
+        wait_stopped(process)
+        journal = json.loads((state / "state.json").read_text())
+        assert journal["bucket_phase"] == "created" and not journal["complete"]
+        admin = s3(f["endpoint"], f["admin"])
+        bucket = "earshot-sameprocess"
+        assert admin.list_objects_v2(Bucket=bucket).get("KeyCount") == 0
+        admin.delete_bucket(Bucket=bucket)
+        admin.create_bucket(Bucket=bucket)
+        admin.put_object(Bucket=bucket, Key="phone/foreign", Body=b"foreign-data")
+        os.kill(process.pid, signal.SIGCONT)
+        stdout, stderr = process.communicate(timeout=30)
+        assert process.returncode != 0 and ("fresh bucket is not empty" in stderr or "continuity unknown" in stderr)
+    finally:
+        kill_owned(process)
+    assert admin.get_object(Bucket=bucket, Key="phone/foreign")["Body"].read() == b"foreign-data"
+    assert [obj["Key"] for obj in admin.list_objects_v2(Bucket=bucket).get("Contents", [])] == ["phone/foreign"]
+    mc = admin_mc(f)
+    for identity in journal["identities"].values():
+        assert mc("admin", "user", "info", "fixture", identity["access_key"]).returncode != 0
+        assert identity["secret_key"] not in stdout + stderr
+    assert not (state / "writer.json").exists()
+
+
+def test_same_process_empty_bucket_replacement_creation_time_is_refused(fixture):
+    f = fixture
+    manifest_file, state = f["dir"] / "spec.json", f["dir"] / "state"
+    write_json(manifest_file, manifest("emptyreplace"))
+    injected = """original=m.fresh_bucket_is_empty
+def pause(admin,bucket):
+ os.kill(os.getpid(), 19)
+ return original(admin,bucket)
+m.fresh_bucket_is_empty=pause
+"""
+    process = crash_script(f, manifest_file, state, injected)
+    try:
+        wait_stopped(process)
+        journal = json.loads((state / "state.json").read_text())
+        assert journal["bucket_phase"] == "created" and journal["bucket_created_at"]
+        admin = s3(f["endpoint"], f["admin"])
+        bucket = "earshot-emptyreplace"
+        time.sleep(1.1)
+        admin.delete_bucket(Bucket=bucket)
+        admin.create_bucket(Bucket=bucket)
+        os.kill(process.pid, signal.SIGCONT)
+        stdout, stderr = process.communicate(timeout=30)
+        assert process.returncode != 0 and "continuity unknown" in stderr
+    finally:
+        kill_owned(process)
+    assert admin.list_objects_v2(Bucket=bucket).get("KeyCount") == 0
+    mc = admin_mc(f)
+    for identity in journal["identities"].values():
+        assert mc("admin", "user", "info", "fixture", identity["access_key"]).returncode != 0
+        assert identity["secret_key"] not in stdout + stderr
+
+
+def test_same_process_object_after_empty_check_is_refused_before_issuance(fixture):
+    f = fixture
+    manifest_file, state = f["dir"] / "spec.json", f["dir"] / "state"
+    write_json(manifest_file, manifest("afterempty"))
+    injected = """original=m.fresh_bucket_is_empty
+def pause(admin,bucket):
+ result=original(admin,bucket)
+ os.kill(os.getpid(), 19)
+ return result
+m.fresh_bucket_is_empty=pause
+"""
+    process = crash_script(f, manifest_file, state, injected)
+    try:
+        wait_stopped(process)
+        admin = s3(f["endpoint"], f["admin"])
+        bucket = "earshot-afterempty"
+        admin.put_object(Bucket=bucket, Key="phone/foreign", Body=b"retain")
+        os.kill(process.pid, signal.SIGCONT)
+        _, stderr = process.communicate(timeout=30)
+        assert process.returncode != 0 and "unexpected objects" in stderr
+    finally:
+        kill_owned(process)
+    journal = json.loads((state / "state.json").read_text())
+    assert journal["bucket_phase"] == "bound" and not journal["complete"]
+    assert admin.get_object(Bucket=bucket, Key="phone/foreign")["Body"].read() == b"retain"
+    mc = admin_mc(f)
+    for identity in journal["identities"].values():
+        assert mc("admin", "user", "info", "fixture", identity["access_key"]).returncode != 0
+    retry = run_apply(f, manifest_file, state)
+    assert retry.returncode != 0 and "unexpected objects" in retry.stderr
+
+
+def test_replaced_bucket_with_copied_marker_is_refused_on_reapply(fixture):
+    f = fixture
+    manifest_file, state = f["dir"] / "spec.json", f["dir"] / "state"
+    write_json(manifest_file, manifest("copiedmarker"))
+    assert run_apply(f, manifest_file, state).returncode == 0
+    admin = s3(f["endpoint"], f["admin"])
+    bucket, marker = "earshot-copiedmarker", ".earshot-provisioner/binding.json"
+    content = admin.get_object(Bucket=bucket, Key=marker)["Body"].read()
+    admin.delete_object(Bucket=bucket, Key=marker)
+    time.sleep(1.1)
+    admin.delete_bucket(Bucket=bucket)
+    admin.create_bucket(Bucket=bucket)
+    admin.put_object(Bucket=bucket, Key=marker, Body=content)
+    admin.put_object(Bucket=bucket, Key="phone/foreign", Body=b"retain")
+    result = run_apply(f, manifest_file, state)
+    assert result.returncode != 0 and "continuity unknown" in result.stderr
+    assert admin.get_object(Bucket=bucket, Key="phone/foreign")["Body"].read() == b"retain"
+    assert not json.loads((state / "state.json").read_text())["complete"]
+
+
+def test_foreign_versioned_data_or_multipart_is_not_fresh(fixture):
+    f = fixture
+    admin = s3(f["endpoint"], f["admin"])
+    bucket = "earshot-hiddenversions"
+    admin.create_bucket(Bucket=bucket)
+    admin.put_bucket_versioning(Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
+    admin.put_object(Bucket=bucket, Key="phone/foreign", Body=b"retain")
+    admin.delete_object(Bucket=bucket, Key="phone/foreign")
+    admin.put_bucket_versioning(Bucket=bucket, VersioningConfiguration={"Status": "Suspended"})
+    assert admin.list_objects_v2(Bucket=bucket).get("KeyCount") == 0
+    class Admin:
+        s3 = admin
+    assert not setup.fresh_bucket_is_empty(Admin(), bucket)
+    multipart = "earshot-multipart"
+    admin.create_bucket(Bucket=multipart)
+    admin.create_multipart_upload(Bucket=multipart, Key="phone/pending")
+    assert admin.list_objects_v2(Bucket=multipart).get("KeyCount") == 0
+    assert not setup.fresh_bucket_is_empty(Admin(), multipart)
+
+
+def test_foreign_object_before_issuance_is_refused(fixture):
+    f = fixture
+    manifest_file, state = f["dir"] / "spec.json", f["dir"] / "state"
+    write_json(manifest_file, manifest("beforeissue"))
+    injected = """original=m.fresh_bucket_has_only_marker
+def pause(admin,bucket,marker):
+ os.kill(os.getpid(), 19)
+ return original(admin,bucket,marker)
+m.fresh_bucket_has_only_marker=pause
+"""
+    process = crash_script(f, manifest_file, state, injected)
+    try:
+        wait_stopped(process)
+        journal = json.loads((state / "state.json").read_text())
+        assert journal["bucket_phase"] == "bound" and not journal["complete"]
+        admin = s3(f["endpoint"], f["admin"])
+        admin.put_object(Bucket="earshot-beforeissue", Key="phone/foreign", Body=b"preserve")
+        os.kill(process.pid, signal.SIGCONT)
+        stdout, stderr = process.communicate(timeout=30)
+        assert process.returncode != 0 and "unexpected objects" in stderr
+    finally:
+        kill_owned(process)
+    assert admin.get_object(Bucket="earshot-beforeissue", Key="phone/foreign")["Body"].read() == b"preserve"
+    mc = admin_mc(f)
+    for identity in journal["identities"].values():
+        assert mc("admin", "user", "info", "fixture", identity["access_key"]).returncode != 0
+        assert identity["secret_key"] not in stdout + stderr
+    assert not (state / "writer.json").exists()
+    retry = run_apply(f, manifest_file, state)
+    assert retry.returncode != 0 and "unexpected objects" in retry.stderr
+    assert admin.get_object(Bucket="earshot-beforeissue", Key="phone/foreign")["Body"].read() == b"preserve"
+
+
+def test_preexisting_input_and_handoff_conflicts_have_no_provider_changes(fixture):
+    f = fixture
+    sentinel = b"operator-owned-sentinel"
+    manifest_file, state = f["dir"] / "spec.json", f["dir"] / "state"
+    write_json(manifest_file, manifest("collision"))
+    state.mkdir(mode=0o700)
+    admin_path = state / "writer.json"
+    write_json(admin_path, f["admin"])
+    original = admin_path.read_bytes()
+    result = cli("--spec", manifest_file, "--apply", "--endpoint", f["endpoint"], "--admin-file", admin_path, "--state-dir", state)
+    assert result.returncode != 0 and "collides" in result.stderr
+    assert admin_path.read_bytes() == original and not (state / "state.json").exists()
+    admin = s3(f["endpoint"], f["admin"])
+    assert "earshot-collision" not in [bucket["Name"] for bucket in admin.list_buckets()["Buckets"]]
+    admin_path.unlink()
+    for reserved_name in (".lock", "state.json"):
+        collision_path = state / reserved_name
+        write_json(collision_path, f["admin"])
+        original = collision_path.read_bytes()
+        result = cli("--spec", manifest_file, "--apply", "--endpoint", f["endpoint"], "--admin-file", collision_path, "--state-dir", state)
+        assert result.returncode != 0 and "collides" in result.stderr
+        assert collision_path.read_bytes() == original
+        collision_path.unlink()
+    reader_path = state / "reader-speaker.json"
+    reader_path.write_bytes(sentinel)
+    reader_path.chmod(0o600)
+    result = run_apply(f, manifest_file, state)
+    assert result.returncode != 0 and "not journal-owned" in result.stderr
+    assert reader_path.read_bytes() == sentinel and not (state / "state.json").exists()
+    assert "earshot-collision" not in [bucket["Name"] for bucket in admin.list_buckets()["Buckets"]]
+    reader_path.unlink()
+    writer_path = state / "writer.json"
+    writer_path.write_bytes(sentinel)
+    writer_path.chmod(0o600)
+    result = run_apply(f, manifest_file, state)
+    assert result.returncode != 0 and "not journal-owned" in result.stderr
+    assert writer_path.read_bytes() == sentinel and not (state / "state.json").exists()
+    assert "earshot-collision" not in [bucket["Name"] for bucket in admin.list_buckets()["Buckets"]]
+    writer_path.unlink()
+    spec_collision = state / "reader-speaker.json"
+    write_json(spec_collision, manifest("collision"))
+    original = spec_collision.read_bytes()
+    result = cli("--spec", spec_collision, "--apply", "--endpoint", f["endpoint"], "--admin-file", f["adminfile"], "--state-dir", state)
+    assert result.returncode != 0 and "collides" in result.stderr
+    assert spec_collision.read_bytes() == original and not (state / "state.json").exists()
+    spec_collision.unlink()
+    outside = f["dir"] / "linked-sentinel"
+    outside.write_bytes(sentinel)
+    (state / "reader-speaker.json").symlink_to(outside)
+    result = run_apply(f, manifest_file, state)
+    assert result.returncode != 0 and "not journal-owned" in result.stderr
+    assert outside.read_bytes() == sentinel
+    assert "earshot-collision" not in [bucket["Name"] for bucket in admin.list_buckets()["Buckets"]]
+
+
+def test_partial_handoff_publication_recovers_without_replacing_files(fixture):
+    f = fixture
+    manifest_file, state = f["dir"] / "spec.json", f["dir"] / "state"
+    write_json(manifest_file, manifest("handoffcrash"))
+    injected = """original=m.rename_noreplace
+def pause(source,destination):
+ result=original(source,destination)
+ if str(destination).endswith('/reader-alerts.json'):
+  os.kill(os.getpid(), 19)
+ return result
+m.rename_noreplace=pause
+"""
+    process = crash_script(f, manifest_file, state, injected)
+    try:
+        wait_stopped(process)
+        journal = json.loads((state / "state.json").read_text())
+        assert journal["progress"] == "handoff files pending" and not journal["complete"]
+        assert "reader-alerts.json" in journal["handoffs"]
+        first = state / "reader-alerts.json"
+        before, inode = first.read_bytes(), first.stat().st_ino
+    finally:
+        kill_owned(process)
+    result = run_apply(f, manifest_file, state)
+    assert result.returncode == 0, result.stderr
+    assert first.read_bytes() == before and first.stat().st_ino == inode
+    assert json.loads((state / "state.json").read_text())["complete"]
+    assert (state / "writer.json").exists() and (state / "reader-speaker.json").exists()
+    second = run_apply(f, manifest_file, state)
+    assert second.returncode == 0 and first.stat().st_ino == inode
+
+
+def test_partial_handoff_before_rename_recovers_owned_temp(fixture):
+    f = fixture
+    manifest_file, state = f["dir"] / "spec.json", f["dir"] / "state"
+    write_json(manifest_file, manifest("tempcrash"))
+    injected = """original=m.rename_noreplace
+def pause(source,destination):
+ if str(destination).endswith('/reader-alerts.json'):
+  os.kill(os.getpid(), 19)
+ return original(source,destination)
+m.rename_noreplace=pause
+"""
+    process = crash_script(f, manifest_file, state, injected)
+    try:
+        wait_stopped(process)
+        journal = json.loads((state / "state.json").read_text())
+        record = journal["handoffs"]["reader-alerts.json"]
+        temp = state / record["temp"]
+        assert temp.stat().st_ino == record["inode"]
+        before = temp.read_bytes()
+        assert not (state / "reader-alerts.json").exists()
+    finally:
+        kill_owned(process)
+    result = run_apply(f, manifest_file, state)
+    assert result.returncode == 0, result.stderr
+    target = state / "reader-alerts.json"
+    assert target.read_bytes() == before and target.stat().st_ino == record["inode"]
+    assert not temp.exists()
+
+
+def test_sentinel_inserted_during_handoff_is_never_replaced(fixture):
+    f = fixture
+    manifest_file, state = f["dir"] / "spec.json", f["dir"] / "state"
+    write_json(manifest_file, manifest("handoffrace"))
+    injected = """original=m.rename_noreplace
+def pause(source,destination):
+ if str(destination).endswith('/reader-alerts.json'):
+  os.kill(os.getpid(), 19)
+ return original(source,destination)
+m.rename_noreplace=pause
+"""
+    process = crash_script(f, manifest_file, state, injected)
+    sentinel = b"operator-inserted-after-preflight"
+    try:
+        wait_stopped(process)
+        journal = json.loads((state / "state.json").read_text())
+        assert "reader-alerts.json" in journal["handoffs"] and not journal["complete"]
+        target = state / "reader-alerts.json"
+        target.write_bytes(sentinel)
+        target.chmod(0o600)
+        os.kill(process.pid, signal.SIGCONT)
+        _, stderr = process.communicate(timeout=30)
+        assert process.returncode != 0 and "refusing to overwrite" in stderr
+    finally:
+        kill_owned(process)
+    assert target.read_bytes() == sentinel
+    result = run_apply(f, manifest_file, state)
+    assert result.returncode != 0 and "both temporary and published" in result.stderr
+    assert target.read_bytes() == sentinel
+
+
+def test_legacy_journal_without_handoff_provenance_is_refused_before_provider(fixture):
+    f = fixture
+    manifest_file, state = f["dir"] / "spec.json", f["dir"] / "state"
+    write_json(manifest_file, manifest("legacyjournal"))
+    state.mkdir(mode=0o700)
+    journal_path = state / "state.json"
+    journal = setup.new_state(setup.validate_spec(manifest("legacyjournal")), f["endpoint"])
+    journal.pop("handoffs")
+    journal["bucket_phase"], journal["complete"], journal["version"] = "bound", True, 1
+    write_json(journal_path, journal)
+    before = journal_path.read_bytes()
+    result = run_apply(f, manifest_file, state)
+    assert result.returncode != 0 and "version mismatch" in result.stderr
+    assert journal_path.read_bytes() == before
+    assert "earshot-legacyjournal" not in [item["Name"] for item in s3(f["endpoint"], f["admin"]).list_buckets()["Buckets"]]
+
+
+def test_unchanged_handoff_replaced_by_copy_is_not_adopted(fixture):
+    f = fixture
+    manifest_file, state = f["dir"] / "spec.json", f["dir"] / "state"
+    write_json(manifest_file, manifest("copiedhandoff"))
+    assert run_apply(f, manifest_file, state).returncode == 0
+    target = state / "reader-speaker.json"
+    copy = state / "operator-copy"
+    copy.write_bytes(target.read_bytes())
+    copy.chmod(0o600)
+    os.replace(copy, target)
+    before = target.read_bytes()
+    result = run_apply(f, manifest_file, state)
+    assert result.returncode != 0 and "journal-owned" in result.stderr
+    assert target.read_bytes() == before
+
+
 def test_marker_written_but_binding_not_confirmed_requires_reconciliation(fixture):
     f = fixture
     manifest_file, state = f["dir"] / "spec.json", f["dir"] / "state"

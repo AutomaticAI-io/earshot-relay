@@ -223,6 +223,8 @@ sys.exit(m.main(sys.argv[2:]))
     assert journal["bucket_phase"] == "bound" and not journal["complete"]
     assert not (state / "writer.json").exists()
     admin = s3(f["endpoint"], f["admin"])
+    p = run_apply(f, m, state)
+    assert p.returncode == 0, p.stderr
     admin.put_object(Bucket="earshot-recover", Key="phone/preexisting", Body=b"keep")
     p = run_apply(f, m, state)
     assert p.returncode == 0, p.stderr
