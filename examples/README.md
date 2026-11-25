@@ -20,7 +20,7 @@
 | --- | --- | --- |
 | Telegram HTTP MCP | **Tested** | Actual owner DM and `say` transcript; `msg_3dbfe85909514004b7c76b436a9bb9c6`, key `phone/3dbfe85909514004b7c76b436a9bb9c6.say`, exact text `EARS48 telegram MCP check`, S24 `finished` 16:51:38.773 UTC. |
 | Telegram current hook | **Tested with reply failure** | Current hook hash `fa730115f8befe3092a0594cea2639d207926e5dd7303fbc2dbeded32591aceb`; actual `.extra.platform: telegram` and final text included an unsolicited onboarding paragraph despite the exact-reply instruction. Distinct `msg_be14e09068e245be8ff0ac0ee315dde8`, key `phone/be14e09068e245be8ff0ac0ee315dde8.say`, S24 `finished` 16:51:54.087 UTC. |
-| Current multiplexed ntfy hook | **Blocked; security action required** | Configured self-host destination resolved to public `ntfy.sh` with 401 twice; credential may have been disclosed. Stop and rotate before further use. |
+| Current multiplexed ntfy hook | **Blocked; security action required** | Despite an intended self-hosted HTTPS ntfy server, the gateway contacted public `ntfy.sh`, returning 401 twice. Exact effective incident config is unavailable and cause is unproven; the on-wire authorization header was not captured. Treat the credential as potentially disclosed, not confirmed disclosed; stop and arrange owner rotation/audit. |
 
 The following rows are **historical** and do not establish current corrected-hook results:
 
@@ -29,7 +29,7 @@ The following rows are **historical** and do not establish current corrected-hoo
 | [Hermes HTTP MCP](../docs/hermes.md#path-a-agent-directed-mcp), CLI | **Tested** | Hermes v0.23.4+386, relay 1.1.2; S24 Ultra Android 17 / buyer beta 0.1.12 (1012), matching `finished`. `say` is write-capable and untrusted execution without approval refused. |
 | Hermes explicit MCP in bounded external-scheduler cron | **Tested** | One explicit run completed with a matching S24 `finished`; automatic hook speech stayed excluded. Not a wall-clock schedule test. |
 | [Hermes final-reply hook](hermes/earshot-say.sh), CLI | **Tested** | Real `.extra.platform: cli` and `.extra.assistant_response`; matching S24 `finished`. |
-| Hermes final-reply hook, multiplexed ntfy | **Tested** | Real `.extra.platform: ntfy`; own active-profile credential file; `https://ntfy.delo.sh` subscription, matching S24 `finished`. |
+| Hermes final-reply hook, multiplexed ntfy | **Tested** | Real `.extra.platform: ntfy`; own active-profile credential file; self-hosted HTTPS ntfy server subscription, matching S24 `finished`. |
 | Hermes final-reply hook, Ink TUI | **Tested** | Real `.extra.platform: tui`; allowlist correction rerun, matching S24 `finished`. |
 | Hermes Desktop hook | **Untested** | No packaged app; read-only build preflight also failed because dependencies are absent. No platform value guessed. |
 | Hermes Telegram HTTP MCP and hook | **Untested, owner-deferred** | Dedicated bot waits on EARS-62; no PM bot used. |
