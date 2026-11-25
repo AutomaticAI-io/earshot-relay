@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import shutil
+import sqlite3
 import time
 from collections import deque
 from collections.abc import AsyncIterator
@@ -18,8 +19,9 @@ from typing import IO
 from starlette.concurrency import run_in_threadpool
 
 from . import RECEIPT_WORDING, __version__
+from .auth import authorize
 from .beacons import HEARTBEAT, PHASE_ORDER, TERMINAL, iso_ms, parse_rfc3339, receipt_is_final
-from .control import Control
+from .control import OWNER, Control, ControlError, Principal
 from .config import RateLimit, Settings
 from .hygiene import (
     MAX_COOLDOWN_S,
@@ -40,7 +42,7 @@ from .keys import (
     utf16_units,
 )
 from .storage import S3Writer, StorageError
-from .store import BeaconRow, FailedRow, MessageRow, PendingRow, Store, TooManyDevices, now_utc
+from .store import BeaconRow, FailedRow, MessageRow, PendingRow, Store, TooManyDevices, now_utc, principal_for, provenance
 from .tts import TtsClient
 from .watchdog import Watchdog
 
@@ -384,36 +386,86 @@ class Relay:
                            "voice")
         return speech
 
-    async def _put(self, key: str, body: bytes | IO[bytes], content_type: str) -> None:
+    async def _put(self, key: str, body: bytes | IO[bytes], content_type: str, *, principal: Principal = OWNER) -> None:
+        channel = key.split("/", 1)[0]
+
+        def put_guarded():
+            if principal.kind != "scoped":
+                authorize(self, channel, principal=principal)
+                self.writer.put(key, body, content_type)
+                return
+            if self.control is None:
+                raise ApiError(403, "channel_not_allowed", "request not permitted")
+            try:
+                db = self.control.connect()
+            except (ControlError, sqlite3.Error, OSError):
+                raise ApiError(403, "channel_not_allowed", "request not permitted") from None
+            try:
+                try:
+                    db.execute("BEGIN IMMEDIATE")
+                except sqlite3.Error:
+                    raise ApiError(403, "channel_not_allowed", "request not permitted") from None
+                authorize(self, channel, principal=principal, db=db)
+                self.writer.put(key, body, content_type)
+                db.commit()
+            except BaseException:
+                db.rollback()
+                raise
+            finally:
+                db.close()
+
         try:
-            await run_in_threadpool(self.writer.put, key, body, content_type)
+            await run_in_threadpool(put_guarded)
         except StorageError as exc:
             raise ApiError(502, "storage_error", f"PutObject failed: {exc.code}: {exc.hint}") from None
         self.last_write_ok_at = iso_ms(self.clock())
 
     @asynccontextmanager
-    async def idempotency(self, header: str | None) -> AsyncIterator[Idempotency]:
-        """Hold the Idempotency-Key for the whole send, so a concurrent retry waits and then gets the first 202 body.
+    async def idempotency(self, header: str | None, *, principal: Principal = OWNER) -> AsyncIterator[Idempotency]:
+        """Legacy owner entrypoint. New adapters must use check_replay with the requested channel."""
+        if principal != OWNER:
+            raise ApiError(403, "forbidden", "request not permitted")
+        async with self._idempotency(header, principal=principal, requested_channel=None) as idem:
+            yield idem
 
-        The same key within 24 hours returns the original body without writing anything or counting toward the
-        rate limit. The relay keeps only a hash of the key.
-        """
+    @asynccontextmanager
+    async def check_replay(self, header: str | None, channel: object = None, *,
+                           principal: Principal = OWNER) -> AsyncIterator[Idempotency]:
+        chan = self.resolve_channel(channel)
+        authorize(self, chan, principal=principal)
+        async with self._idempotency(header, principal=principal, requested_channel=chan) as idem:
+            yield idem
+
+    @asynccontextmanager
+    async def _idempotency(self, header: str | None, *, principal: Principal,
+                           requested_channel: str | None) -> AsyncIterator[Idempotency]:
         if header is None:
             yield Idempotency(None, None)
             return
-        digest = hashlib.sha256(header.encode("utf-8")).hexdigest()
+        # Retain the legacy owner hash so pre-migration owner replays continue to work.
+        material = header if principal == OWNER else "\x00" + json.dumps([*provenance(principal), header], separators=(",", ":"))
+        digest = hashlib.sha256(material.encode("utf-8")).hexdigest()
         async with self._idem_locks.hold(digest):
+            if requested_channel is not None:
+                authorize(self, requested_channel, principal=principal)
             cutoff = iso_ms(self.clock() - IDEMPOTENCY_WINDOW)
-            replay = self.store.get_suppressed(digest, cutoff)
-            row = self.store.get_by_idem(digest, cutoff) if replay is None else None
+            replay = self.store.get_suppressed(digest, cutoff, principal=principal)
+            row = self.store.get_by_idem(digest, cutoff, principal=principal) if replay is None else None
             replay = replay or (self._accepted_row(row) if row else None)
-            if replay is None:  # a key that was merged into a coalesced message (before or after it was written)
-                alias = self.store.get_alias(digest, cutoff)
+            if replay is None:
+                alias = self.store.get_alias(digest, cutoff, principal=principal)
                 if alias:
                     written = self.store.get_message(alias)
                     pending = None if written else self.store.get_pending_by_id(alias)
-                    replay = (self._accepted_row(written) if written
-                              else self._accepted_pending(pending) if pending else None)
+                    if written and provenance(principal_for(written)) == provenance(principal):
+                        replay = self._accepted_row(written)
+                    elif pending and provenance(principal_for(pending)) == provenance(principal):
+                        replay = self._accepted_pending(pending)
+            if replay is not None:
+                self.resolve_channel(replay["channel"])
+                authorize(self, replay["channel"], principal=principal)
+                if requested_channel is not None:
+                    authorize(self, requested_channel, principal=principal)
             yield Idempotency(digest, replay)
 
     def _accepted(self, msg_id: str, kind: str, speech: str | None, channel: str, key: str | None, created_at: str, *,
@@ -459,13 +511,14 @@ class Relay:
     async def send_text(self, *, text: object, channel: object = None, speech: object = None, voice: object = None,
                         idem_key: str | None = None, normalize: object = None, tag: object = None,
                         coalesce_window_s: object = None, cooldown_s: object = None, compat: bool = False,
-                        coalesce_s: object = None) -> dict:
+                        coalesce_s: object = None, principal: Principal = OWNER) -> dict:
         """Store text for the phone. `tag` with `coalesce_window_s` holds the write until the window closes (the latest
         text under the tag wins); `tag` with `cooldown_s` drops a repeat of the tag inside the cooldown. Both act before
         anything is written: the relay holds PutObject only and cannot replace an object that already exists.
         `coalesce_s` is the 1.1.0 name of `coalesce_window_s`, still accepted. `compat` marks a compat-ingress send,
         whose alarm promotion is checked again when a held window is written."""
         chan = self.resolve_channel(channel)
+        authorize(self, chan, principal=principal)
         clean, normalized, truncated = self._prepare_text(text, check_flag("normalize", normalize), chan)
         chosen_voice = check_voice(voice)
         mode = self.resolve_speech(speech, chosen_voice)
@@ -475,15 +528,16 @@ class Relay:
         if tag is None and (coalesce or cooldown):
             raise ApiError(422, "tag_required", "coalesce_window_s and cooldown_s need a tag", "tag")
         if coalesce or cooldown:
+            assert tag is not None
             return await self._send_tagged(text=clean, chan=chan, mode=mode, voice=chosen_voice, idem_key=idem_key,
                                            tag=tag, normalized=normalized, truncated=truncated, coalesce=coalesce,
-                                           cooldown=cooldown, compat=compat)
+                                           cooldown=cooldown, compat=compat, principal=principal)
         return await self._write_text(text=clean, chan=chan, mode=mode, voice=chosen_voice, idem_key=idem_key, tag=tag,
-                                      normalized=normalized, truncated=truncated)
+                                      normalized=normalized, truncated=truncated, principal=principal)
 
     async def _write_text(self, *, text: str, chan: str, mode: str, voice: str | None, idem_key: str | None,
                           tag: str | None, normalized: bool, truncated: bool, message_id: str | None = None,
-                          reserve: bool = True) -> dict:
+                          reserve: bool = True, principal: Principal = OWNER) -> dict:
         """TTS (when server speech), PutObject and the index row. `reserve=False` is the coalescing flush, whose
         send was already counted when its window opened."""
         reservation = self.limiter.take(chan) if reserve else []
@@ -497,14 +551,14 @@ class Relay:
                 result = await self.tts.render(text, voice)
                 body, ext, ctype = result.data, result.ext, result.content_type
             nk = new_key(chan, ext, message_id)
-            await self._put(nk.key, body, ctype)
+            await self._put(nk.key, body, ctype, principal=principal)
         except BaseException:
             self.limiter.refund(reservation)
             raise
         created = iso_ms(self.clock())
         self.store.add_message(id=nk.message_id, created_at=created, channel=chan, type="text", speech=mode,
                                key=nk.key, bytes=len(body), text_chars=utf16_units(text), idem_key=idem_key, tag=tag,
-                               normalized=normalized, truncated=truncated)
+                               normalized=normalized, truncated=truncated, principal=principal)
         self.signal.notify()
         return self._accepted(nk.message_id, "text", mode, chan, nk.key, created, tag=tag, normalized=normalized,
                               truncated=truncated)
@@ -513,15 +567,18 @@ class Relay:
 
     async def _send_tagged(self, *, text: str, chan: str, mode: str, voice: str | None, idem_key: str | None,
                            tag: str, normalized: bool, truncated: bool, coalesce: float | None,
-                           cooldown: float | None, compat: bool) -> dict:
-        async with self._tag_locks.hold(f"{chan}\x00{tag}"):
+                           cooldown: float | None, compat: bool, principal: Principal) -> dict:
+        lock_key = json.dumps([*provenance(principal), chan, tag], separators=(",", ":"))
+        async with self._tag_locks.hold(lock_key):
+            authorize(self, chan, principal=principal)
             now = self.clock()
-            pending = self.store.get_pending(chan, tag)
+            pending = self.store.get_pending(chan, tag, principal=principal)
             if pending and (pending.window_end_at or pending.due_at) <= iso_ms(now):
                 # The window has closed but the flush has not run yet (or its write is waiting for a retry). A closed
                 # window never takes new text: write it now, under this tag's lock, before looking at this send.
                 await self._flush_locked(pending)
-                pending = self.store.get_pending(chan, tag)
+                authorize(self, chan, principal=principal)
+                pending = self.store.get_pending(chan, tag, principal=principal)
                 if pending and coalesce:
                     # Its write failed and is waiting for a retry: the accepted text is frozen, and a second window
                     # under the same tag cannot open until it is written (or given up on).
@@ -534,51 +591,54 @@ class Relay:
                 self.store.update_pending(pending.id, text=text, speech=mode, voice=voice, normalized=normalized,
                                           truncated=truncated, compat=compat)
                 if idem_key:
-                    self.store.add_alias(idem_key, pending.id, iso_ms(now))
+                    self.store.add_alias(idem_key, pending.id, iso_ms(now), principal=principal)
                 return self._accepted_pending(self.store.get_pending_by_id(pending.id) or pending)
             if cooldown:
                 if pending:
                     ref = (pending.id, None, pending.speech, pending.created_at, pending.due_at)
                 else:
-                    recent = self.store.latest_tagged(chan, tag, iso_ms(now - timedelta(seconds=cooldown)))
+                    recent = self.store.latest_tagged(chan, tag, iso_ms(now - timedelta(seconds=cooldown)), principal=principal)
                     ref = (recent.id, recent.key, recent.speech, recent.created_at, recent.created_at) if recent else None
                 if ref:
                     until = parse_rfc3339(ref[4]) + timedelta(seconds=cooldown)
                     result = self._accepted(ref[0], "text", ref[2], chan, ref[1], ref[3], status="suppressed", tag=tag,
                                             cooldown_until=iso_ms(until))
                     if idem_key:  # a retry of this request must get this same answer, not a fresh send
-                        self.store.save_suppressed(idem_key, iso_ms(now), result)
+                        self.store.save_suppressed(idem_key, iso_ms(now), result, principal=principal)
                     return result
             if coalesce:
                 reservation = self.limiter.take(chan)  # one send, counted when its window opens
                 end = iso_ms(now + timedelta(seconds=coalesce))
                 row = PendingRow(id=new_id(), channel=chan, tag=tag, created_at=iso_ms(now), due_at=end, text=text,
                                  speech=mode, voice=voice, normalized=normalized, truncated=truncated, merged=1,
-                                 attempts=0, compat=compat, window_end_at=end)
+                                 attempts=0, compat=compat, window_end_at=end, principal_kind=principal.kind,
+                                 principal_id=principal.id, workspace_id=principal.workspace_id or "",
+                                 agent_id=principal.agent_id or "")
                 try:
                     self.store.add_pending(row)
                 except BaseException:
                     self.limiter.refund(reservation)
                     raise
                 if idem_key:
-                    self.store.add_alias(idem_key, row.id, iso_ms(now))
+                    self.store.add_alias(idem_key, row.id, iso_ms(now), principal=principal)
                 self.signal.notify()  # the flush loop sleeps until the earliest window closes
                 return self._accepted_pending(row)
             return await self._write_text(text=text, chan=chan, mode=mode, voice=voice, idem_key=idem_key, tag=tag,
-                                          normalized=normalized, truncated=truncated)
+                                          normalized=normalized, truncated=truncated, principal=principal)
 
     async def flush_due(self) -> int:
         """Write every coalesced message whose window has closed. Runs at startup, then whenever the earliest window
         closes (the flush loop sleeps until then, or until a send changes the queue)."""
         written = 0
         for row in self.store.due_pending(iso_ms(self.clock())):
-            if await self._flush_one(row.channel, row.tag):
+            if await self._flush_one(row.channel, row.tag, principal=principal_for(row)):
                 written += 1
         return written
 
-    async def _flush_one(self, channel: str, tag: str) -> bool:
-        async with self._tag_locks.hold(f"{channel}\x00{tag}"):
-            row = self.store.get_pending(channel, tag)  # re-read under the lock: a request may have changed it
+    async def _flush_one(self, channel: str, tag: str, *, principal: Principal = OWNER) -> bool:
+        lock_key = json.dumps([*provenance(principal), channel, tag], separators=(",", ":"))
+        async with self._tag_locks.hold(lock_key):
+            row = self.store.get_pending(channel, tag, principal=principal)
             if row is None:
                 return False
             return await self._flush_locked(row)
@@ -587,6 +647,7 @@ class Relay:
         """The checks that admitted a held message, run again when it is written: the relay may have restarted with
         a channel removed from EARSHOT_RELAY_CHANNELS, compat alarm switched off or server speech unconfigured."""
         self.resolve_channel(row.channel)
+        authorize(self, row.channel, principal=principal_for(row))
         if row.channel == "alarm" and row.compat and not self.settings.compat_alarm_allowed:
             raise ApiError(403, "compat_alarm_disabled", "compat alarm is no longer enabled (EARSHOT_RELAY_COMPAT_ALARM "
                                                          "and alarm in EARSHOT_RELAY_CHANNELS)", "channel")
@@ -610,8 +671,12 @@ class Relay:
         try:
             await self._write_text(text=row.text, chan=row.channel, mode=row.speech, voice=row.voice, idem_key=None,
                                    tag=row.tag, normalized=row.normalized, truncated=row.truncated,
-                                   message_id=row.id, reserve=False)
+                                   message_id=row.id, reserve=False, principal=principal_for(row))
         except Exception as exc:  # noqa: BLE001 - a failed write is retried, then given up on, never raised into the loop
+            if isinstance(exc, ApiError) and exc.status == 403:
+                self.store.fail_pending(row, iso_ms(self.clock()), exc.code)
+                self.signal.notify()
+                return False
             code = exc.code if isinstance(exc, ApiError) else type(exc).__name__
             attempts = row.attempts + 1
             if attempts > len(FLUSH_RETRY_S):
@@ -631,8 +696,9 @@ class Relay:
         return True
 
     async def send_audio(self, *, fileobj: IO[bytes], size: int, ext: str, channel: object = None,
-                         idem_key: str | None = None) -> dict:
+                         idem_key: str | None = None, principal: Principal = OWNER) -> dict:
         chan = self.resolve_channel(channel)
+        authorize(self, chan, principal=principal)
         if size <= 0:
             raise ApiError(422, "empty_file", "the uploaded file is empty", "file")
         if size > self.settings.max_audio_bytes:
@@ -642,13 +708,13 @@ class Relay:
         try:
             nk = new_key(chan, ext)
             fileobj.seek(0)
-            await self._put(nk.key, fileobj, content_type_for(ext))
+            await self._put(nk.key, fileobj, content_type_for(ext), principal=principal)
         except BaseException:
             self.limiter.refund(reservation)
             raise
         created = iso_ms(self.clock())
         self.store.add_message(id=nk.message_id, created_at=created, channel=chan, type="audio", speech=None,
-                               key=nk.key, bytes=size, text_chars=None, idem_key=idem_key)
+                               key=nk.key, bytes=size, text_chars=None, idem_key=idem_key, principal=principal)
         self.signal.notify()
         return self._accepted(nk.message_id, "audio", None, chan, nk.key, created)
 
@@ -706,64 +772,85 @@ class Relay:
     def _missing(self, message_id: str) -> ApiError:
         return ApiError(404, "not_found", "no message with that id" if message_id != "latest" else "no message sent yet")
 
-    def receipt(self, message_id: str) -> dict:
-        msg = self.store.get_message(message_id)
+    def _receipt_channels(self, principal: Principal) -> list[str] | None:
+        if principal == OWNER:
+            return None
+        if principal.kind != "scoped" or self.control is None:
+            raise ApiError(403, "forbidden", "request not permitted")
+        channels = [c for c in self.settings.channels
+                    if c != "replies" and self.control.permits(principal, c, receipt=True)]
+        if not channels:
+            raise ApiError(403, "forbidden", "request not permitted")
+        return channels
+
+    def _check_receipt_row(self, row, message_id: str, principal: Principal) -> None:
+        if principal != OWNER:
+            if provenance(principal_for(row)) != provenance(principal):
+                raise self._missing(message_id)
+            authorize(self, row.channel, receipt=True, principal=principal)
+        elif row.channel == "replies":
+            raise self._missing(message_id)
+
+    def get_message(self, message_id: str, *, principal: Principal = OWNER) -> dict:
+        allowed = self._receipt_channels(principal)
+        msg = self.store.get_message(message_id, principal=None if principal == OWNER else principal,
+                                     allowed_channels=allowed if message_id == "latest" else None)
         if msg is None:
             pending = self.store.get_pending_by_id(message_id) if message_id != "latest" else None
             if pending is None:
                 failed = self.store.get_failed(message_id) if message_id != "latest" else None
                 if failed is None:
                     raise self._missing(message_id)
+                self._check_receipt_row(failed, message_id, principal)
                 return self._failed_receipt(failed)
+            self._check_receipt_row(pending, message_id, principal)
             return self._pending_receipt(pending)
+        self._check_receipt_row(msg, message_id, principal)
         return self._receipt_for(msg)
 
-    async def wait_receipt(self, message_id: str, wait_s: float) -> dict:
-        msg = self.store.get_message(message_id)
-        pending_id = None
-        if msg is None:
-            pending = self.store.get_pending_by_id(message_id) if message_id != "latest" else None
-            if pending is None:
-                failed = self.store.get_failed(message_id) if message_id != "latest" else None
-                if failed is None:
-                    raise self._missing(message_id)
-                return self._failed_receipt(failed)
-            pending_id = pending.id
+    def receipt(self, message_id: str, *, principal: Principal = OWNER) -> dict:
+        return self.get_message(message_id, principal=principal)
+
+    async def wait_message(self, message_id: str, wait_s: float, *, principal: Principal = OWNER) -> dict:
         deadline = time.monotonic() + max(0.0, wait_s)
+        # Pin latest to its original row and reauthorize on every wake, including timeout.
         while True:
-            if msg is None and pending_id:
-                msg = self.store.get_message(pending_id)  # the window closed and the object was written
-            if msg is not None:
-                receipt = self._receipt_for(msg)
-            else:
-                pending = self.store.get_pending_by_id(pending_id)
-                if pending is None:
-                    failed = self.store.get_failed(pending_id)
-                    if failed is None:
-                        raise self._missing(pending_id)
-                    return self._failed_receipt(failed)
-                receipt = self._pending_receipt(pending)
+            receipt = self.get_message(message_id, principal=principal)
+            message_id = receipt["id"]
             left = deadline - time.monotonic()
             if receipt_is_final(receipt) or left <= 0:
                 return receipt
             await self.signal.wait(min(left, 1.0))
 
-    def list_messages(self, *, channel: str | None, limit: int, since: str | None) -> dict:
+    async def wait_receipt(self, message_id: str, wait_s: float, *, principal: Principal = OWNER) -> dict:
+        return await self.wait_message(message_id, wait_s, principal=principal)
+
+    def recent_messages(self, *, channel: str | None, limit: int, since: str | None,
+                        principal: Principal = OWNER) -> dict:
+        if channel == "replies":
+            raise ApiError(403, "channel_not_allowed", "channel is reserved", "channel")
         if channel is not None and not is_valid_channel(channel):
             raise ApiError(422, "invalid_channel", "channel must match ^[a-z0-9][a-z0-9_-]{0,31}$", "channel")
+        allowed = self._receipt_channels(principal)
+        if channel is not None:
+            authorize(self, channel, receipt=True, principal=principal)
         since_created = since_rowid = None
         if since:
             if since.startswith("msg_"):
-                anchor = self.store.get_message(since)
+                anchor = self.store.get_message(since, principal=None if principal == OWNER else principal)
                 if anchor is None:
                     raise ApiError(404, "not_found", "the since message is unknown (it may have been pruned)", "since")
+                self._check_receipt_row(anchor, since, principal)
                 since_created, since_rowid = anchor.created_at, anchor.rowid
             else:
                 ts = parse_rfc3339(since)
                 if ts is None:
                     raise ApiError(422, "invalid_field", "since must be an RFC 3339 time or a message id", "since")
                 since_created = iso_ms(ts)
-        rows = self.store.list_messages(channel=channel, limit=limit, since_created=since_created, since_rowid=since_rowid)
+        rows = self.store.list_messages(channel=channel, limit=limit, since_created=since_created, since_rowid=since_rowid,
+                                        principal=None if principal == OWNER else principal, allowed_channels=allowed)
+        for row in rows:
+            self._check_receipt_row(row, row.id, principal)
         beacons = self.store.beacons_for([r.key for r in rows])
         now, ever = self.clock(), self.store.any_beacon()
         items = [derive_receipt(r, beacons[r.key], now=now, wait_min=self.settings.receipt_wait_min, beacons_ever=ever,
@@ -773,6 +860,10 @@ class Relay:
         else:
             next_since = items[0]["id"] if items else None
         return {"items": items, "next_since": next_since}
+
+    def list_messages(self, *, channel: str | None, limit: int, since: str | None,
+                      principal: Principal = OWNER) -> dict:
+        return self.recent_messages(channel=channel, limit=limit, since=since, principal=principal)
 
     # status and doctor ------------------------------------------------------------------------------------------
 

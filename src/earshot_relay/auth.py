@@ -25,15 +25,19 @@ def authenticate(relay, token, *, compat=False, pushover=False):
         for kind, expected in (("compat", relay.settings.compat_token),
                                ("pushover", relay.settings.compat_pushover_token if pushover else None)):
             if expected and hmac.compare_digest(token.encode(), expected.encode()):
-                return Principal(kind, kind)
+                return Principal("compat", "compat_token" if kind == "compat" else "pushover_token")
     return None
 
 
-def authorize(relay, channel, *, receipt=False, principal=None):
-    p = principal or current_principal.get()
+def authorize(relay, channel, *, receipt=False, principal=None, db=None):
+    p = principal if principal is not None else current_principal.get()
     if channel == "replies":
         raise ApiError(403, "channel_not_allowed", "channel is reserved", "channel")
-    if p.kind == "scoped" and (relay.control is None or not relay.control.permits(p, channel, receipt=receipt)):
+    if p == OWNER:
+        return channel
+    if p.kind == "compat" and not receipt:
+        return channel
+    if p.kind != "scoped" or relay.control is None or not relay.control.permits(p, channel, receipt=receipt, db=db):
         raise ApiError(403, "channel_not_allowed", "request not permitted")
     return channel
 
