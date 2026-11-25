@@ -2,15 +2,20 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
+import json
 import sqlite3
 import threading
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
+from starlette.testclient import TestClient
 
+from earshot_relay.api import create_app
 from earshot_relay.auth import authenticate
+from earshot_relay.beacons import iso_ms
 from earshot_relay.config import load_settings
 from earshot_relay.control import OWNER, Control, Principal
 from earshot_relay.keys import ApiError
@@ -338,7 +343,6 @@ def test_legacy_idempotency_rejects_scoped_and_hashes_do_not_collide(rig):
             pass
     assert_status(403, lambda: run(unsafe()))
     # A printable owner header equal to the scoped hash's JSON input is a distinct namespace.
-    import json
     owner_header = json.dumps([p.kind, p.id, p.workspace_id, "k"], separators=(",", ":"))
     async def digests():
         async with relay.check_replay("k", "phone", principal=p) as scoped:
@@ -424,3 +428,199 @@ def test_migrate_legacy_rows_owner_only(tmp_path, rig):
         assert held["id"] != "msg_pending" and store.pending_count() == 2
     finally:
         store.close()
+
+
+# This schema is the v5 layout from the pre-scoping relay, not a fresh v6 Store.
+LEGACY_SCHEMA = """
+CREATE TABLE messages(id TEXT PRIMARY KEY,created_at TEXT NOT NULL,channel TEXT NOT NULL,type TEXT NOT NULL,
+    speech TEXT,key TEXT UNIQUE NOT NULL,bytes INTEGER NOT NULL,text_chars INTEGER,idem_key TEXT,tag TEXT,
+    normalized INTEGER NOT NULL DEFAULT 0,truncated INTEGER NOT NULL DEFAULT 0);
+CREATE UNIQUE INDEX messages_idem ON messages(idem_key);
+CREATE INDEX messages_created ON messages(created_at);
+CREATE INDEX messages_tag ON messages(channel,tag,created_at);
+CREATE TABLE beacons(id INTEGER PRIMARY KEY,key TEXT NOT NULL,channel TEXT NOT NULL,phase TEXT NOT NULL,
+    device TEXT NOT NULL,app_version TEXT NOT NULL,at TEXT NOT NULL,last_modified TEXT,clock_skew_ms INTEGER,
+    error TEXT,received_at TEXT NOT NULL,UNIQUE(key,device,phase,at));
+CREATE INDEX beacons_key ON beacons(key);
+CREATE INDEX beacons_received ON beacons(received_at);
+CREATE TABLE pending(id TEXT PRIMARY KEY,channel TEXT NOT NULL,tag TEXT NOT NULL,created_at TEXT NOT NULL,
+    due_at TEXT NOT NULL,text TEXT NOT NULL,speech TEXT NOT NULL,voice TEXT,normalized INTEGER NOT NULL DEFAULT 0,
+    truncated INTEGER NOT NULL DEFAULT 0,merged INTEGER NOT NULL DEFAULT 1,attempts INTEGER NOT NULL DEFAULT 0,
+    compat INTEGER NOT NULL DEFAULT 0,window_end_at TEXT,UNIQUE(channel,tag));
+CREATE INDEX pending_due ON pending(due_at);
+CREATE TABLE failed_pending(id TEXT PRIMARY KEY,channel TEXT NOT NULL,tag TEXT NOT NULL,created_at TEXT NOT NULL,
+    failed_at TEXT NOT NULL,attempts INTEGER NOT NULL,error TEXT NOT NULL,notified INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE idem_aliases(idem_key TEXT PRIMARY KEY,message_id TEXT NOT NULL,created_at TEXT NOT NULL);
+CREATE TABLE suppressed_idem(idem_key TEXT PRIMARY KEY,created_at TEXT NOT NULL,result TEXT NOT NULL);
+CREATE TABLE meta(k TEXT PRIMARY KEY,v TEXT NOT NULL);
+PRAGMA user_version=5;
+"""
+
+
+@pytest.mark.parametrize("kind", ["stored", "pending", "suppressed", "stale_alias"])
+def test_compat_legacy_retry_fails_closed_after_real_migration(tmp_path, rig, kind, monkeypatch):
+    path = tmp_path / "compat-legacy-v5.db"
+    raw_key = "legacy-idempotency-fixture"
+    digest = hashlib.sha256(raw_key.encode()).hexdigest()
+    now = iso_ms(rig.clock())
+    old_id = "msg_" + "1" * 32
+    secret_key = "phone/" + "1" * 32 + ".say"
+    with sqlite3.connect(path) as db:
+        db.executescript(LEGACY_SCHEMA)
+        if kind == "stored":
+            db.execute("INSERT INTO messages VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                       (old_id, now, "phone", "text", "device", secret_key, 6, 6, digest, None, 0, 0))
+        elif kind in ("pending", "stale_alias"):
+            if kind == "pending":
+                due = iso_ms(rig.clock() + timedelta(seconds=300))
+                db.execute("INSERT INTO pending VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                           (old_id, "phone", "progress", now, due, "legacy secret", "device", None, 0, 0, 1, 0, 1, due))
+            db.execute("INSERT INTO idem_aliases VALUES(?,?,?)", (digest, old_id, now))
+        else:
+            db.execute("INSERT INTO suppressed_idem VALUES(?,?,?)", (digest, now, json.dumps({
+                "id": old_id, "channel": "phone", "key": secret_key, "status": "suppressed"})))
+    store = Store(str(path))
+    relay = Relay(rig.settings, store, rig.relay.writer, clock=rig.clock)
+    calls = []
+    monkeypatch.setattr(relay.writer, "put", lambda *args: calls.append(args))
+    principal = Principal("compat", "compat_token")
+    try:
+        with sqlite3.connect(path) as db:
+            assert db.execute("PRAGMA user_version").fetchone()[0] == 6
+            before_counts = {t: db.execute(f"SELECT count(*) FROM {t}").fetchone()[0]
+                             for t in ("messages", "pending", "idem_aliases", "suppressed_idem")}
+            table = {"stored": "messages", "pending": "pending", "suppressed": "suppressed_idem",
+                     "stale_alias": "idem_aliases"}[kind]
+            assert db.execute(f"SELECT principal_kind,principal_id,workspace_id FROM {table}").fetchone() == (
+                "owner", "owner", "")
+        before = store.pending_count()
+        with TestClient(create_app(relay, mcp=False)) as client:
+            headers = {"Authorization": "Bearer " + "s" * 40, "Idempotency-Key": raw_key,
+                       "X-Earshot-Tag": "progress", "X-Earshot-Coalesce-Window-S": "300"}
+            response = client.post("/compat/ntfy/phone", content="retry", headers=headers)
+            assert response.status_code == 409
+            for hidden in (old_id, secret_key, raw_key, "legacy secret"):
+                assert hidden not in response.text and hidden not in str(response.headers)
+            plain = client.post("/compat/ntfy/phone", content="retry", headers={
+                "Authorization": headers["Authorization"], "Idempotency-Key": raw_key})
+            assert plain.status_code == 409 and old_id not in plain.text and secret_key not in plain.text
+            pushover = client.post("/compat/pushover/1/messages.json", data={
+                "token": "p" * 30, "user": "u" * 30, "message": "retry"},
+                headers={"Idempotency-Key": raw_key})
+            assert pushover.status_code == 409 and old_id not in pushover.text and secret_key not in pushover.text
+            assert not calls and store.pending_count() == before
+            with sqlite3.connect(path) as db:
+                assert before_counts == {t: db.execute(f"SELECT count(*) FROM {t}").fetchone()[0]
+                                         for t in before_counts}
+            if kind == "stored":
+                assert relay.get_message(old_id)["id"] == old_id
+            elif kind == "pending":
+                row = store.get_pending_by_id(old_id)
+                assert row and row.principal_kind == "owner" and row.merged == 1 and row.text == "legacy secret"
+            fresh = client.post("/compat/ntfy/phone", content="fresh", headers={**headers,
+                                "Idempotency-Key": "fresh-compat-key", "X-Earshot-Tag": "new-tag"})
+            assert fresh.status_code == 200
+            assert store.pending_count() == before + 1 and not calls
+            replay = client.post("/compat/ntfy/phone", content="again", headers={**headers,
+                                 "Idempotency-Key": "fresh-compat-key", "X-Earshot-Tag": "new-tag"})
+            assert replay.status_code == 200 and replay.headers.get("idempotent-replayed") == "true"
+            assert store.pending_count() == before + 1
+            own_pending = store.get_pending_by_id(fresh.headers["x-earshot-message-id"])
+            assert own_pending and own_pending.principal_id == principal.id
+            new_send = client.post("/compat/ntfy/phone", content="fresh", headers={
+                "Authorization": headers["Authorization"], "Idempotency-Key": "fresh-direct"})
+            assert new_send.status_code == 200 and len(calls) == 1
+            new_replay = client.post("/compat/ntfy/phone", content="different", headers={
+                "Authorization": headers["Authorization"], "Idempotency-Key": "fresh-direct"})
+            assert new_replay.status_code == 200 and new_replay.headers.get("idempotent-replayed") == "true"
+            assert len(calls) == 1
+    finally:
+        store.close()
+
+
+def test_owner_collision_preserves_existing_compat_and_scoped_replays(rig):
+    relay = rig.relay
+    compat, scoped = Principal("compat", "compat_token"), rig.issue()
+    compat_result = run(send_idem(relay, compat, "same"))
+    scoped_result = run(send_idem(relay, scoped, "same"))
+    owner_result = run(send_idem(relay, OWNER, "same"))
+    assert len({compat_result["id"], scoped_result["id"], owner_result["id"]}) == 3
+    assert run(send_idem(relay, compat, "same"))["id"] == compat_result["id"]
+    assert run(send_idem(relay, scoped, "same"))["id"] == scoped_result["id"]
+    assert run(send_idem(relay, OWNER, "same"))["id"] == owner_result["id"]
+    assert run(send_idem(relay, Principal("compat", "pushover_token"), "other"))["status"] == "stored"
+    assert run(send_idem(relay, scoped, "owner-only"))["status"] == "stored"
+    run(send_idem(relay, OWNER, "different"))
+    with pytest.raises(ApiError) as exc:
+        run(send_idem(relay, Principal("compat", "pushover_token"), "different"))
+    assert exc.value.status == 409 and exc.value.message == "request could not be completed"
+
+
+def test_legacy_retry_retained_until_pending_or_record_pruned(tmp_path, rig, monkeypatch):
+    path = tmp_path / "old-compat.db"
+    old = iso_ms(rig.clock() - timedelta(hours=25))
+    due = iso_ms(rig.clock() + timedelta(hours=1))
+    raw = "very-old-key"
+    digest = hashlib.sha256(raw.encode()).hexdigest()
+    old_id = "msg_" + "2" * 32
+    with sqlite3.connect(path) as db:
+        db.executescript(LEGACY_SCHEMA)
+        db.execute("INSERT INTO pending VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+            old_id, "phone", "progress", old, due, "legacy secret", "device", None, 0, 0, 1, 0, 1, due))
+        db.execute("INSERT INTO idem_aliases VALUES(?,?,?)", (digest, old_id, old))
+    store = Store(str(path))
+    relay = Relay(rig.settings, store, rig.relay.writer, clock=rig.clock)
+    monkeypatch.setattr(relay.writer, "put", lambda *args: None)
+    principal = Principal("compat", "compat_token")
+    try:
+        store.prune(1, now=rig.clock() + timedelta(days=1))
+        with pytest.raises(ApiError) as exc:
+            run(send_idem(relay, principal, raw, tag="progress", coalesce_window_s=60))
+        assert exc.value.status == 409 and store.pending_count() == 1
+        store.delete_pending(old_id)
+        with pytest.raises(ApiError) as exc:
+            run(send_idem(relay, principal, raw))
+        assert exc.value.status == 409  # an owner alias is still indistinguishable from legacy
+        store.prune(1, now=rig.clock() + timedelta(days=1))
+        fresh = run(send_idem(relay, principal, raw))
+        assert fresh["status"] == "stored"
+    finally:
+        store.close()
+
+
+def test_scoped_receipt_hint_independent_of_other_callers_and_heartbeats(rig, monkeypatch):
+    relay = rig.relay
+    principal, other = rig.issue(), rig.issue()
+    own = run(relay.send_text(text="own", principal=principal))
+    foreign = run(relay.send_text(text="other", principal=other))
+    owner = run(relay.send_text(text="owner"))
+    assert relay.get_message(owner["id"])["hint"] is not None
+    before = relay.get_message(own["id"], principal=principal)
+    assert before["hint"] is None
+    assert run(relay.wait_message(own["id"], 0, principal=principal))["hint"] is None
+    assert relay.recent_messages(channel=None, limit=10, since=None, principal=principal)["items"][0]["hint"] is None
+    assert "hint" not in run(relay.send_text(text="another", principal=principal))
+    now = iso_ms(rig.clock())
+    relay.ingest_beacon({"key": foreign["key"], "channel": "phone", "phase": "detected", "device": "foreign",
+                         "app_version": "1", "at": now, "last_modified": now})
+    relay.ingest_beacon({"channel": "phone", "phase": "heartbeat", "device": "foreign",
+                         "app_version": "1", "at": now})
+    assert relay.get_message(owner["id"])["hint"] is None
+    assert relay.get_message(own["id"], principal=principal) == before
+    rig.clock.advance((relay.settings.receipt_wait_min + 1) * 60)
+    with TestClient(create_app(relay, mcp=False)) as client:
+        token = (rig.control.path.parent / "token0").read_text().strip()
+        auth = {"Authorization": f"Bearer {token}"}
+        assert client.get(f"/v1/messages/{own['id']}", headers=auth).json()["hint"] is None
+        assert client.get(f"/v1/messages/{own['id']}?wait=1", headers=auth).json()["hint"] is None
+        assert all(item["hint"] is None for item in client.get("/v1/messages", headers=auth).json()["items"])
+    monkeypatch.setattr(relay.store, "any_beacon", lambda: (_ for _ in ()).throw(AssertionError("global beacon lookup")))
+    receipt = relay.get_message(own["id"], principal=principal)
+    assert receipt["status"] == "unconfirmed" and receipt["hint"] is None
+    assert run(relay.wait_message(own["id"], 0, principal=principal))["hint"] is None
+    assert all(row["hint"] is None for row in relay.recent_messages(
+        channel=None, limit=10, since=None, principal=principal)["items"])
+    relay.ingest_beacon({"key": own["key"], "channel": "phone", "phase": "finished", "device": "own",
+                         "app_version": "1", "at": now, "last_modified": now})
+    result = relay.get_message(own["id"], principal=principal)
+    assert result["status"] == "finished" and result["hint"] is None and result["devices"][0]["device"] == "own"

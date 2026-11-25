@@ -306,6 +306,19 @@ class Store:
                                    (idem_key, not_before, *provenance(principal))).fetchone()
         return self._message(row)
 
+    def owner_idempotency_exists(self, digest: str) -> bool:
+        """Detect a retained ambiguous owner key without returning owner message data."""
+        with self._lock:
+            for table in ("messages", "idem_aliases", "suppressed_idem"):
+                row = self._db.execute(
+                    f"SELECT 1 FROM {table} WHERE idem_key=?"
+                    " AND principal_kind=? AND principal_id=? AND workspace_id=? LIMIT 1",
+                    (digest, *provenance(OWNER)),
+                ).fetchone()
+                if row is not None:
+                    return True
+        return False
+
     def _message(self, row: sqlite3.Row | None) -> MessageRow | None:
         if row is None:
             return None
@@ -638,6 +651,11 @@ class Store:
             m = self._db.execute("DELETE FROM messages WHERE created_at < ?", (cutoff,)).rowcount
             b = self._db.execute("DELETE FROM beacons WHERE received_at < ?", (cutoff,)).rowcount
             self._db.execute("DELETE FROM suppressed_idem WHERE created_at < ?", (cutoff,))
-            self._db.execute("DELETE FROM idem_aliases WHERE created_at < ?", (cutoff,))
+            # An old coalesced request remains in flight while its pending row exists.
+            self._db.execute("DELETE FROM idem_aliases WHERE created_at < ? AND NOT EXISTS ("
+                             "SELECT 1 FROM pending p WHERE p.id=idem_aliases.message_id"
+                             " AND p.principal_kind=idem_aliases.principal_kind"
+                             " AND p.principal_id=idem_aliases.principal_id"
+                             " AND p.workspace_id=idem_aliases.workspace_id)", (cutoff,))
             self._db.execute("DELETE FROM failed_pending WHERE failed_at < ?", (cutoff,))
         return m, b

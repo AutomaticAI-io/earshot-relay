@@ -246,7 +246,7 @@ def device_states(hops: list[Hop]) -> dict[str, Hop]:
     return best
 
 
-def derive_receipt(msg: MessageRow, beacons: list[BeaconRow], *, now: datetime, wait_min: int, beacons_ever: bool,
+def derive_receipt(msg: MessageRow, beacons: list[BeaconRow], *, now: datetime, wait_min: int, beacons_ever: bool | None,
                    include_hops: bool = True) -> dict:
     hops = build_hops(beacons)
     best = device_states(hops)
@@ -262,7 +262,7 @@ def derive_receipt(msg: MessageRow, beacons: list[BeaconRow], *, now: datetime, 
         status, status_at = "unconfirmed", iso_ms(created + timedelta(minutes=wait_min))
     else:
         status, status_at = "stored", msg.created_at
-    if status in ("stored", "unconfirmed"):
+    if status in ("stored", "unconfirmed") and beacons_ever is not None:
         if not beacons_ever:
             hint = NO_BEACON_HINT
         elif status == "unconfirmed":
@@ -461,6 +461,11 @@ class Relay:
                         replay = self._accepted_row(written)
                     elif pending and provenance(principal_for(pending)) == provenance(principal):
                         replay = self._accepted_pending(pending)
+            # A live owner row and a migrated compat row are indistinguishable; do not disclose either.
+            if replay is None and principal.kind == "compat":
+                legacy_digest = hashlib.sha256(header.encode("utf-8")).hexdigest()
+                if self.store.owner_idempotency_exists(legacy_digest):
+                    raise ApiError(409, "legacy_retry_ambiguous", "request could not be completed")
             if replay is not None:
                 self.resolve_channel(replay["channel"])
                 authorize(self, replay["channel"], principal=principal)
@@ -740,10 +745,11 @@ class Relay:
             self.signal.notify()
         return inserted
 
-    def _receipt_for(self, msg: MessageRow, include_hops: bool = True) -> dict:
+    def _receipt_for(self, msg: MessageRow, include_hops: bool = True, *, principal: Principal = OWNER) -> dict:
         beacons = self.store.beacons_for([msg.key])[msg.key]
+        ever = self.store.any_beacon() if principal == OWNER else None
         return derive_receipt(msg, beacons, now=self.clock(), wait_min=self.settings.receipt_wait_min,
-                              beacons_ever=self.store.any_beacon(), include_hops=include_hops)
+                              beacons_ever=ever, include_hops=include_hops)
 
     def _pending_receipt(self, p: PendingRow) -> dict:
         return {
@@ -806,7 +812,7 @@ class Relay:
             self._check_receipt_row(pending, message_id, principal)
             return self._pending_receipt(pending)
         self._check_receipt_row(msg, message_id, principal)
-        return self._receipt_for(msg)
+        return self._receipt_for(msg, principal=principal)
 
     def receipt(self, message_id: str, *, principal: Principal = OWNER) -> dict:
         return self.get_message(message_id, principal=principal)
@@ -852,7 +858,8 @@ class Relay:
         for row in rows:
             self._check_receipt_row(row, row.id, principal)
         beacons = self.store.beacons_for([r.key for r in rows])
-        now, ever = self.clock(), self.store.any_beacon()
+        now = self.clock()
+        ever = self.store.any_beacon() if principal == OWNER else None
         items = [derive_receipt(r, beacons[r.key], now=now, wait_min=self.settings.receipt_wait_min, beacons_ever=ever,
                                 include_hops=False) for r in rows]
         if since:
