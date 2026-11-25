@@ -5,7 +5,7 @@ import contextvars
 import hmac
 from contextlib import contextmanager
 
-from .control import OWNER, Principal
+from .control import OWNER, ControlError, Principal
 from .keys import ApiError
 
 current_principal = contextvars.ContextVar("earshot_principal", default=OWNER)
@@ -15,16 +15,26 @@ current_token = contextvars.ContextVar("earshot_token", default=None)
 def authenticate(relay, token, *, compat=False, pushover=False):
     if not isinstance(token, str) or not token or len(token) > 512:
         return None
-    if hmac.compare_digest(token.encode(), relay.settings.token.encode()):
-        return OWNER
-    if relay.control is not None:
-        principal = relay.control.authenticate(token)
-        if principal is not None:
+    try:
+        encoded = token.encode("utf-8")
+    except UnicodeError:
+        return None
+    control = relay.control
+    if control is None and relay.settings.control_db:
+        return None
+    if control is not None:
+        try:
+            known, principal = control.resolve(token)
+        except ControlError:
+            return None
+        if known:
             return principal
+    if hmac.compare_digest(encoded, relay.settings.token.encode()):
+        return OWNER
     if compat:
         for kind, expected in (("compat", relay.settings.compat_token),
                                ("pushover", relay.settings.compat_pushover_token if pushover else None)):
-            if expected and hmac.compare_digest(token.encode(), expected.encode()):
+            if expected and hmac.compare_digest(encoded, expected.encode()):
                 return Principal("compat", "compat_token" if kind == "compat" else "pushover_token")
     return None
 

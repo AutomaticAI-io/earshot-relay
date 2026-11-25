@@ -15,7 +15,13 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from earshot_relay.control import Control
+from earshot_relay.control import Control, ControlError
+from earshot_relay.api import create_app, create_compat_app
+from earshot_relay.config import load_settings
+from earshot_relay.service import Relay
+from earshot_relay.store import Store
+from starlette.testclient import TestClient
+from .test_scoped_adapters import Writer
 from .conftest import TOKEN, base_env
 from .test_control import rig
 
@@ -175,6 +181,97 @@ def test_cli_stdout_failure_rolls_back_credential(tmp_path):
     assert result.returncode != 0 and not tokenfile.exists()
     with sqlite3.connect(settings.control_db) as db:
         assert db.execute("select count(*) from principals").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("state", ["active", "revoked", "expired"])
+@pytest.mark.parametrize("privilege", ["owner", "beacon", "compat", "pushover"])
+def test_issued_token_never_reconfigured_as_privileged(tmp_path, state, privilege):
+    directory, settings, _ = setup(tmp_path)
+    target = directory / "scoped-token"
+    flags = ["--pushover"] if privilege == "pushover" else []
+    issued = cli(settings, "create", "--agent", "agent1", "--channel", "normal", "--output", target, *flags)
+    assert issued.returncode == 0
+    token, ident = target.read_text().strip(), issued.stdout.strip()
+    if state == "revoked":
+        assert cli(settings, "revoke", ident).returncode == 0
+    elif state == "expired":
+        with sqlite3.connect(settings.control_db) as db:
+            db.execute("UPDATE principals SET expires_at='2000-01-01T00:00:00Z' WHERE id=?", (ident,))
+    extra = {"EARSHOT_RELAY_CHANNELS": "phone,alarm", "EARSHOT_RELAY_CONTROL_DB": settings.control_db}
+    if privilege == "owner":
+        extra["EARSHOT_RELAY_TOKEN"] = token
+    elif privilege == "beacon":
+        extra["EARSHOT_RELAY_BEACON_TOKEN"] = token
+    elif privilege == "compat":
+        extra.update(EARSHOT_RELAY_COMPAT="ntfy", EARSHOT_RELAY_COMPAT_TOKEN=token)
+    else:
+        extra.update(EARSHOT_RELAY_COMPAT="pushover", EARSHOT_RELAY_COMPAT_PUSHOVER_TOKEN=token)
+    configured = load_settings(base_env(settings.s3_endpoint, settings.data_dir, **extra), check_ffmpeg=False)
+    store = Store(str(tmp_path / "index.db"))
+    try:
+        with pytest.raises(ControlError) as exc:
+            Relay(configured, store, Writer())
+        assert token not in str(exc.value)
+    finally:
+        store.close()
+
+
+def test_revoked_or_unavailable_control_never_falls_through_to_compat(tmp_path):
+    directory, settings, _ = setup(tmp_path)
+    target = directory / "scoped-token"
+    issued = cli(settings, "create", "--agent", "agent1", "--channel", "normal", "--output", target)
+    assert issued.returncode == 0
+    token, ident = target.read_text().strip(), issued.stdout.strip()
+    env = base_env(settings.s3_endpoint, settings.data_dir, EARSHOT_RELAY_CHANNELS="phone,alarm",
+                   EARSHOT_RELAY_CONTROL_DB=settings.control_db, EARSHOT_RELAY_COMPAT="ntfy,pushover",
+                   EARSHOT_RELAY_COMPAT_TOKEN="c" * 40, EARSHOT_RELAY_COMPAT_PUSHOVER_TOKEN="p" * 30,
+                   EARSHOT_RELAY_COMPAT_ALARM="1", EARSHOT_RELAY_COMPAT_NTFY_TOPICS="phone=phone alarm=alarm",
+                   EARSHOT_RELAY_RATE_LIMIT="off", EARSHOT_RELAY_ALARM_RATE_LIMIT="off")
+    configured = load_settings(env, check_ffmpeg=False)
+    store = Store(str(tmp_path / "index.db"))
+    relay = Relay(configured, store, Writer())
+    # Emulate a credential collision introduced after startup, without replacing the file-backed relay configuration.
+    from dataclasses import replace
+    relay.settings = replace(configured, compat_token=token)
+    headers = {"Authorization": "Bearer " + token}
+    try:
+        with TestClient(create_app(relay, mcp=False)) as native, TestClient(create_compat_app(relay)) as root:
+            assert root.post("/alarm", headers=headers, content="fixture").status_code == 403
+            os.chmod(settings.control_db, 0o644)
+            try:
+                assert root.post("/alarm", headers=headers, content="fixture").status_code == 401
+                assert native.get("/v1/status", headers=headers).status_code == 401
+                assert root.post("/phone", headers={"Authorization": "Bearer " + TOKEN}, content="fixture").status_code == 401
+            finally:
+                os.chmod(settings.control_db, 0o600)
+            assert cli(settings, "revoke", ident).returncode == 0
+            assert root.post("/alarm", headers=headers, content="fixture").status_code == 401
+            assert native.post("/compat/ntfy/alarm", headers=headers, content="fixture").status_code == 401
+            assert native.get("/v1/status", headers=headers).status_code == 401
+            assert not relay.writer.objects
+    finally:
+        store.close()
+
+
+def test_healthy_unrelated_legacy_credentials_still_work(tmp_path):
+    directory, settings, _ = setup(tmp_path)
+    target = directory / "scoped-token"
+    issued = cli(settings, "create", "--agent", "agent1", "--channel", "normal", "--output", target)
+    assert issued.returncode == 0
+    env = base_env(settings.s3_endpoint, settings.data_dir, EARSHOT_RELAY_CHANNELS="phone,alarm",
+                   EARSHOT_RELAY_CONTROL_DB=settings.control_db, EARSHOT_RELAY_COMPAT="ntfy,pushover",
+                   EARSHOT_RELAY_COMPAT_TOKEN="c" * 40, EARSHOT_RELAY_COMPAT_PUSHOVER_TOKEN="p" * 30,
+                   EARSHOT_RELAY_RATE_LIMIT="off")
+    configured = load_settings(env, check_ffmpeg=False)
+    store = Store(str(tmp_path / "index.db"))
+    relay = Relay(configured, store, Writer())
+    try:
+        with TestClient(create_compat_app(relay)) as root:
+            assert root.post("/phone", headers={"Authorization": "Bearer " + "c" * 40}, content="fixture").status_code == 200
+            response = root.post("/1/messages.json", data={"token": "p" * 30, "message": "fixture"})
+            assert response.status_code == 200
+    finally:
+        store.close()
 
 
 def test_crash_after_durable_output_before_commit_leaves_token_inert(tmp_path):

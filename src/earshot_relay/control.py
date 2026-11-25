@@ -133,6 +133,16 @@ def digest_token(token):
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
+def _privileged_digests(settings):
+    try:
+        values = (settings.token, settings.beacon_token, settings.compat_token, settings.compat_pushover_token)
+        if any(value is not None and not isinstance(value, str) for value in values):
+            raise ValueError
+        return {digest_token(value) for value in values if value}
+    except (AttributeError, TypeError, ValueError, UnicodeError):
+        raise ControlError("invalid credential configuration") from None
+
+
 def _safe_directory(path: Path):
     if ".." in path.parts:
         raise ControlError("unsafe control directory")
@@ -210,6 +220,7 @@ class Control:
                                  receipts INTEGER NOT NULL, alarm INTEGER NOT NULL);
         CREATE TABLE grants (principal_id TEXT NOT NULL REFERENCES principals(id), channel_id TEXT NOT NULL,
                              PRIMARY KEY(principal_id, channel_id));
+        CREATE TABLE protected_credentials (token_digest TEXT PRIMARY KEY);
     """
 
     def __init__(self, path, settings):
@@ -217,12 +228,21 @@ class Control:
         self.settings = settings
         try:
             with closing(self.connect()) as db:
-                rows = db.execute("SELECT contract FROM binding").fetchall()
-                if len(rows) != 1 or not isinstance(rows[0][0], str):
+                db.execute("BEGIN IMMEDIATE")
+                rows = db.execute("SELECT singleton, contract FROM binding").fetchall()
+                if len(rows) != 1 or rows[0][0] != 1 or not isinstance(rows[0][1], str):
                     raise ControlError("control binding is missing")
-                self._binding = rows[0][0]
+                self._binding = rows[0][1]
                 self.contract = parse_contract(self._binding)
                 self.workspace_id = validate_contract(self.contract, settings)
+                self._live_contract(db)
+                db.execute("CREATE TABLE IF NOT EXISTS protected_credentials (token_digest TEXT PRIMARY KEY)")
+                self._check_privileged_overlap(db)
+                # Retain hashes across local processes and rotations: an older relay may still use them.
+                db.executemany("INSERT OR IGNORE INTO protected_credentials(token_digest) VALUES(?)",
+                               [(digest,) for digest in _privileged_digests(settings)])
+                _safe_file(self.path)
+                db.commit()
         except sqlite3.Error:
             raise ControlError("control database is unavailable") from None
 
@@ -288,13 +308,18 @@ class Control:
                 raise ControlError("control database changed")
         except (OSError, ValueError):
             raise ControlError("control database changed") from None
-        rows = db.execute("SELECT contract FROM binding").fetchall()
-        if len(rows) != 1 or rows[0][0] != self._binding:
+        rows = db.execute("SELECT singleton, contract FROM binding").fetchall()
+        if len(rows) != 1 or rows[0][0] != 1 or rows[0][1] != self._binding:
             raise ControlError("control binding changed")
-        contract = parse_contract(rows[0][0])
+        contract = parse_contract(rows[0][1])
         if validate_contract(contract, self.settings) != self.workspace_id:
             raise ControlError("control binding changed")
         return contract
+
+    def _check_privileged_overlap(self, db):
+        for digest in _privileged_digests(self.settings):
+            if db.execute("SELECT 1 FROM principals WHERE token_digest=? LIMIT 1", (digest,)).fetchone():
+                raise ControlError("credential configuration conflicts with issued principal")
 
     @staticmethod
     def _check_owner(settings, owner_token):
@@ -308,8 +333,13 @@ class Control:
 
     def verify_owner(self, owner_token):
         self._check_owner(self.settings, owner_token)
-        with closing(self.connect()) as db:
-            self._live_contract(db)
+        try:
+            with closing(self.connect()) as db:
+                db.execute("BEGIN")
+                self._live_contract(db)
+                self._check_privileged_overlap(db)
+        except sqlite3.Error:
+            raise ControlError("control authorization unavailable") from None
 
     @staticmethod
     def _active(row):
@@ -327,18 +357,28 @@ class Control:
                 and isinstance(row["id"], str) and ID_RE.fullmatch(row["id"]) is not None
                 and row["agent_id"] in {x["id"] for x in contract["agents"]})
 
-    def authenticate(self, token):
-        if not isinstance(token, str) or not token or len(token) > 512:
-            return None
+    def resolve(self, token):
+        """Return (known, active principal); raise when control cannot establish either."""
         try:
+            if not isinstance(token, str) or not token or len(token) > 512:
+                raise ValueError
+            digest = digest_token(token)
             with closing(self.connect()) as db:
                 db.execute("BEGIN")
                 contract = self._live_contract(db)
-                row = db.execute("SELECT * FROM principals WHERE token_digest=?", (digest_token(token),)).fetchone()
+                row = db.execute("SELECT * FROM principals WHERE token_digest=?", (digest,)).fetchone()
+                if row is None:
+                    return False, None
                 if not self._valid_principal(row, contract):
-                    return None
-                return Principal("scoped", row["id"], row["workspace_id"], row["agent_id"])
+                    return True, None
+                return True, Principal("scoped", row["id"], row["workspace_id"], row["agent_id"])
         except (ControlError, sqlite3.Error, OSError, ValueError, TypeError, UnicodeError, IndexError, KeyError):
+            raise ControlError("control authorization unavailable") from None
+
+    def authenticate(self, token):
+        try:
+            return self.resolve(token)[1]
+        except ControlError:
             return None
 
     def permits(self, principal, channel, *, receipt=False, db=None):
@@ -384,7 +424,6 @@ class Control:
             except (ValueError, TypeError, OverflowError):
                 raise ControlError("invalid expiry") from None
         alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
-        token = "".join(secrets.choice(alphabet) for _ in range(30)) if pushover else secrets.token_urlsafe(32)
         principal_id = "principal_" + secrets.token_hex(16)
         output = Path(output)
         _safe_directory(output.parent)
@@ -403,6 +442,17 @@ class Control:
                 raise ControlError("invalid channel grants")
             if alarm != any(known[c] == "alarm" for c in channel_ids):
                 raise ControlError("alarm requires both the alarm channel and explicit alarm grant")
+            self._check_privileged_overlap(db)
+            protected = _privileged_digests(self.settings)
+            for _ in range(8):
+                token = "".join(secrets.choice(alphabet) for _ in range(30)) if pushover else secrets.token_urlsafe(32)
+                token_hash = digest_token(token)
+                if (token_hash not in protected
+                        and not db.execute("SELECT 1 FROM protected_credentials WHERE token_digest=?", (token_hash,)).fetchone()
+                        and not db.execute("SELECT 1 FROM principals WHERE token_digest=?", (token_hash,)).fetchone()):
+                    break
+            else:
+                raise ControlError("cannot generate unique principal credential")
             try:
                 fd = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
             except OSError:
@@ -410,7 +460,7 @@ class Control:
             created = True
             os.fchmod(fd, 0o600)
             db.execute("INSERT INTO principals(id,workspace_id,agent_id,token_digest,expires_at,receipts,alarm) "
-                       "VALUES(?,?,?,?,?,?,?)", (principal_id, self.workspace_id, agent_id, digest_token(token), expires_at,
+                       "VALUES(?,?,?,?,?,?,?)", (principal_id, self.workspace_id, agent_id, token_hash, expires_at,
                                                int(receipts), int(alarm)))
             db.executemany("INSERT INTO grants VALUES(?,?)", [(principal_id, c) for c in channel_ids])
             _safe_file(self.path)
@@ -443,13 +493,17 @@ class Control:
     def revoke(self, owner_token, principal_id):
         self.verify_owner(owner_token)
         _id(principal_id)
-        with closing(self.connect()) as db:
-            db.execute("BEGIN IMMEDIATE")
-            self._live_contract(db)
-            changed = db.execute("UPDATE principals SET revoked=1 WHERE id=? AND workspace_id=?",
-                                 (principal_id, self.workspace_id)).rowcount
-            if not changed:
-                db.rollback()
-                raise ControlError("principal not found")
-            _safe_file(self.path)
-            db.commit()
+        try:
+            with closing(self.connect()) as db:
+                db.execute("BEGIN IMMEDIATE")
+                self._live_contract(db)
+                self._check_privileged_overlap(db)
+                changed = db.execute("UPDATE principals SET revoked=1 WHERE id=? AND workspace_id=?",
+                                     (principal_id, self.workspace_id)).rowcount
+                if not changed:
+                    db.rollback()
+                    raise ControlError("principal not found")
+                _safe_file(self.path)
+                db.commit()
+        except sqlite3.Error:
+            raise ControlError("control authorization unavailable") from None
