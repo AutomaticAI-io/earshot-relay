@@ -576,6 +576,9 @@ class Relay:
         lock_key = json.dumps([*provenance(principal), chan, tag], separators=(",", ":"))
         async with self._tag_locks.hold(lock_key):
             authorize(self, chan, principal=principal)
+            # Old holds could combine owner and compat sends and lose an alias to a crash.
+            if principal.kind == "compat" and self.store.ambiguous_legacy_pending(chan, tag):
+                raise ApiError(409, "legacy_retry_ambiguous", "request could not be completed")
             now = self.clock()
             pending = self.store.get_pending(chan, tag, principal=principal)
             if pending and (pending.window_end_at or pending.due_at) <= iso_ms(now):
@@ -594,9 +597,8 @@ class Relay:
             if pending and coalesce:
                 # Inside an open window: the latest text replaces what will be written. Same id, same window.
                 self.store.update_pending(pending.id, text=text, speech=mode, voice=voice, normalized=normalized,
-                                          truncated=truncated, compat=compat)
-                if idem_key:
-                    self.store.add_alias(idem_key, pending.id, iso_ms(now), principal=principal)
+                                          truncated=truncated, compat=compat, idem_key=idem_key,
+                                          alias_at=iso_ms(now), principal=principal)
                 return self._accepted_pending(self.store.get_pending_by_id(pending.id) or pending)
             if cooldown:
                 if pending:
@@ -620,12 +622,10 @@ class Relay:
                                  principal_id=principal.id, workspace_id=principal.workspace_id or "",
                                  agent_id=principal.agent_id or "")
                 try:
-                    self.store.add_pending(row)
+                    self.store.add_pending(row, idem_key=idem_key)
                 except BaseException:
                     self.limiter.refund(reservation)
                     raise
-                if idem_key:
-                    self.store.add_alias(idem_key, row.id, iso_ms(now), principal=principal)
                 self.signal.notify()  # the flush loop sleeps until the earliest window closes
                 return self._accepted_pending(row)
             return await self._write_text(text=text, chan=chan, mode=mode, voice=voice, idem_key=idem_key, tag=tag,

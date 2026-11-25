@@ -5,9 +5,15 @@ import asyncio
 import hashlib
 import io
 import json
+import os
+import shutil
 import sqlite3
+import subprocess
+import sys
+import tarfile
 import threading
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -586,6 +592,172 @@ def test_legacy_retry_retained_until_pending_or_record_pruned(tmp_path, rig, mon
         assert fresh["status"] == "stored"
     finally:
         store.close()
+
+
+@pytest.fixture(params=[False, True], ids=["compat-created", "owner-created"])
+def base_gap(tmp_path, request):
+    # Run the real pre-scoping implementation with an injected failure at its alias commit.
+    repo = Path(__file__).resolve().parents[1]
+    archive = subprocess.run(["git", "archive", "4206b81", "src", "tests"], cwd=repo,
+                             check=True, capture_output=True, timeout=20).stdout
+    base_tree = tmp_path / "base-tree"
+    base_tree.mkdir()
+    with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
+        for member in tar.getmembers():
+            target = (base_tree / member.name).resolve()
+            if not (member.isfile() or member.isdir()) or not target.is_relative_to(base_tree.resolve()):
+                raise AssertionError("unsafe base archive")
+            if member.isdir():
+                target.mkdir(parents=True, exist_ok=True)
+            else:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                content = tar.extractfile(member)
+                assert content is not None
+                with content, target.open("wb") as out:
+                    shutil.copyfileobj(content, out)
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(base_tree / "src") + os.pathsep + str(base_tree) + os.pathsep + env.get("PYTHONPATH", "")
+    script = """
+from pathlib import Path
+from starlette.testclient import TestClient
+from earshot_relay.api import create_app
+from earshot_relay.config import load_settings
+from earshot_relay.service import Relay
+from earshot_relay.store import Store
+from tests.conftest import TOKEN, base_env
+import sys
+
+class Writer:
+    def put(self, *args):
+        raise AssertionError('held message unexpectedly wrote to provider')
+
+root = Path(sys.argv[1])
+settings = load_settings(base_env('http://127.0.0.1:9', str(root / 'data'),
+    EARSHOT_RELAY_CHANNELS='phone,other,alarm', EARSHOT_RELAY_COMPAT='ntfy',
+    EARSHOT_RELAY_COMPAT_TOKEN='s' * 40, EARSHOT_RELAY_RATE_LIMIT='off'), check_ffmpeg=False)
+store = Store(str(root / 'migrate-real-base.db'))
+relay = Relay(settings, store, Writer())
+if sys.argv[2] == 'owner':
+    with TestClient(create_app(relay, mcp=False)) as client:
+        response = client.post('/v1/messages', headers={'Authorization': 'Bearer ' + TOKEN}, json={
+            'text': 'owner initial', 'tag': 'progress', 'coalesce_window_s': 60})
+        assert response.status_code == 202 and store.pending_count() == 1
+def crash(*args, **kwargs):
+    raise RuntimeError('injected crash between pending and alias commits')
+store.add_alias = crash
+try:
+    with TestClient(create_app(relay, mcp=False), raise_server_exceptions=False) as client:
+        response = client.post('/compat/ntfy/phone', content='original-before-crash', headers={
+            'Authorization': 'Bearer ' + 's' * 40, 'Idempotency-Key': 'crash-gap',
+            'X-Earshot-Tag': 'progress', 'X-Earshot-Coalesce-Window-S': '60'})
+        assert response.status_code == 500 and store.pending_count() == 1
+finally:
+    store.close()
+"""
+    subprocess.run([sys.executable, "-c", script, str(tmp_path), "owner" if request.param else "compat"],
+                   cwd=base_tree, env=env, check=True, capture_output=True, text=True, timeout=20)
+    return tmp_path / "migrate-real-base.db"
+
+
+def test_real_base_crash_gap_compat_retry_is_refused(tmp_path, rig, monkeypatch, base_gap):
+    path = base_gap
+    with sqlite3.connect(path) as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 5
+        old_id, created, old_text, merged = db.execute("SELECT id,created_at,text,merged FROM pending").fetchone()
+        assert old_text == "original-before-crash" and merged in (1, 2)
+        assert db.execute("SELECT count(*) FROM idem_aliases").fetchone()[0] == 0
+    # Persisted v6 upgrades are also common: an already-migrated owner row must not lose the guard.
+    first_upgrade = Store(str(path))
+    first_upgrade.close()
+    store = Store(str(path))
+    relay = Relay(rig.settings, store, rig.relay.writer, clock=rig.clock)
+    rig.clock.now = datetime.fromisoformat(created.replace("Z", "+00:00")) + timedelta(seconds=1)
+    writes = []
+    monkeypatch.setattr(relay.writer, "put", lambda *args: writes.append(args))
+    auth = {"Authorization": "Bearer " + "s" * 40, "Idempotency-Key": "crash-gap",
+            "X-Earshot-Tag": "progress"}
+    try:
+        scoped = rig.issue()
+        with TestClient(create_app(relay, mcp=False)) as client:
+            for mode in ({"X-Earshot-Coalesce-Window-S": "60"},
+                         {"X-Earshot-Cooldown-S": "60"},
+                         {"X-Earshot-Coalesce-Window-S": "60", "X-Earshot-Cooldown-S": "60"}):
+                response = client.post("/compat/ntfy/phone", content="retry", headers={**auth, **mode})
+                assert response.status_code == 409
+                assert old_id not in response.text and old_text not in response.text
+                assert old_id not in str(response.headers)
+            no_key = {k: v for k, v in auth.items() if k != "Idempotency-Key"}
+            assert client.post("/compat/ntfy/phone", content="no key", headers={**no_key,
+                "X-Earshot-Coalesce-Window-S": "60"}).status_code == 409
+            row = store.get_pending_by_id(old_id)
+            assert row and row.text == old_text and row.merged == merged and row.principal_kind == "owner"
+            assert relay.get_message(old_id)["id"] == old_id
+            assert_status(404, lambda: relay.get_message(old_id, principal=scoped))
+            assert store.pending_count() == 1 and not writes
+            replay_key = "already-in-own-namespace"
+            same_other = client.post("/compat/ntfy/other", content="unrelated", headers={**auth,
+                "Idempotency-Key": replay_key, "X-Earshot-Coalesce-Window-S": "60"})
+            assert same_other.status_code == 200 and store.pending_count() == 2
+            # An existing unambiguous replay wins before a later ambiguous owner hold can block it.
+            replay = client.post("/compat/ntfy/phone", content="unrelated", headers={**auth,
+                "Idempotency-Key": replay_key, "X-Earshot-Coalesce-Window-S": "60"})
+            assert replay.status_code == 200 and replay.headers.get("idempotent-replayed") == "true"
+            assert replay.headers["x-earshot-message-id"] == same_other.headers["x-earshot-message-id"]
+            fresh = client.post("/compat/ntfy/phone", content="unrelated", headers={**auth,
+                "Idempotency-Key": "different-key", "X-Earshot-Tag": "different-tag",
+                "X-Earshot-Coalesce-Window-S": "60"})
+            assert fresh.status_code == 200 and store.pending_count() == 3 and not writes
+            other = client.post("/compat/ntfy/other", content="unrelated", headers={**auth,
+                "Idempotency-Key": "different-channel", "X-Earshot-Coalesce-Window-S": "60"})
+            assert other.status_code == 200 and store.pending_count() == 3 and not writes
+            # A window that has closed but has not flushed remains ambiguous.
+            rig.clock.advance(61)
+            assert client.post("/compat/ntfy/phone", content="retry", headers={**auth,
+                "X-Earshot-Coalesce-Window-S": "60"}).status_code == 409
+            assert not writes and store.pending_count() == 3
+            assert run(relay.flush_due()) == 3
+            assert len(writes) == 3 and sum(args[1] == old_text.encode() for args in writes) == 1
+            later = client.post("/compat/ntfy/phone", content="fresh after flush", headers={**auth,
+                "Idempotency-Key": "new-after-flush", "X-Earshot-Coalesce-Window-S": "60"})
+            assert later.status_code == 200 and store.pending_count() == 1
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("operation", ["insert", "merge"])
+def test_pending_alias_write_failure_rolls_back_send(rig, monkeypatch, operation):
+    relay = rig.relay
+    principal = Principal("compat", "compat_token")
+    old = None
+    if operation == "merge":
+        async def initial():
+            async with relay.check_replay("first", "phone", principal=principal) as idem:
+                return await relay.send_text(text="original", channel="phone", idem_key=idem.digest,
+                    principal=principal, tag="progress", coalesce_window_s=60, compat=True)
+        first = run(initial())
+        old = relay.store.get_pending_by_id(first["id"])
+        assert old and old.text == "original" and old.merged == 1
+    writes = []
+    monkeypatch.setattr(relay.writer, "put", lambda *args: writes.append(args))
+    with sqlite3.connect(rig.settings.db_path) as db:
+        before_pending = db.execute("SELECT * FROM pending ORDER BY id").fetchall()
+        before_alias = db.execute("SELECT * FROM idem_aliases ORDER BY idem_key").fetchall()
+        db.execute("CREATE TRIGGER crash_alias BEFORE INSERT ON idem_aliases "
+                   "BEGIN SELECT RAISE(ABORT, 'injected alias failure'); END")
+    with pytest.raises(sqlite3.IntegrityError, match="injected alias failure"):
+        run(send_idem(relay, principal, "retry-key", tag="progress", coalesce_window_s=60, compat=True))
+    with sqlite3.connect(rig.settings.db_path) as db:
+        assert db.execute("SELECT * FROM pending ORDER BY id").fetchall() == before_pending
+        assert db.execute("SELECT * FROM idem_aliases ORDER BY idem_key").fetchall() == before_alias
+        db.execute("DROP TRIGGER crash_alias")
+    assert not writes
+    accepted = run(send_idem(relay, principal, "retry-key", tag="progress", coalesce_window_s=60, compat=True))
+    assert accepted["status"] == "coalescing"
+    current = relay.store.get_pending_by_id(accepted["id"])
+    assert current and current.merged == (2 if old else 1) and current.text == "hello"
+    assert run(send_idem(relay, principal, "retry-key", tag="progress", coalesce_window_s=60, compat=True))["id"] == current.id
+    rig.clock.advance(61)
+    assert run(relay.flush_due()) == 1 and len(writes) == 1
 
 
 def test_scoped_receipt_hint_independent_of_other_callers_and_heartbeats(rig, monkeypatch):

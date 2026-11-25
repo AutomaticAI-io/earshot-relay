@@ -447,28 +447,56 @@ class Store:
                 "SELECT * FROM pending WHERE channel=? AND tag=? AND principal_kind=? AND principal_id=? AND workspace_id=?",
                 (channel, tag, *provenance(principal))).fetchone())
 
+    def ambiguous_legacy_pending(self, channel: str, tag: str) -> bool:
+        """A pre-scope compat hold may be missing the alias of a request interrupted by a crash."""
+        with self._lock:
+            return self._db.execute(
+                "SELECT 1 FROM pending WHERE channel=? AND tag=?"
+                " AND principal_kind=? AND principal_id=? AND workspace_id=? LIMIT 1",
+                (channel, tag, *provenance(OWNER)),
+            ).fetchone() is not None
+
     def get_pending_by_id(self, message_id: str) -> PendingRow | None:
         with self._lock:
             return self._pending(self._db.execute("SELECT * FROM pending WHERE id=?", (message_id,)).fetchone())
 
-    def add_pending(self, row: PendingRow) -> None:
+    def _save_pending(self, sql: str, values: tuple, *, idem_key: str | None, message_id: str,
+                      alias_at: str | None, principal: Principal) -> None:
+        if idem_key and alias_at is None:
+            raise ValueError("alias timestamp required")
         with self._lock:
-            self._db.execute(
-                "INSERT INTO pending(id, channel, tag, created_at, due_at, text, speech, voice, normalized, truncated,"
-                " merged, attempts, compat, window_end_at, principal_kind, principal_id, workspace_id, agent_id)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (row.id, row.channel, row.tag, row.created_at, row.due_at, row.text, row.speech, row.voice,
-                 int(row.normalized), int(row.truncated), row.merged, row.attempts, int(row.compat),
-                 row.window_end_at or row.due_at, row.principal_kind, row.principal_id, row.workspace_id, row.agent_id))
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = self._db.execute(sql, values)
+                if idem_key:
+                    if cursor.rowcount != 1:
+                        raise sqlite3.IntegrityError("pending row disappeared")
+                    assert alias_at is not None
+                    self._insert_alias(idem_key, message_id, alias_at, principal=principal)
+                self._db.commit()
+            except BaseException:
+                self._db.rollback()
+                raise
+
+    def add_pending(self, row: PendingRow, *, idem_key: str | None = None) -> None:
+        self._save_pending(
+            "INSERT INTO pending(id, channel, tag, created_at, due_at, text, speech, voice, normalized, truncated,"
+            " merged, attempts, compat, window_end_at, principal_kind, principal_id, workspace_id, agent_id)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (row.id, row.channel, row.tag, row.created_at, row.due_at, row.text, row.speech, row.voice,
+             int(row.normalized), int(row.truncated), row.merged, row.attempts, int(row.compat),
+             row.window_end_at or row.due_at, row.principal_kind, row.principal_id, row.workspace_id, row.agent_id),
+            idem_key=idem_key, message_id=row.id, alias_at=row.created_at, principal=principal_for(row))
 
     def update_pending(self, message_id: str, *, text: str, speech: str, voice: str | None, normalized: bool,
-                       truncated: bool, compat: bool = False) -> None:
+                       truncated: bool, compat: bool = False, idem_key: str | None = None,
+                       alias_at: str | None = None, principal: Principal = OWNER) -> None:
         """Latest text wins; retain compat provenance if any merged send used the compat alarm gate."""
-        with self._lock:
-            self._db.execute(
-                "UPDATE pending SET text=?, speech=?, voice=?, normalized=?, truncated=?, compat=MAX(compat, ?), "
-                "merged=merged+1 WHERE id=?",
-                (text, speech, voice, int(normalized), int(truncated), int(compat), message_id))
+        self._save_pending(
+            "UPDATE pending SET text=?, speech=?, voice=?, normalized=?, truncated=?, compat=MAX(compat, ?), "
+            "merged=merged+1 WHERE id=?",
+            (text, speech, voice, int(normalized), int(truncated), int(compat), message_id),
+            idem_key=idem_key, message_id=message_id, alias_at=alias_at, principal=principal)
 
     def retry_pending(self, message_id: str, attempts: int, due_at: str) -> None:
         with self._lock:
@@ -553,11 +581,14 @@ class Store:
                                    (digest, cutoff, *provenance(principal))).fetchone()
         return json.loads(row["result"]) if row else None
 
+    def _insert_alias(self, idem_key: str, message_id: str, created_at: str, *, principal: Principal) -> None:
+        self._db.execute("INSERT OR REPLACE INTO idem_aliases"
+                         "(idem_key,message_id,created_at,principal_kind,principal_id,workspace_id,agent_id) VALUES(?,?,?,?,?,?,?)",
+                         (idem_key, message_id, created_at, *provenance(principal), principal.agent_id or ""))
+
     def add_alias(self, idem_key: str, message_id: str, created_at: str, *, principal: Principal = OWNER) -> None:
         with self._lock:
-            self._db.execute("INSERT OR REPLACE INTO idem_aliases"
-                             "(idem_key,message_id,created_at,principal_kind,principal_id,workspace_id,agent_id) VALUES(?,?,?,?,?,?,?)",
-                             (idem_key, message_id, created_at, *provenance(principal), principal.agent_id or ""))
+            self._insert_alias(idem_key, message_id, created_at, principal=principal)
 
     def get_alias(self, idem_key: str, not_before: str, *, principal: Principal = OWNER) -> str | None:
         """The id of the message an Idempotency-Key hash was merged into by coalescing, if recent enough."""
