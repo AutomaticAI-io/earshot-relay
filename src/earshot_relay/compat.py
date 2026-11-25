@@ -645,6 +645,27 @@ def _ntfy_routes(app: FastAPI, relay: Relay, prefix: str, include_in_schema: boo
             body_file, size = await spool_capped(request, cap)
             media = _media(request)
             ext = _audio_ext(filename, media) if size else None
+            if size and (media == "application/json" or media.endswith("+json") or ext is None):
+                sample = body_file.read(MAX_FORM_BYTES + 1)
+                body_file.seek(0)
+                stripped = sample.lstrip().removeprefix(b"\xef\xbb\xbf").lstrip()
+                declared_json = media == "application/json" or media.endswith("+json")
+                if declared_json or stripped.startswith(b"{"):
+                    if len(sample) > MAX_FORM_BYTES:
+                        raise ApiError(413, "too_large", "JSON body is too large")
+                    try:
+                        data = parse_json(sample)
+                    except (ValueError, UnicodeDecodeError, RecursionError):
+                        try:
+                            object_body = isinstance(json.loads(sample), dict)
+                        except (ValueError, UnicodeDecodeError, RecursionError):
+                            object_body = False
+                        if object_body or declared_json:
+                            raise ApiError(400, "bad_json", "invalid JSON body") from None
+                    else:
+                        if isinstance(data, dict):
+                            check_body_workspace(relay, data)
+                            raise ApiError(400, "bad_json", "JSON objects must be sent to the ntfy base route")
             message = param_message
             if ext is not None:
                 incoming.audio = (body_file, size, ext)

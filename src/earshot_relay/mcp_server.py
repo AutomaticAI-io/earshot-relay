@@ -20,6 +20,26 @@ from mcp.types import CallToolResult, TextContent, ToolAnnotations
 from . import RECEIPT_WORDING, __version__
 from .auth import current_token
 from .beacons import receipt_is_final
+from .keys import is_valid_channel
+
+
+class _CapabilitiesNotFound(ToolError):
+    pass
+
+
+def _legacy_capabilities(data: dict) -> dict:
+    # The 1.1.2 status schema is owner-only; never return its beacon or bucket details.
+    from .api import StatusResponse
+
+    try:
+        status = StatusResponse.model_validate(data, strict=True)
+    except ValidationError:
+        raise ToolError("the relay returned an unexpected legacy status") from None
+    channels = status.channels
+    if (status.relay.version != "1.1.2" or not channels or len(set(channels)) != len(channels)
+            or not all(is_valid_channel(c) for c in channels) or status.default_channel not in channels):
+        raise ToolError("the relay returned an unexpected legacy status")
+    return {"channels": channels, "default_channel": status.default_channel}
 
 INSTRUCTIONS = (
     "Earshot reads text aloud on the user's Android phone: the relay stores a message in the user's own bucket and the "
@@ -99,6 +119,8 @@ class Backend:
         except ValueError:
             data = None
         if resp.status_code >= 400:
+            if method == "GET" and path == "/v1/capabilities" and resp.status_code == 404:
+                raise _CapabilitiesNotFound("capabilities endpoint is unavailable")
             err = (data or {}).get("error", {}) if isinstance(data, dict) else {}
             code = err.get("code", f"http_{resp.status_code}")
             message = err.get("message", "request refused")
@@ -126,7 +148,10 @@ class Backend:
         return await self._call("GET", "/v1/status")
 
     async def capabilities(self) -> dict:
-        return await self._call("GET", "/v1/capabilities")
+        try:
+            return await self._call("GET", "/v1/capabilities")
+        except _CapabilitiesNotFound:
+            return _legacy_capabilities(await self.status())
 
 
 def _sent(result: dict) -> dict[str, Any]:
@@ -291,9 +316,15 @@ def run_stdio(api_url: str, token: str) -> None:
     try:
         with httpx.Client(base_url=api_url, headers=headers, timeout=10) as c:
             resp = c.get("/v1/capabilities")
-            if resp.status_code == 200:
-                alarm_allowed = "alarm" in resp.json().get("channels", [])
-    except (httpx.HTTPError, ValueError):
+            if resp.status_code == 404:
+                legacy = c.get("/v1/status")
+                if legacy.status_code == 200:
+                    alarm_allowed = "alarm" in _legacy_capabilities(legacy.json())["channels"]
+            elif resp.status_code == 200:
+                data = resp.json()
+                channels = data.get("channels") if isinstance(data, dict) else None
+                alarm_allowed = isinstance(channels, list) and "alarm" in channels
+    except (httpx.HTTPError, ValueError, TypeError, ToolError):
         pass  # tools still register; each call reports the connection problem
     client = httpx.AsyncClient(base_url=api_url, headers=headers, timeout=httpx.Timeout(120))
     mcp = build_mcp(Backend(client), alarm_allowed=alarm_allowed)

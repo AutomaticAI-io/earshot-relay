@@ -652,6 +652,7 @@ def _api_routes(app: FastAPI, relay: Relay) -> None:
                 raise ApiError(400, "bad_json", "body must be a JSON object")
             compat.check_body_workspace(relay, data)
             if owner_idem is not None and owner_idem.replay is not None:
+                resolved_send_channel(relay, request.state.principal, data.get("channel"))
                 return owner_idem.replay
             unknown = sorted(set(data) - TEXT_FIELDS)
             if unknown:
@@ -792,6 +793,8 @@ async def _send_multipart(request: Request, relay: Relay, idem_header: str | Non
         if workspaces and (relay.control is None or any(w != relay.control.workspace_id for w in workspaces)):
             raise ApiError(403, "forbidden", "request not permitted")
         if owner_idem is not None and owner_idem.replay is not None:
+            for requested in form.getlist("channel") or [None]:
+                resolved_send_channel(relay, request.state.principal, requested)
             return owner_idem.replay
         unknown = sorted(set(form.keys()) - {"file", "channel", "workspace", "workspace_id"})
         if unknown:
