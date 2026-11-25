@@ -13,7 +13,7 @@ This is an **operator-only** Python CLI, not part of the relay process. It uses 
 
 ## Requirements and plan
 
-Python 3.11+, `boto3` (the repo already declares it), and `mc` on `/usr/local/bin`, `/usr/bin` or `/bin`. TLS verification is required for HTTPS. HTTP is accepted only on the explicit loopback IPs `127.0.0.1` or `::1` for local testing. No proxy is used. Obtain an explicitly authorized MinIO admin account with the necessary bucket and IAM administration rights. Never run the CLI inside the relay container or give admin access to the relay.
+Python 3.11+, `boto3` (the repo already declares it), and `mc` on `/usr/local/bin`, `/usr/bin` or `/bin`. TLS verification is required for HTTPS. HTTP is accepted only on the explicit loopback IPs `127.0.0.1` or `::1` for local testing. An explicit port must be in 1–65535. No proxy is used; inherited `SSLKEYLOGFILE` is cleared before provider TLS connections so TLS session secrets are not written to that file. Obtain an explicitly authorized MinIO admin account with the necessary bucket and IAM administration rights. Never run the CLI inside the relay container or give admin access to the relay.
 
 Create a spec containing **no credentials**, e.g. `workspace.json`:
 
@@ -26,7 +26,7 @@ Create a spec containing **no credentials**, e.g. `workspace.json`:
 }
 ```
 
-`workspace` uses lowercase letters, digits and hyphens; bucket must be exactly `earshot-<workspace>`. Channel and device names use `[a-z0-9][a-z0-9_-]{0,31}`; each device grant must be a nonempty subset of requested channels. A workspace owns its bucket; no shared-bucket prefix mapping or existing-bucket adoption is attempted. The tool creates no channel marker objects.
+`workspace` uses lowercase letters, digits and hyphens; bucket must be exactly `earshot-<workspace>`. Channel and device names use `[a-z0-9][a-z0-9_-]{0,31}`; at least one channel must be non-`alarm` so the relay can select a default, and each device grant must be a nonempty subset of requested channels. A workspace owns its bucket; no shared-bucket prefix mapping or existing-bucket adoption is attempted. The tool creates no channel marker objects.
 
 Run from the repository root (or use the absolute script path):
 
@@ -54,7 +54,11 @@ Rerunning the same spec, endpoint, admin file and state directory verifies exist
 
 ## Failure and revocation
 
-A nonzero exit means **not complete**, even if some provider operations succeeded. Check the protected journal's `bucket_phase`, `progress`, and identity `*_attempted`/`*_confirmed` flags; attempted is not proof of success. Handoff files from an earlier successful run may still exist and must not be treated as evidence of a later failed run. The tool never deletes a bucket, object, user or policy. Retry only with the same spec/endpoint/state after inspecting provider state. It can resume a confirmed bound bucket and operations whose outcomes are safely inspectable. If bucket creation's outcome is unknown (`bucket_phase=creating`), it refuses blind retry or adoption; inspect it manually and reconcile with the operator. Do not change the binding marker or edit the journal to force adoption. For a foreign existing bucket, stop and follow the manual path below.
+A nonzero exit means **not complete**, even if some provider operations succeeded. Check the protected journal's `bucket_phase`, `progress`, and identity `*_attempted`/`*_confirmed` flags; attempted is not proof of success. Handoff files from an earlier successful run may still exist and must not be treated as evidence of a later failed run. The tool never deletes a bucket, object, user or policy. Retry only with the same spec/endpoint/state after inspecting provider state. It can resume a confirmed bound bucket and operations whose outcomes are safely inspectable.
+
+If `bucket_phase` is `creating` or `created` after interruption, bucket identity/continuity is unknown: the name may refer to a replacement, even if a marker exists. The CLI refuses to bind or issue credentials; it does not automatically adopt or repair it. An authorized operator must investigate bucket ownership, data and audit history. Do not edit the journal or copy a marker to force adoption. Keep the existing bucket and data untouched; if continuity cannot be established, use a new, explicitly authorized workspace/bucket name and fresh state, or use the protected manual path below. Reconcile any provider resources separately with the owner; never delete them merely to make retry succeed.
+
+An attempted but unconfirmed user might have been created and subsequently revoked or modified. The CLI refuses automatic recovery whether that user is absent or still exists; in particular, it never recreates the same access key. An authorized operator should investigate provider audit history and revocation, preserve the journal, and arrange a fresh identity and secret through a deliberate manual rotation/reprovisioning procedure; no CLI command automatically resolves this uncertainty. The same applies to a confirmed user or attachment that is missing. Do not clear journal flags or restore revoked credentials by hand. For a foreign existing bucket, stop and follow the manual path below.
 
 **Remove local secrets is not revocation.** Removing a handoff or uninstalling the app does not disable a key at MinIO. To revoke a device, an authorized administrator must disable or delete that exact MinIO user (and its child service accounts, if any), and verify the old key is denied. `mc admin user disable <operator-alias> <device-access-key>` is a provider-side example; run only in the operator's explicitly configured admin environment. The access key identifies the user and should be handled privately. Then remove that device's handoff and local copies as appropriate. Do not delete the whole journal casually: it contains recovery information and the other identities. Reapply refuses a disabled or removed confirmed user and does not re-enable it. Rotation/replacement is a separate manual process, not implemented here.
 
@@ -64,12 +68,13 @@ Do not point this automation at an existing bucket. An operator can instead inve
 
 ## Test
 
-Unit plan checks do not require Docker. The integration tests start disposable uniquely named MinIO containers on an OS-assigned `127.0.0.1` port using the already-present `minio/minio:latest` image (`--pull=never`), generated credentials, an isolated `mc` config and the local Docker socket. They remove only their own containers; no existing MinIO endpoint, host credential or alias is used. Override `TMPDIR` and pytest `--basetemp` to a private scratch location, and do not run this on a host where using its local Docker daemon is unauthorized.
+Unit plan checks do not require Docker. The integration tests start disposable uniquely named MinIO containers on an OS-assigned `127.0.0.1` port using the already-present `minio/minio:latest` image (`--pull=never`), generated credentials, an isolated `mc` config and the local Docker socket. They remove only their own containers; no existing MinIO endpoint, host credential or alias is used. The TLS regression also needs `openssl` and runs against a loopback server with a generated test certificate. Override `TMPDIR` and pytest `--basetemp` to a private scratch location, and do not run this on a host where using its local Docker daemon is unauthorized.
 
 ```sh
 export EARSHOT_MINIO_TESTS=1 AWS_EC2_METADATA_DISABLED=true NO_PROXY='*'
 pytest -q -p no:cacheprovider --basetemp /private/scratch/ears65-test \
-  tools/provision/test_minio_setup.py tools/provision/test_extra.py tools/provision/test_revocation.py
+  tools/provision/test_minio_setup.py tools/provision/test_extra.py \
+  tools/provision/test_revocation.py tools/provision/test_review_regressions.py
 ```
 
 The test command requires an unused basetemp path; pytest removes that path at startup. It retains private fixture files (including throwaway credentials) under that path after the run, so remove only that test run's scratch directory when finished. Without `EARSHOT_MINIO_TESTS=1`, Docker tests skip rather than using any alternate provider.

@@ -34,6 +34,8 @@ def validate_spec(spec):
         raise Refusal("bucket must be earshot-<workspace> and a valid bucket name")
     if not isinstance(channels, list) or not channels or any(not isinstance(c, str) or not CHANNEL.fullmatch(c) for c in channels) or len(set(channels)) != len(channels):
         raise Refusal("channels must be unique app channel names")
+    if not any(channel != "alarm" for channel in channels):
+        raise Refusal("at least one non-alarm channel is required by the relay")
     if not isinstance(readers, dict) or not readers:
         raise Refusal("at least one device reader is required")
     for device, grants in readers.items():
@@ -54,8 +56,12 @@ def endpoint_url(value):
         raise Refusal("invalid endpoint") from None
     if url.scheme not in ("http", "https") or not url.hostname or url.username is not None or url.password is not None or url.path not in ("", "/") or url.query or url.fragment:
         raise Refusal("endpoint must be an origin without credentials, path or query")
+    if port == 0:
+        raise Refusal("endpoint port must be between 1 and 65535")
     if url.scheme == "http" and url.hostname not in ("127.0.0.1", "::1"):
         raise Refusal("HTTP is allowed only on explicit loopback IP addresses")
+    if url.netloc.endswith(":"):
+        raise Refusal("endpoint port must be between 1 and 65535")
     host = url.hostname.lower()
     if ":" in host:
         host = f"[{host}]"
@@ -195,6 +201,8 @@ def error_code(exc):
 
 
 def apply(spec, endpoint, credentials, state_dir):
+    # Python's TLS contexts honor this inherited variable even with certificate verification enabled.
+    os.environ.pop("SSLKEYLOGFILE", None)
     from botocore.exceptions import ClientError
     state_dir = private_dir(state_dir)
     path = state_dir / "state.json"
@@ -222,6 +230,7 @@ def apply(spec, endpoint, credentials, state_dir):
             bucket = spec["bucket"]
             marker_key = ".earshot-provisioner/binding.json"
             marker = {"version": 1, "workspace": spec["workspace"], "binding": state["binding"]}
+            created_this_run = False
             if state["bucket_phase"] == "new":
                 try:
                     admin.s3.head_bucket(Bucket=bucket)
@@ -237,22 +246,31 @@ def apply(spec, endpoint, credentials, state_dir):
                 state["progress"] = "bucket creation attempted; outcome may be unknown"
                 save()
                 admin.s3.create_bucket(Bucket=bucket)
+                created_this_run = True
                 state["bucket_phase"] = "created"
                 state["progress"] = "bucket created; binding pending"
                 save()
             if state["bucket_phase"] == "creating":
+                state["progress"] = "bucket creation outcome unknown"
+                save()
                 raise Refusal("bucket creation outcome unknown; inspect provider and state, do not retry blindly")
             if state["bucket_phase"] == "created":
+                if not created_this_run:
+                    state["progress"] = "bucket continuity unknown"
+                    save()
+                    raise Refusal("unbound bucket continuity unknown; no binding or IAM changes made")
                 try:
                     admin.s3.put_object(Bucket=bucket, Key=marker_key, Body=json.dumps(marker).encode(), IfNoneMatch="*")
                 except ClientError as exc:
                     if error_code(exc) not in ("PreconditionFailed", "412"):
                         raise
-                state["bucket_phase"] = "bound"
-                save()
             obj = admin.s3.get_object(Bucket=bucket, Key=marker_key)
             if json.loads(obj["Body"].read()) != marker:
                 raise Refusal("bucket binding mismatch; refusing provider changes")
+            if state["bucket_phase"] == "created":
+                state["bucket_phase"] = "bound"
+                state["progress"] = "bucket binding confirmed"
+                save()
             try:
                 admin.s3.get_bucket_policy(Bucket=bucket)
             except ClientError as exc:
@@ -283,6 +301,10 @@ def apply(spec, endpoint, credentials, state_dir):
                 if info is None:
                     if identity["user_confirmed"]:
                         raise Refusal("confirmed user is missing; refusing to recreate it")
+                    if identity["user_attempted"]:
+                        state["progress"] = "attempted user missing for " + label
+                        save()
+                        raise Refusal("attempted user is missing; outcome or revocation unknown; refusing recreation")
                     identity["user_attempted"] = True
                     state["progress"] = "creating user for " + label
                     save()
@@ -290,16 +312,18 @@ def apply(spec, endpoint, credentials, state_dir):
                     info = admin.user_info(identity["access_key"])
                 elif not identity["user_attempted"]:
                     raise Refusal("unexpected pre-existing user")
+                elif not identity["user_confirmed"]:
+                    state["progress"] = "attempted user unconfirmed for " + label
+                    save()
+                    raise Refusal("attempted user remains unconfirmed; manual reconciliation required")
                 if not info or info.get("userStatus") != "enabled" or info.get("memberOf"):
                     raise Refusal("provider user disabled, missing or in a group")
                 admin.assert_no_service_accounts(identity["access_key"])
-                identity["user_confirmed"] = True
-                save()
                 policies = set(filter(None, info.get("policyName", "").split(",")))
                 if policies - {identity["policy"]}:
                     raise Refusal("provider user has unexpected policies")
                 if not policies:
-                    if identity["attachment_confirmed"]:
+                    if identity["attachment_confirmed"] or identity["user_confirmed"]:
                         raise Refusal("confirmed policy attachment is missing; refusing to reattach")
                     try:
                         admin.client(identity).list_objects_v2(Bucket=bucket, Prefix=identity["channels"][0] + "/", MaxKeys=1)
@@ -314,6 +338,7 @@ def apply(spec, endpoint, credentials, state_dir):
                     info = admin.user_info(identity["access_key"])
                     if not info or info.get("policyName") != identity["policy"]:
                         raise Refusal("provider did not confirm policy attachment")
+                identity["user_confirmed"] = True
                 identity["attachment_confirmed"] = True
                 save()
                 client = admin.client(identity)
