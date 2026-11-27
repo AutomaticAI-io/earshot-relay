@@ -28,7 +28,8 @@ class _CapabilitiesNotFound(ToolError):
 
 
 def _legacy_capabilities(data: dict) -> dict:
-    # The 1.1.2 status schema is owner-only; never return its beacon or bucket details.
+    # The 1.1.2 status schema is owner-only; never return its beacon or bucket details. 1.1.3 ships the
+    # same schema, so exactly these versions are accepted; anything else fails closed.
     from .api import StatusResponse
 
     try:
@@ -36,7 +37,7 @@ def _legacy_capabilities(data: dict) -> dict:
     except ValidationError:
         raise ToolError("the relay returned an unexpected legacy status") from None
     channels = status.channels
-    if (status.relay.version != "1.1.2" or not channels or len(set(channels)) != len(channels)
+    if (status.relay.version not in {"1.1.2", "1.1.3"} or not channels or len(set(channels)) != len(channels)
             or not all(is_valid_channel(c) for c in channels) or status.default_channel not in channels):
         raise ToolError("the relay returned an unexpected legacy status")
     return {"channels": channels, "default_channel": status.default_channel}

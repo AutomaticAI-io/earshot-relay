@@ -1,7 +1,7 @@
 {
   "name": "earshot",
   "displayName": "Earshot",
-  "version": "1.1.2",
+  "version": "1.1.3",
   "description": "Speak short messages on your Android phone through your own Earshot relay, and check whether the phone played them.",
   "author": {
     "name": "AutomaticAI",
@@ -10,7 +10,7 @@
   "homepage": "https://store.automaticai.io/earshot/",
   "repository": "https://github.com/AutomaticAI-io/earshot-relay",
   "license": "MIT",
-  "keywords": ["mcp", "tts", "notifications", "android", "voice", "earshot"],
+  "keywords": ["mcp", "tts", "notifications", "android", "voice", "earshot", "hermes", "hermes-agent"],
   "documentationUrl": "https://github.com/AutomaticAI-io/earshot-relay/blob/main/docs/mcp.md",
   "supportUrl": "https://github.com/AutomaticAI-io/earshot-relay/issues",
   "privacyPolicyUrl": "https://store.automaticai.io/earshot/privacy/",

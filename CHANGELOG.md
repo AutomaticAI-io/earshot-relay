@@ -3,6 +3,31 @@
 All notable changes. Versions follow semver. A `202` always means stored (or, with `coalesce_window_s`, held), never played;
 receipts describe device playback, never that a person heard anything.
 
+## 1.1.3 (2026-11-27)
+
+Directory-listing and docs release: the public Hermes recipe.
+
+### Fixed
+
+- The stdio MCP legacy-status fallback accepts a 1.1.3 relay's status again. Its fail-closed guard pinned the
+  1.1.2 status schema by version, so after the version bump a 1.1.3 relay without `/v1/capabilities` was rejected;
+  the guard now accepts exactly the versions that ship that schema (1.1.2 and 1.1.3) and still rejects anything
+  else.
+
+### Changed
+
+- `server.json` describes the relay Hermes-first: "Make Hermes and other agents speak on your Android phone. Own S3
+  bucket, receipts, opt-in alarm" (95 characters, inside the registry's 100).
+- The Claude Code plugin metadata adds `hermes` and `hermes-agent` keywords. It stays a Claude Code plugin; the
+  keywords are discovery, not a Hermes plugin claim.
+
+### Added
+
+- The Hermes recipe: a [README](README.md#hermes) subsection, self-contained [docs/hermes.md](docs/hermes.md), and
+  [examples/hermes/](examples/hermes/) with a config snippet, the EARS-48 final-reply hook (unchanged) and a short
+  installable `earshot` skill. Dated tested-on evidence is in the recipe and
+  [docs/verification/ears-49.md](docs/verification/ears-49.md).
+
 ## 1.1.2 (2026-11-21)
 
 ### Fixed
