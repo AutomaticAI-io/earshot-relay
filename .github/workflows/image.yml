@@ -14,6 +14,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # tests/test_scoped_service.py replays the legacy relay with `git archive 4206b81`,
+          # which a depth-1 checkout doesn't have. Same fix as ci.yml.
+          fetch-depth: 0
       - uses: astral-sh/setup-uv@v5
       - run: uv sync --locked
       - run: uv run pytest -q
