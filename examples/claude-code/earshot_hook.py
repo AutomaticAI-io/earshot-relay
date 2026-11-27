@@ -4,14 +4,17 @@
   Notification -> "Claude Code needs your permission in <project>" (permission_prompt), "... is waiting for you ..."
                   (idle_prompt) or "... has a question ..." (elicitation_dialog). Other notification types (a login
                   that succeeded, a finished subagent, quota notices) stay silent.
-  Stop         -> the first sentence or two of the assistant's last message (about 300 characters at most)
+  Stop         -> the first sentence or two of the assistant's last message (about 300 characters at most).
+                  OFF BY DEFAULT: the Stop path sends nothing unless EARSHOT_HOOK_STOP is set to 1 (or true/yes).
 
-WARNING: the Stop hook sends a slice of what the agent wrote to your bucket. Use a private bucket and a
-private channel, and leave the Stop hook out if the agent works with anything you would not say aloud.
+WARNING: the Stop hook sends a slice of what the agent wrote to your bucket. The text is stored there as a plain
+object anyone with bucket read access can see. Use a private bucket and a private channel, and leave the Stop
+hook off if the agent works with anything you would not say aloud.
 
 Configuration (environment): EARSHOT_API_URL (default http://127.0.0.1:8080), EARSHOT_API_TOKEN or
-EARSHOT_API_TOKEN_FILE, optional EARSHOT_HOOK_CHANNEL. This script always exits 0: a hook that fails must
-never block or slow the agent (exit code 2 on Stop would keep the agent working).
+EARSHOT_API_TOKEN_FILE, optional EARSHOT_HOOK_CHANNEL, EARSHOT_HOOK_STOP=1 to turn the Stop hook on. This script
+always exits 0: a hook that fails must never block or slow the agent (exit code 2 on Stop would keep the agent
+working).
 """
 
 from __future__ import annotations
@@ -94,6 +97,12 @@ def project_name(payload: dict) -> str:
     return os.path.basename((payload.get("cwd") or "").rstrip("/")) or "your project"
 
 
+def stop_enabled(environ=os.environ) -> bool:
+    """The Stop hook is opt-in: it sends a slice of the agent's reply into the bucket, so it stays off
+    unless EARSHOT_HOOK_STOP is set to 1 (or true/yes)."""
+    return environ.get("EARSHOT_HOOK_STOP", "").strip().lower() in ("1", "true", "yes")
+
+
 NOTIFICATION_LINES = {
     "permission_prompt": "Claude Code needs your permission in {project}.",
     "idle_prompt": "Claude Code is waiting for you in {project}.",
@@ -101,7 +110,7 @@ NOTIFICATION_LINES = {
 }
 
 
-def build_line(payload: dict) -> str | None:
+def build_line(payload: dict, environ=os.environ) -> str | None:
     event = payload.get("hook_event_name")
     if event == "Notification":
         kind = payload.get("notification_type")
@@ -110,6 +119,8 @@ def build_line(payload: dict) -> str | None:
         template = NOTIFICATION_LINES.get(kind)
         return template.format(project=project_name(payload)) if template else None
     if event == "Stop":
+        if not stop_enabled(environ):
+            return None  # opt-in only: the slice lands in the bucket
         if payload.get("stop_hook_active"):
             return None  # a Stop hook already kept the agent going; do not speak twice
         text = payload.get("last_assistant_message") or last_assistant_text(payload.get("transcript_path") or "")

@@ -105,21 +105,33 @@ def test_hook_notification_types_that_do_not_need_you_stay_silent(live_relay, ki
 
 def test_hook_stop_speaks_a_short_gist(live_relay, s3_admin):
     msg = "All tests pass now. I also tidied the imports.\n\n" + "More detail. " * 50
-    p = run(HOOK, [], json.dumps({"hook_event_name": "Stop", "stop_hook_active": False, "last_assistant_message": msg}), live_relay)
+    p = run(HOOK, [], json.dumps({"hook_event_name": "Stop", "stop_hook_active": False, "last_assistant_message": msg}),
+            live_relay, extra={"EARSHOT_HOOK_STOP": "1"})
     assert p.returncode == 0
     assert message_text(s3_admin, sent(live_relay)[0]) == "All tests pass now. I also tidied the imports."
+
+
+@pytest.mark.parametrize("value", [None, "", "0", "false", "no"])
+def test_hook_stop_defaults_off(live_relay, value):
+    """Without an explicit EARSHOT_HOOK_STOP opt-in the Stop hook sends nothing and still exits 0."""
+    before = sent(live_relay)
+    extra = {} if value is None else {"EARSHOT_HOOK_STOP": value}
+    p = run(HOOK, [], json.dumps({"hook_event_name": "Stop", "last_assistant_message": "Done."}), live_relay, extra=extra)
+    assert p.returncode == 0 and sent(live_relay) == before
 
 
 def test_hook_stop_falls_back_to_the_transcript(live_relay, s3_admin, tmp_path):
     t = tmp_path / "t.jsonl"
     t.write_text(json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "From the transcript."}]}}))
-    run(HOOK, [], json.dumps({"hook_event_name": "Stop", "transcript_path": str(t)}), live_relay)
+    run(HOOK, [], json.dumps({"hook_event_name": "Stop", "transcript_path": str(t)}), live_relay,
+        extra={"EARSHOT_HOOK_STOP": "1"})
     assert message_text(s3_admin, sent(live_relay)[0]) == "From the transcript."
 
 
 def test_hook_skips_when_stop_hook_active(live_relay):
     before = sent(live_relay)
-    p = run(HOOK, [], json.dumps({"hook_event_name": "Stop", "stop_hook_active": True, "last_assistant_message": "Nope."}), live_relay)
+    p = run(HOOK, [], json.dumps({"hook_event_name": "Stop", "stop_hook_active": True, "last_assistant_message": "Nope."}),
+            live_relay, extra={"EARSHOT_HOOK_STOP": "1"})
     assert p.returncode == 0 and sent(live_relay) == before
 
 

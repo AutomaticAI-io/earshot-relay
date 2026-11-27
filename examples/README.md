@@ -4,11 +4,11 @@
 | --- | --- |
 | [`curl.sh`](curl.sh) | **Tested** in the test suite against a live relay and a moto bucket (needs `curl` and `jq`). |
 | [`hermes/`](hermes/) (`earshot-say.sh`, [recipe](../docs/hermes.md)) | **Tested on named surfaces; Desktop Untested.** Genuine Telegram MCP/current hook S24 `finished` November 25, new genuine multiplexed ntfy current hook plus real CLI/TUI S24 `finished` November 27. Actual bounded cron produced zero hook objects. Telegram/ntfy exact-sentence obedience failed, full normalized actual response delivered. Earlier inert-wrapper failure and authorized multi-device diagnostic retained separately. |
-| [`claude-code/`](claude-code) hook (`earshot_hook.py`, `settings.hooks.json`) | **Tested**: the script runs against a live relay in the test suite (each Notification type, Stop gist, transcript fallback, `stop_hook_active`, always exit 0). The hook JSON is checked for shape only; it was **not** run inside a real Claude Code session. |
+| [`claude-code/`](claude-code) hook (`earshot_hook.py`, `settings.hooks.json`) | **Tested on 2026-11-27**: the suite runs the script against a live relay and a moto bucket (each Notification type, Stop gist, transcript fallback, `stop_hook_active`, default-off Stop, always exit 0), and a manual run piped docs-shaped Stop and Notification payloads through a from-source relay into a disposable local MinIO bucket: with no `EARSHOT_HOOK_STOP` the Stop payload stored nothing; with `EARSHOT_HOOK_STOP=1` the object held the trimmed two-sentence gist and `GET /v1/messages/{id}` returned a `stored` receipt for both sends. **Not** run inside a real Claude Code session (the payload shapes follow the hooks reference, including `last_assistant_message` on Stop); phone playback is not part of this test. |
 | [`codex-notify.py`](codex-notify.py) | **Tested** with a hand-built `agent-turn-complete` event following the Codex `notify` documentation. **Not** run inside a real Codex session. |
 | [`github-actions.yml`](github-actions.yml) | **Untested.** No workflow was run. |
 | [`n8n.md`](n8n.md) | **Untested.** |
-| [`home-assistant.md`](home-assistant.md) | **Untested.** |
+| [`home-assistant.md`](home-assistant.md) (`rest_command`) | **Tested** 2026-11-27 with Home Assistant 2026.11.3 (Docker, HTTP API only) against relay 1.1.2 (`db161da`) and a disposable MinIO bucket: both recipe sends landed in the bucket byte-identical, receipts `stored`. Phone playback **not** tested. |
 | [`apprise.md`](apprise.md) (Apprise `ntfy://`, `ntfys://`, `gotify://`) | **Tested** with Apprise 2.3.0 against a live relay (`scripts/compat_clients.py`); the requests are replayed in `tests/test_compat.py`. |
 | [`uptime-kuma.md`](uptime-kuma.md) (ntfy and Gotify providers) | **Tested** with Uptime Kuma 1.23.16 (its notification Test call). Version 2 was **not** run. |
 | Hermes `send --to ntfy:phone` → [ntfy compat spike](../docs/verification/ears-56-hermes-ntfy.md) / [device follow-up](../docs/verification/ears-56-hermes-ntfy.md#fresh-espeak-emulator-follow-up--playback-completion-2026-11-25-00340035-utc) | **Tested: isolated emulator playback completion.** On 2026-11-25, Hermes `d6525ab`, relay 1.1.2 frozen `e1021e8`, Earshot beta-debug 0.1.12, Android 16 / API 36 and eSpeak NG 1.52.0: manual `msg_6e0e746418b0428786cbc8f4700f3fb3`, object `phone/6e0e746418b0428786cbc8f4700f3fb3.say` / `EARS56-device-manual-20261125T003451Z`, selected-device `detected → started → finished` at **00:35:12.083 UTC**. Earlier selected-device attempt failed TTS initialization. No-audio emulator: not physical phone, audibility or locked-screen proof. Positional `hermes send ntfy:phone "text"` is unsupported; use `--to`. |
@@ -60,8 +60,13 @@ Claude Code starts with, so export them in the shell you launch `claude` from, o
 file only you can read. Optional: `EARSHOT_HOOK_CHANNEL` sends to another channel (never `alarm` for this).
 
 The Notification entry speaks only when Claude Code needs you: a permission prompt, an idle prompt waiting for input,
-or a question. The Stop entry speaks the first sentence or two of the last reply; leave it out if the agent works with
-anything you would not say aloud.
+or a question. The Stop entry speaks the first sentence or two of the last reply (at most about 300 characters), and
+it is **off by default**: even with the Stop entry installed, the hook sends nothing until you opt in by setting
+`EARSHOT_HOOK_STOP=1` (in the `env` object of the same `settings.json`, or exported in the launching shell).
+
+**Warning:** the Stop hook writes a slice of what the agent wrote into your bucket as a plain `.say` object — anyone
+who can read the bucket can read it. Use a private bucket and a private channel, and leave the Stop hook off if the
+agent works with anything you would not say aloud.
 
 ## Install the Codex notify program
 
