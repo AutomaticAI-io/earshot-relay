@@ -3,7 +3,12 @@
 Date: 2026-11-27. Candidate branch `ears-49-hermes-recipe`, worktree
 `/home/delorenj/code/earshot-relay/.worktrees/ears-49-hermes-recipe`, base `96c1afc` (main, clean at start).
 All fixture credentials below are synthetic and were deleted after the run. No live profile, phone, bucket
-policy, board, push, tag, workflow dispatch or release was touched.
+policy or board was touched. **Scope note (corrected 2026-11-27 after the post-landing audit):** the statement
+"no push, tag, workflow dispatch or release was touched" describes the initial pre-release fixture/candidate
+phase (AC1–AC5 evidence below) only. The later release phase did push `main`, create/move tag `v1.1.3`, run
+the image workflow and dispatch `publish-mcp.yml` exactly once; see "Release evidence (2026-11-27)" and
+"Post-landing audit and process record (2026-11-27)" for that chronology, including one process deviation
+recorded there without retroactive approval.
 
 ## Environment
 
@@ -140,8 +145,8 @@ only source change in the candidate and is called out in CHANGELOG.md.
 | 3 | **PASS after B1 correction:** short SKILL.md (say/receipt guidance); layout validated against installed rules; real install and removal in a disposable profile repeated on the final bytes; no live profile touched. See the corrections section. |
 | 4 | **PASS:** examples/README.md and docs/hermes.md agree with the EARS-48 dated evidence; only exercised cases are Tested; Desktop stays Untested; stored vs finished and no human-heard/locked-screen/Autoplay claims retained. |
 | 5 | **PASS:** exact 95-character description; plugin keywords added without a Hermes-plugin claim; `test_registry_files.py` plus the affected recipe/hook checks pass; no embedded credentials. |
-| 6 | **PREPARED, NOT SHIPPED:** docs-only commit and the 1.1.3 release commit (server.json, plugin.json, version/image metadata) are ready on the candidate branch. Tag, image build, the one `publish-mcp.yml` dispatch at the tag and the registry read-back remain for the release phase; no tag or dispatch receipt exists yet. |
-| 7 | **PENDING:** ticket links to the reviewed public recipe, skill-install check and release/registry evidence are added at ticket completion; this file is the durable recipe/install evidence, and release/registry evidence is produced in the release phase. |
+| 6 | **PASS — RELEASED.** Docs-only updates shipped with the single relay 1.1.3 release; tag `v1.1.3`; tag image run succeeded; `publish-mcp.yml` dispatched exactly once; the registry entry read back with the exact Hermes description and `ghcr.io/automaticai-io/earshot-relay:1.1.3`. Details in "Release evidence (2026-11-27)" below. |
+| 7 | **PENDING (ticket-side).** Recipe, skill-install, and release evidence is recorded here; the PM attaches the links to the ticket at completion (no board writes from this lane). |
 
 ## Post-review corrections (2026-11-27, transparent record)
 
@@ -178,3 +183,132 @@ notes. Corrections on this branch:
 Fixture cleanup: relay and file-server processes stopped, the MinIO container removed, both disposable
 profile `.env` files and the synthetic token/password files deleted; sanitized command outputs are retained
 in the task scratch (self-pruning after 24 h). Nothing in this file carries a usable credential.
+
+## Release evidence (2026-11-27)
+
+Recorded after independent final review; observed facts only. Review receipts (each summary is the durable
+record; the full reviewer reports live in profile scratch and self-prune after 24 h):
+
+- **Spec review, round 1** of `0580a1f6bd2c8035cc17099570ad599f58f38077`: **FAIL**. One blocker (B1 —
+  `examples/hermes/SKILL.md` wrongly said `skipped` means "the phone did not play"; the real formatter
+  answers "The phone started it but the user skipped it." with possibly-null `hint`) and one numbering note
+  (N1 — this ledger's AC rows were misnumbered). Reproduced the exact skipped-receipt output
+  `{"status":"skipped","final":true,"summary":"The phone started it but the user skipped it.","hint":null}`.
+  Fixed in `7dd4de7c702a0ce8d85790c08f2d9b873fafbe03`. Report: `ears49-spec-review.md` (scratch).
+- **Spec review, final** of `7dd4de7c702a0ce8d85790c08f2d9b873fafbe03`: **PASS** — approves ordinary landing
+  and the authorized 1.1.3 release at that exact pin; verified the B1 fix against the real formatter, the
+  re-run disposable install/uninstall on the corrected bytes, and the corrected AC numbering. Report:
+  `ears49-spec-review-final.md` (scratch).
+- **Quality review** of `0580a1f6bd2c8035cc17099570ad599f58f38077`: **PASS** for ordinary landing with
+  nonblocking notes (trust-default wording; the delta to `7dd4de7` was docs-only so runtime conclusions
+  carried over). Report: `ears49-quality-review.md` (scratch).
+- **Post-landing quality/security audit** of `133b13bb2457dd1b3c37cd31fc0292b7d2d55e3a`: **technical PASS,
+  process FAIL** — see "Post-landing audit and process record" below. Report: `ears49-release-audit.md`
+  (scratch).
+
+Landing (shared checkout, fast-forward merges on `main`, `git pull --no-rebase` first; `origin/main` was
+still `96c1afc221bdb9121e6c2ffc1d15c985b7422381`, no outside advance):
+
+- `main` pushed `96c1afc` → `7dd4de7c702a0ce8d85790c08f2d9b873fafbe03` →
+  `133b13bb2457dd1b3c37cd31fc0292b7d2d55e3a` (https://github.com/AutomaticAI-io/earshot-relay/commits/main).
+- Commits: `c875023` recipe docs, `0580a1f` release 1.1.3 metadata, `7dd4de7` post-review correction,
+  `133b13b` CI repair (below).
+
+CI repair discovered during the release sequence (commit `133b13b`, workflow-only):
+
+- The first tag image run at `7dd4de7` (run 46074922686) failed its test job: two
+  `tests/test_scoped_service.py` fixtures replay the legacy relay with `git archive 4206b81`, which a
+  depth-1 `actions/checkout` does not contain (exit 128; 709 passed, 14 skipped, 2 errors).
+- The same defect predates this candidate. Two earlier main image runs also failed (run IDs corrected
+  2026-11-27 after the post-landing audit found the originally recorded IDs returned 404):
+  [run 46063041114](https://github.com/AutomaticAI-io/earshot-relay/actions/runs/46063041114) at `96c1afc`
+  (2026-11-27 20:21Z) and [run 46035784655](https://github.com/AutomaticAI-io/earshot-relay/actions/runs/46035784655)
+  at `db161da` (2026-11-27 16:41Z). Same-cause was re-verified from their actual job logs: both fail at
+  setup of the `test_real_base_crash_gap` fixtures with `git archive 4206b81 src tests` raising
+  `CalledProcessError` in the depth-1 checkout.
+- `ci.yml` already carries the established repair (`fetch-depth: 0` with the same comment);
+  `image.yml` drifted and received the identical 4-line repair. No product content changed — `server.json`
+  is byte-identical between `7dd4de7` and `133b13b`.
+
+Tag:
+
+- Annotated tag `v1.1.3` was first created at `7dd4de7` (tag object `fcb8f4b`), then moved to `133b13b`
+  (tag object `b5bbc81`) so the tag build could run with the repaired workflow. Moved before any 1.1.3 image
+  or registry entry existed; recorded here transparently.
+
+Image (tag build):
+
+- Run 46075354122 — https://github.com/AutomaticAI-io/earshot-relay/actions/runs/46075354122 — test success,
+  publish success. Pushed `ghcr.io/automaticai-io/earshot-relay:1.1.3` (plus `:1.1`, `:1`, `:latest`),
+  digest `sha256:498dda0085b944a8f54fecc06b0e4a8d2c986d82bf6dae165d3b50a773b15207`.
+- Verified after the build, independently of the workflow log: `docker manifest inspect` shows the
+  multi-arch index (linux/amd64 + linux/arm64); `docker pull` of the digest then showed label
+  `io.modelcontextprotocol.server.name=io.github.AutomaticAI-io/earshot-relay` (matches `server.json`),
+  and `--version` printed `earshot-relay 1.1.3`.
+
+Registry publication:
+
+- `publish-mcp.yml` dispatched exactly once with `--ref v1.1.3`: run 46076248244 —
+  https://github.com/AutomaticAI-io/earshot-relay/actions/runs/46076248244 — success.
+- Registry API read-back: GET
+  `https://registry.modelcontextprotocol.io/v0/servers/io.github.AutomaticAI-io%2Fearshot-relay/versions/1.1.3`
+  returned `name: io.github.AutomaticAI-io/earshot-relay`, `version: 1.1.3`, description exactly
+  "Make Hermes and other agents speak on your Android phone. Own S3 bucket, receipts, opt-in alarm"
+  (95 characters), package `oci ghcr.io/automaticai-io/earshot-relay:1.1.3`. Parsed output saved to
+  `ears49/registry-readback.out` (profile scratch).
+
+Other checks after landing: CI on main (run 46074901248) success; edge image build on main
+(run 46075324247) success; `git log origin/main..HEAD` empty (nothing unpushed — re-confirmed with the
+required machine-wide `git unpushed` scan: this worktree's branch reports "NO UPSTREAM" and its commits are
+contained in the pushed `origin/main`; the shared checkout's `main` reports no unpushed commits). No live
+service restarts, no live profiles/phones/buckets touched, no store/outreach changes.
+
+## Post-landing audit and process record (2026-11-27)
+
+An independent post-landing quality/security audit (`ears49-release-audit.md`, scratch) reviewed the exact
+workflow-only commit `133b13bb2457dd1b3c37cd31fc0292b7d2d55e3a` against
+`7dd4de7c702a0ce8d85790c08f2d9b873fafbe03` and returned **technical PASS, process FAIL**. Its substance,
+recorded here permanently:
+
+> Post-landing independent quality/security audit of workflow-only commit `133b13bb2457dd1b3c37cd31fc0292b7d2d55e3a`
+> against `7dd4de7c702a0ce8d85790c08f2d9b873fafbe03`: technical PASS. Full-history checkout repairs the
+> reproduced legacy-archive failure; both affected tests pass. Image run 46075354122, registry run
+> 46076248244 and public OCI/registry read-backs match the released pin/version. The release worker landed
+> this new workflow commit and moved `v1.1.3` before obtaining review; earlier approvals did not cover that
+> delta. This audit is post-landing and does not erase the review-before-landing breach. No automatic
+> revert/retag/republish is recommended. AC7 remains pending ticket-side evidence links.
+
+Recorded process deviation, without retroactive approval:
+
+- The reviewed candidate was `7dd4de7`. During the release sequence the tag image build failed on a
+  pre-existing shallow-checkout defect (above), and the worker landed the workflow-only repair `133b13b` and
+  moved tag `v1.1.3` to it without first sending that new pin for independent review. The pre-landing spec
+  and quality approvals covered `7dd4de7` only; the delta was out-of-candidate. The post-landing audit is
+  the first independent review of `133b13b`; it is explicitly not a retroactive approval of the sequence.
+- Following the audit's recommendation, the now-published tag, image and registry entry are preserved as-is
+  (no automatic rollback, retag or republish), and any further source/tag/workflow change must be reviewed
+  before execution.
+
+Audit's independent technical checks (sanitized facts):
+
+- Semantic YAML comparison of `7dd4de7..133b13b`: only `.github/workflows/image.yml` changed, and only by
+  adding `jobs.test.steps[0].with.fetch-depth: 0`; `ci.yml` already had the same setting. No trigger, action
+  version, command, permissions, secret use, publish job, dependency or product-content change.
+- Reproduced the missing-history boundary in a scratch local-file clone: depth-1 `git archive 4206b81 src
+  tests` → exit 128 (`fatal: not a valid object name`); after scratch-only `fetch --unshallow --tags` →
+  exit 0. No shared repository refs changed.
+- Ran the affected tests at exact `133b13b` in that isolated clone:
+  `pytest tests/test_scoped_service.py -k test_real_base_crash_gap` → 2 passed, 27 deselected.
+- `git diff --check 7dd4de7 133b13b` and staged `git diff --cached --check`: exit 0.
+- Public read-backs: remote `main` and peeled `v1.1.3` = `133b13b`; tag object
+  `b5bbc8118f7aa706f9cb1fa1cedf7ee047e12cb3`; locally retained previous tag object `fcb8f4b` targets
+  `7dd4de7`, corroborating the move. OCI `:1.1.3` manifest digest matches
+  `498dda0085b944a8f54fecc06b0e4a8d2c986d82bf6dae165d3b50a773b15207` (amd64+arm64); config labels match
+  server name, revision `133b13b`, version `1.1.3`. Registry workflow history has exactly one run for
+  `v1.1.3` (46076248244, `workflow_dispatch`, success). Live registry 1.1.3 entry matches name, version, the
+  exact 95-character description and `ghcr.io/automaticai-io/earshot-relay:1.1.3`.
+- Audit limits, recorded for accuracy: unauthenticated raw job logs for run 46074922686 returned 403, so the
+  audit did not independently re-establish the `709 passed / 14 skipped / 2 errors` counts (they remain this
+  worker's evidence from the live log at the time); the containerized `--version` execution is likewise
+  worker evidence, not the auditor's execution. The audit's verdicts are release/publication read-backs,
+  not phone playback, hearing, locked-screen or live-profile proof.
