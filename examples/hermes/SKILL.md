@@ -38,8 +38,14 @@ the way the receipt words it:
 - `finished` means the phone finished device playback. It is not proof a person
   heard it and not a locked-screen test.
 - `stored`, `detected` or `started` mean the message is on its way.
-- `skipped`, `failed` or `missed` mean the phone reported it did not play; read
-  the receipt's `hint` and tell the user plainly.
+- `skipped` means the phone **started** playback but the user skipped it —
+  neither "played to the end" nor "did not play"; say that it started and was
+  skipped, and that how much was heard is not established.
+- `failed` means the phone tried and could not play it; `missed` means it did
+  not play (it went stale, the audio was unavailable, or the bucket changed).
+- Word your answer from the receipt's own `summary`, its timeline hops and the
+  hop `error`/`hint`. When `hint` is null, say there is no hint — never invent
+  a reason.
 
 Use `mcp__earshot__recent` to list the last few messages and
 `mcp__earshot__status` for relay, bucket and device state when something looks

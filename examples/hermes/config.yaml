@@ -15,6 +15,9 @@ mcp_servers:
     url: https://your-relay.example.com/mcp   # your own relay's /mcp endpoint
     headers:
       Authorization: "Bearer ${EARSHOT_API_TOKEN}"
+    # trust: untrusted   # optional: ask before write-capable calls like say.
+                         # Without this key the server defaults to trust: full
+                         # and say runs without prompting.
 
 # Opt-in final-reply hook (path B in docs/hermes.md). Nothing runs until you add
 # this entry and consent: Hermes asks once per (event, command) pair, or you set

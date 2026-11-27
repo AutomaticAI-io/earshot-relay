@@ -46,9 +46,11 @@ channel (`EARSHOT_RELAY_CHANNELS`); with the default `phone`-only channel list i
 can never be the default channel.
 
 Inside the agent the discovered tools are registered as `mcp__earshot__say`, `mcp__earshot__receipt`,
-`mcp__earshot__recent` and `mcp__earshot__status` (Hermes prefixes every MCP tool `mcp__<server>__<tool>`). On an
-untrusted profile Hermes asks before the first `say` call; to pre-approve just that one tool in a throwaway
-profile, allowlist `mcp:earshot/say` without weakening the server's trust tier.
+`mcp__earshot__recent` and `mcp__earshot__status` (Hermes prefixes every MCP tool `mcp__<server>__<tool>`). A
+server without an explicit `trust` key defaults to `trust: full`, so `say` runs without prompting. Set
+`mcp_servers.earshot.trust: untrusted` (`hermes config set mcp_servers.earshot.trust untrusted`) to make Hermes
+ask before write-capable calls such as `say`; to pre-approve just that one tool in a throwaway profile,
+allowlist `mcp:earshot/say` without weakening the server's trust tier.
 
 `say` stores your text in the bucket (`status: stored`); `receipt` with the returned id reports what the phone
 reported doing. **Stored is not played, and `finished` is device playback completion — not proof a person heard

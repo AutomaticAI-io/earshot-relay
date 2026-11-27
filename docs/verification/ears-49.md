@@ -96,6 +96,9 @@ Uninstalled 'earshot' from earshot
 ```
 
 `skills/earshot` was confirmed gone after uninstall (exit 0). No live profile was installed into or altered.
+That first run installed the pre-correction bytes (SHA-256 `bdf3c11df2d12f146ecb945b390049f015dc6529257cd8dfc4b6dd676ee6e62c`);
+the corrected final bytes (SHA-256 `0e5a41252bd56582ef927f14943b6d7191d0a2adc8244accf77676654b232f89`) were
+installed and removed in a fresh disposable profile afterward — see the post-review corrections section below.
 
 ## AC5 — metadata
 
@@ -134,11 +137,43 @@ only source change in the candidate and is called out in CHANGELOG.md.
 | --- | --- |
 | 1 | **PASS:** README Hermes subsection links the self-contained docs/hermes.md and examples/hermes/; real isolated `hermes mcp test earshot` discovered `say`, `receipt`, `recent`, `status` with alarm disabled, plus a 401 negative control; tool names, `${EARSHOT_API_TOKEN}` placeholder, prerequisites and tested Hermes version recorded; no private-doc dependency. |
 | 2 | **PASS:** hook bytes unchanged (SHA-256 above); warning beside opt-in; before-delivery and duplication notes; hook tests pass; no executable change, so no rerun triggered. |
-| 3 | **PASS:** short SKILL.md (say/receipt guidance); layout validated against installed rules; real install and removal in a disposable profile; no live profile touched. |
+| 3 | **PASS after B1 correction:** short SKILL.md (say/receipt guidance); layout validated against installed rules; real install and removal in a disposable profile repeated on the final bytes; no live profile touched. See the corrections section. |
 | 4 | **PASS:** examples/README.md and docs/hermes.md agree with the EARS-48 dated evidence; only exercised cases are Tested; Desktop stays Untested; stored vs finished and no human-heard/locked-screen/Autoplay claims retained. |
-| 5 | **PASS:** exact 95-character description; plugin keywords added without a Hermes-plugin claim. |
-| 6 | **PASS:** `test_registry_files.py` plus recipe/hook checks pass; no embedded credentials. |
-| 7 | **PREPARED, NOT SHIPPED:** docs-only commit and the 1.1.3 release commit (server.json, plugin.json, version/image metadata) are ready on the candidate branch. Tag, image build, `publish-mcp.yml` dispatch and registry read-back remain for the release phase; no tag or dispatch receipt exists yet. |
+| 5 | **PASS:** exact 95-character description; plugin keywords added without a Hermes-plugin claim; `test_registry_files.py` plus the affected recipe/hook checks pass; no embedded credentials. |
+| 6 | **PREPARED, NOT SHIPPED:** docs-only commit and the 1.1.3 release commit (server.json, plugin.json, version/image metadata) are ready on the candidate branch. Tag, image build, the one `publish-mcp.yml` dispatch at the tag and the registry read-back remain for the release phase; no tag or dispatch receipt exists yet. |
+| 7 | **PENDING:** ticket links to the reviewed public recipe, skill-install check and release/registry evidence are added at ticket completion; this file is the durable recipe/install evidence, and release/registry evidence is produced in the release phase. |
+
+## Post-review corrections (2026-11-27, transparent record)
+
+The independent specification review of candidate `0580a1f6bd2c8035cc17099570ad599f58f38077` returned FAIL on
+one bounded defect and one numbering note; the independent quality review passed the same pin with nonblocking
+notes. Corrections on this branch:
+
+- **B1 (recipe skill receipt semantics, fixed):** the first SKILL.md (raw SHA-256
+  `bdf3c11df2d12f146ecb945b390049f015dc6529257cd8dfc4b6dd676ee6e62c`, Hermes scanner bundle
+  `742789805c69b53d6799089375df8f0afa720e07c23b82fe2033112a68c78c61`) told the agent that `skipped` means the
+  phone did not play. The real formatter derives `skipped` from a `finished` beacon with `error: skipped` and
+  answers `summary: "The phone started it but the user skipped it."` with `hint: null`. SKILL.md now
+  distinguishes `skipped` (started, then skipped; how much was heard is not established) from `failed` (tried,
+  could not play) and `missed` (did not play; stale/audio unavailable/bucket changed), and instructs the agent
+  to word its answer from the receipt's own `summary`, timeline hops and hop `error`/`hint`, saying there is no
+  hint instead of inventing a reason when `hint` is null. A bounded semantic probe
+  (`skill-semantic-probe.out`, synthetic beacons through the real `derive_receipt` + actual `SUMMARIES`/
+  `receipt_is_final`/hint formatter) reproduced the reviewer's exact skipped output
+  `{"status":"skipped","final":true,"summary":"The phone started it but the user skipped it.","hint":null}` and
+  contrasted `failed`/`missed`, then asserted none of them words `skipped` as "did not play".
+  Disposable install/list/uninstall was repeated on the corrected bytes in a fresh disposable profile: raw
+  SHA-256 `0e5a41252bd56582ef927f14943b6d7191d0a2adc8244accf77676654b232f89` (installed bytes identical to the
+  candidate), scanner verdict SAFE/ALLOWED, audit INSTALL 21:59:28Z and UNINSTALL 21:59:41Z with the directory
+  confirmed removed. No live profile, phone or credential was used.
+- **N1 (evidence numbering, fixed):** this ledger previously called the tests row AC6 and the release row AC7.
+  The ticket's real numbering is metadata **and tests** = AC5, release/image/registry = AC6, ticket evidence
+  links = AC7; the mapping above now follows that. The earlier numbering is preserved here as a recorded
+  reviewer finding, not silently rewritten.
+- **Quality note (trust default, clarified nonblocking):** an MCP server without an explicit `trust` key
+  defaults to `trust: full` (installed source `tools/mcp_tool.py`: "Missing trust = full"), so the recipe and
+  `examples/hermes/config.yaml` now state that default explicitly and show the optional
+  `mcp_servers.earshot.trust untrusted` setting instead of implying approval prompts by default.
 
 Fixture cleanup: relay and file-server processes stopped, the MinIO container removed, both disposable
 profile `.env` files and the synthetic token/password files deleted; sanitized command outputs are retained
