@@ -1,0 +1,28 @@
+# Earshot MCP for one Hermes profile — merge this block into that profile's
+# config.yaml (default profile: ~/.hermes/config.yaml; named profile:
+# ~/.hermes/profiles/<name>/config.yaml).
+#
+# Keep the token out of this file. Put EARSHOT_API_TOKEN in the profile's own
+# 0600 .env and reference it with the ${...} placeholder below; Hermes resolves
+# the placeholder at startup. Prefer `hermes config set` over hand-editing, for
+# example:
+#
+#   hermes config set mcp_servers.earshot.url https://your-relay.example.com/mcp
+#   hermes config set mcp_servers.earshot.headers.Authorization 'Bearer ${EARSHOT_API_TOKEN}'
+#
+mcp_servers:
+  earshot:
+    url: https://your-relay.example.com/mcp   # your own relay's /mcp endpoint
+    headers:
+      Authorization: "Bearer ${EARSHOT_API_TOKEN}"
+
+# Opt-in final-reply hook (path B in docs/hermes.md). Nothing runs until you add
+# this entry and consent: Hermes asks once per (event, command) pair, or you set
+# hooks_auto_accept: true, or run the gateway with --accept-hooks. The command
+# must be an absolute path to a copy of earshot-say.sh from this directory.
+# Enabling both the MCP tools and this hook can speak one turn twice; enable the
+# path you intend.
+#
+# hooks:
+#   post_llm_call:
+#     - command: /absolute/path/to/earshot-say.sh

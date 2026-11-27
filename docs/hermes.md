@@ -1,4 +1,156 @@
-# Hermes → Earshot (EARS-48)
+# Hermes → Earshot
+
+Make a [Hermes](https://hermes-agent.nousresearch.com/docs/) agent speak on your Android phone through your own
+earshot-relay. Two opt-in paths, usable on their own:
+
+- **Path A — MCP tools.** Hermes connects to the relay's `/mcp` endpoint; the agent calls `say` when it decides to
+  speak and `receipt` to check what the phone did.
+- **Path B — final-reply hook.** A shell hook speaks a slice of every final reply on allowed surfaces. Off until you
+  install it.
+
+Both paths store text in **your own bucket as a plain object**: anyone who can read the bucket can read it. Use a
+private bucket.
+
+## Prerequisites
+
+- A running earshot-relay reachable over HTTPS (or HTTP on localhost) and its bearer token (its
+  `EARSHOT_RELAY_TOKEN`). Setup: the [README](../README.md#run-it).
+- The [Earshot](https://store.automaticai.io/earshot/) Android app listening to the same bucket (the
+  [buyer guide](https://store.automaticai.io/earshot/guide/) covers that). Android only; text is spoken by the
+  phone's own text-to-speech, audio files play as they are.
+- Hermes installed with MCP support ([official docs](https://hermes-agent.nousresearch.com/docs/)). This recipe was
+  exercised with Hermes `v0.23.4+390.g07e5bbf` (`07e5bbfc854a918659c20dbd06040a2a7b0df37f`, git install) on
+  2026-11-27; the dated surface-by-surface evidence is in [Tested on](#tested-on) and the ledger below.
+
+## Path A — MCP: the agent chooses when to speak
+
+Put the token in the profile's own 0600 `.env` (`~/.hermes/.env`, or `~/.hermes/profiles/<name>/.env` for a named
+profile) as `EARSHOT_API_TOKEN=...`, then point the profile at your relay — [`examples/hermes/config.yaml`](../examples/hermes/config.yaml)
+is the same snippet with comments:
+
+```sh
+hermes config set mcp_servers.earshot.url https://your-relay.example.com/mcp
+hermes config set mcp_servers.earshot.headers.Authorization 'Bearer ${EARSHOT_API_TOKEN}'
+```
+
+`config.yaml` holds only the `${EARSHOT_API_TOKEN}` placeholder; Hermes resolves it from the profile's `.env` at
+startup. Then verify the connection:
+
+```sh
+hermes mcp test earshot
+```
+
+A healthy test connects to `https://your-relay.example.com/mcp` with the bearer token and lists four discovered
+tools: `say`, `receipt`, `recent` and `status`. The `alarm` tool exists only when you enabled the relay's alarm
+channel (`EARSHOT_RELAY_CHANNELS`); with the default `phone`-only channel list it is correctly absent, and `alarm`
+can never be the default channel.
+
+Inside the agent the discovered tools are registered as `mcp__earshot__say`, `mcp__earshot__receipt`,
+`mcp__earshot__recent` and `mcp__earshot__status` (Hermes prefixes every MCP tool `mcp__<server>__<tool>`). On an
+untrusted profile Hermes asks before the first `say` call; to pre-approve just that one tool in a throwaway
+profile, allowlist `mcp:earshot/say` without weakening the server's trust tier.
+
+`say` stores your text in the bucket (`status: stored`); `receipt` with the returned id reports what the phone
+reported doing. **Stored is not played, and `finished` is device playback completion — not proof a person heard
+it, and not a locked-screen test.**
+
+## Path B — the opt-in final-reply hook
+
+[`examples/hermes/earshot-say.sh`](../examples/hermes/earshot-say.sh) speaks a slice of each final reply through
+the relay CLI. Nothing runs until you install it.
+
+> **Privacy warning:** the hook writes a slice of what your agent wrote into your bucket as a plain `.say`
+> object — anyone who can read the bucket can read it. Use a private bucket, and skip this hook if the agent works
+> with anything you would not say aloud.
+
+1. Install the relay CLI and `jq` on the hook's PATH (`uv tool install .` from a relay checkout). **Verify the
+   launcher actually executes `earshot-relay say`** — a zero exit from an inert wrapper is not delivery.
+2. Keep a 0600 `earshot.env` in the **active profile's** `$HERMES_HOME` (`~/.hermes/earshot.env` for the default
+   profile) holding direct values:
+
+   ```sh
+   EARSHOT_API_URL=https://your-relay.example.com
+   EARSHOT_API_TOKEN=...        # the relay's EARSHOT_RELAY_TOKEN
+   ```
+
+   The hook reads the active profile's file, not `$HOME`: under a multiplexed gateway each profile is scoped, and
+   inheriting the launcher's environment is not sufficient. It clears inherited relay settings, requires direct
+   non-whitespace URL and token values, and rejects ambiguous `*_FILE` or relay fallback settings — failing closed
+   (sending nothing) rather than falling back to a localhost default or reused credentials.
+3. Register it in that profile's `config.yaml` with an absolute path (also in
+   [`examples/hermes/config.yaml`](../examples/hermes/config.yaml)):
+
+   ```yaml
+   hooks:
+     post_llm_call:
+       - command: /absolute/path/to/earshot-say.sh
+   ```
+
+   Give the hook explicit consent: Hermes asks once per (event, command) pair, or set `hooks_auto_accept: true`, or
+   run the gateway with `--accept-hooks`.
+4. Semantics and limits:
+   - `post_llm_call` fires when the turn finalizes, **before the gateway delivers the reply** to the platform. It
+     speaks what the agent said — never word it as "what Telegram delivered".
+   - The default platform allowlist is `telegram discord slack signal whatsapp sms email ntfy cli tui`; `cron` and
+     `subagent` are always excluded, and Desktop stays excluded until a real Desktop platform value is observed.
+     Narrow the list with `EARSHOT_HERMES_PLATFORMS` in `earshot.env`.
+   - The send detaches with `setsid`, so the reply is not blocked by a bucket write.
+   - Running both path A and path B can speak one turn twice: enable the path you intend.
+   - Multiplexed ntfy gateways: point the profile at your self-hosted server explicitly, prove the effective
+     destination with a **nonsecret canary** and a fail-closed outbound allowlist before any real turn, and do not
+     equate a startup "connected" line with successful asynchronous auth. The ledger below records why.
+   - The tested hook's SHA-256 is `fa730115f8befe3092a0594cea2639d207926e5dd7303fbc2dbeded32591aceb`
+     (`sha256sum examples/hermes/earshot-say.sh`). If you change executable behavior, the affected verification in
+     the ledger must be rerun before the hook can be called Tested again.
+
+## The `earshot` skill
+
+[`examples/hermes/SKILL.md`](../examples/hermes/SKILL.md) is a short recipe skill that tells the agent when to call
+the discovered `mcp__earshot__say` and when to inspect a receipt. Install it into a profile directly from this
+repo, and remove it the same way:
+
+```sh
+hermes skills install https://raw.githubusercontent.com/AutomaticAI-io/earshot-relay/main/examples/hermes/SKILL.md
+hermes skills list                  # shows earshot
+hermes skills uninstall earshot     # removes it again
+```
+
+Its layout follows the current Hermes skill rules — YAML frontmatter with a `name` and `description`, installable
+from a direct SKILL.md URL. It is a recipe skill, not the native Hermes plugin and not a generated onboarding kit.
+
+## Tested on
+
+Everything exercised, dated, with its limits; the full proof ledger is below and the example status rows live in
+[`examples/README.md`](../examples/README.md). Only exercised cases are Tested; Desktop and other unrun paths
+remain Untested.
+
+| Surface / path | Status | Evidence and limits |
+| --- | --- | --- |
+| Telegram → HTTP MCP `say` | **Tested** 2026-11-25 | Real owner DM, exact stored text, physical S24 `finished` 16:51:38.773 UTC. [Ledger](#follow-up-on-2026-11-25-queued-telegram-turn-current-hook) |
+| Telegram → current hook | **Tested delivery; reply obedience failed** 2026-11-25 | Full actual response (with onboarding paragraph) stored after whitespace normalization, S24 `finished`. [Ledger](#follow-up-on-2026-11-25-queued-telegram-turn-current-hook) |
+| Multiplexed ntfy → current hook | **Tested delivery; reply obedience failed** 2026-11-27 | New genuine inbound turn, own secondary credentials, self-hosted subscription, S24 `finished` 15:33:11.295 UTC. [Ledger](#2026-11-27-current-hook-verification-required-delivery-chains-complete) |
+| CLI → current hook | **Tested** 2026-11-27 | Byte-equal stored text, S24 `finished` 15:48:03.814 UTC. [Ledger](#2026-11-27-current-hook-verification-required-delivery-chains-complete) |
+| Ink TUI → current hook | **Tested** 2026-11-27 | Byte-equal stored text, S24 `finished` 15:53:13.024 UTC. [Ledger](#2026-11-27-current-hook-verification-required-delivery-chains-complete) |
+| Bounded cron → hook exclusion | **Tested** 2026-11-27 | Real `cron` payload produced zero hook objects. Not wall-clock scheduling. [Ledger](#2026-11-27-current-hook-verification-required-delivery-chains-complete) |
+| Isolated profile → `hermes mcp test earshot` | **Tested** 2026-11-27 | Authenticated HTTP MCP against a local relay and disposable MinIO bucket discovered `say`, `receipt`, `recent`, `status` with alarm disabled; skill install and removal exercised in a disposable profile. No phone playback. [EARS-49 verification](verification/ears-49.md) |
+| Desktop → hook | **Untested** | No packaged app or build dependencies; no platform value guessed. |
+
+## What this is not
+
+- Android only: the Earshot app is Android; there is no iPhone path.
+- Your own bucket and your own relay; there is no shared Earshot server.
+- One way: the phone cannot reply through Earshot, and nothing here is delivered-reply Autoplay — the hook speaks
+  the final reply before delivery is confirmed, and no path replays what a platform delivered.
+- Not proof of attention: `stored` means the object is in the bucket, and `finished` means the phone finished
+  device playback — not that a person heard it, and not a locked-screen test.
+- Not an emergency or life-safety service, including the opt-in `alarm` channel.
+
+---
+
+## EARS-48 verification ledger (evidence, not setup)
+
+The sections below are the dated proof record the Tested rows above summarize. They are evidence, not
+instructions; preserved failure and incident notes are kept, not rewritten as passes.
 
 ## 2026-11-27 current-hook verification: required delivery chains complete
 

@@ -1,6 +1,6 @@
 # earshot-relay
 
-A small self-hosted service that lets scripts, CI jobs and AI agents send speech to your phone. You POST text (or an audio file) to the relay, it drops an object into your own S3-compatible bucket, and the [Earshot](https://store.automaticai.io/earshot/) Android app, when it is listening to that bucket, plays it out loud. The relay also records what the phone reported doing with each message, so you can ask for a receipt.
+A small self-hosted service that lets scripts, CI jobs and AI agents, including Hermes agents, send speech to your phone. You POST text (or an audio file) to the relay, it drops an object into your own S3-compatible bucket, and the [Earshot](https://store.automaticai.io/earshot/) Android app, when it is listening to that bucket, plays it out loud. The relay also records what the phone reported doing with each message, so you can ask for a receipt.
 
 Put thing in bucket. Hear it on phone. The relay is the "put thing in bucket" part, behind one HTTPS endpoint, a CLI and an MCP server.
 
@@ -94,6 +94,18 @@ Or install it as a Claude Code plugin, which asks for your relay URL and token o
 
 For agent hooks (speak when Claude Code needs you, or when it finishes), see [examples/](examples) and read the warning there: **hook examples send a slice of agent text to your bucket, so use a private bucket.**
 
+### Hermes
+
+[Hermes](https://hermes-agent.nousresearch.com/docs/) agents get two opt-in paths: the relay's MCP server (the agent calls `say` when it decides to speak) and a final-reply hook that speaks every reply on allowed surfaces. With Hermes installed and the token in the profile's `.env`:
+
+```sh
+hermes config set mcp_servers.earshot.url https://your-relay.example.com/mcp
+hermes config set mcp_servers.earshot.headers.Authorization 'Bearer ${EARSHOT_API_TOKEN}'
+hermes mcp test earshot     # connects and discovers say, receipt, recent, status
+```
+
+`config.yaml` holds only the `${EARSHOT_API_TOKEN}` placeholder; Hermes resolves it from the profile's `.env`. The full recipe — token handling, the opt-in hook, the installable `earshot` skill, approval notes and dated tested-on evidence — is [docs/hermes.md](docs/hermes.md); the hook, skill and config snippet live in [examples/hermes/](examples/hermes/). The hook sends a slice of agent text to your bucket as a plain object, so use a private bucket.
+
 ### Switch a producer over by changing a URL
 
 Tools that already push to ntfy, Gotify, Pushover or Join can push to the relay instead. Turn it on with
@@ -152,6 +164,6 @@ EARSHOT_COMPAT_PROVIDERS=1 uv run pytest -q tests/test_providers.py   # SeaweedF
 
 ## Docs
 
-[API](docs/api.md) · [Producer compat](docs/compat.md) · [Hygiene](docs/hygiene.md) · [Receipts](docs/receipts.md) · [Server TTS](docs/tts.md) · [Tunnels](docs/tunnels.md) · [Permissions](docs/permissions.md) · [MCP](docs/mcp.md) · [Configuration](docs/configuration.md) · [Examples](examples)
+[API](docs/api.md) · [Producer compat](docs/compat.md) · [Hygiene](docs/hygiene.md) · [Receipts](docs/receipts.md) · [Server TTS](docs/tts.md) · [Tunnels](docs/tunnels.md) · [Permissions](docs/permissions.md) · [MCP](docs/mcp.md) · [Hermes](docs/hermes.md) · [Configuration](docs/configuration.md) · [Examples](examples)
 
 License: MIT, copyright AutomaticAI.
