@@ -12,6 +12,15 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .beacons import PLAYBACK_PHASES, iso_ms
+from .control import OWNER, Principal
+
+
+def provenance(principal: Principal) -> tuple[str, str, str]:
+    return principal.kind, principal.id, principal.workspace_id or ""
+
+
+def principal_for(row) -> Principal:
+    return Principal(row.principal_kind, row.principal_id, row.workspace_id or None, row.agent_id or None)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages(
@@ -26,7 +35,11 @@ CREATE TABLE IF NOT EXISTS messages(
   idem_key TEXT,
   tag TEXT,
   normalized INTEGER NOT NULL DEFAULT 0,
-  truncated INTEGER NOT NULL DEFAULT 0
+  truncated INTEGER NOT NULL DEFAULT 0,
+  principal_kind TEXT NOT NULL DEFAULT 'owner',
+  principal_id TEXT NOT NULL DEFAULT 'owner',
+  workspace_id TEXT NOT NULL DEFAULT '',
+  agent_id TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS beacons(
   id INTEGER PRIMARY KEY,
@@ -60,7 +73,11 @@ CREATE TABLE IF NOT EXISTS pending(
   attempts INTEGER NOT NULL DEFAULT 0,
   compat INTEGER NOT NULL DEFAULT 0,
   window_end_at TEXT,
-  UNIQUE(channel, tag)
+  principal_kind TEXT NOT NULL DEFAULT 'owner',
+  principal_id TEXT NOT NULL DEFAULT 'owner',
+  workspace_id TEXT NOT NULL DEFAULT '',
+  agent_id TEXT NOT NULL DEFAULT '',
+  UNIQUE(principal_kind, principal_id, workspace_id, channel, tag)
 );
 CREATE INDEX IF NOT EXISTS pending_due ON pending(due_at);
 CREATE TABLE IF NOT EXISTS failed_pending(
@@ -71,17 +88,31 @@ CREATE TABLE IF NOT EXISTS failed_pending(
   failed_at TEXT NOT NULL,
   attempts INTEGER NOT NULL,
   error TEXT NOT NULL,
-  notified INTEGER NOT NULL DEFAULT 0
+  notified INTEGER NOT NULL DEFAULT 0,
+  principal_kind TEXT NOT NULL DEFAULT 'owner',
+  principal_id TEXT NOT NULL DEFAULT 'owner',
+  workspace_id TEXT NOT NULL DEFAULT '',
+  agent_id TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS idem_aliases(
-  idem_key TEXT PRIMARY KEY,
+  idem_key TEXT NOT NULL,
   message_id TEXT NOT NULL,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  principal_kind TEXT NOT NULL DEFAULT 'owner',
+  principal_id TEXT NOT NULL DEFAULT 'owner',
+  workspace_id TEXT NOT NULL DEFAULT '',
+  agent_id TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY(idem_key, principal_kind, principal_id, workspace_id)
 );
 CREATE TABLE IF NOT EXISTS suppressed_idem(
-  idem_key TEXT PRIMARY KEY,
+  idem_key TEXT NOT NULL,
   created_at TEXT NOT NULL,
-  result TEXT NOT NULL
+  result TEXT NOT NULL,
+  principal_kind TEXT NOT NULL DEFAULT 'owner',
+  principal_id TEXT NOT NULL DEFAULT 'owner',
+  workspace_id TEXT NOT NULL DEFAULT '',
+  agent_id TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY(idem_key, principal_kind, principal_id, workspace_id)
 );
 CREATE TABLE IF NOT EXISTS meta(
   k TEXT PRIMARY KEY,
@@ -92,9 +123,8 @@ MESSAGE_COLUMNS = {"idem_key": "TEXT", "tag": "TEXT", "normalized": "INTEGER NOT
                    "truncated": "INTEGER NOT NULL DEFAULT 0"}
 TAG_INDEX = "CREATE INDEX IF NOT EXISTS messages_tag ON messages(channel, tag, created_at)"
 # idem_key holds sha256(Idempotency-Key header), never the raw header. Added in schema version 2.
-IDEM_INDEX = "CREATE UNIQUE INDEX IF NOT EXISTS messages_idem ON messages(idem_key)"
-SCHEMA_VERSION = 5  # 2: idem_key. 3: tag, normalized, truncated, pending, idem_aliases, meta. 4: failed_pending.
-# 5: pending.compat and pending.window_end_at, suppressed_idem
+IDEM_INDEX = "CREATE UNIQUE INDEX IF NOT EXISTS messages_idem ON messages(principal_kind, principal_id, workspace_id, idem_key)"
+SCHEMA_VERSION = 6  # 6: principal/workspace provenance and scoped pending uniqueness
 
 
 @dataclass(frozen=True)
@@ -111,6 +141,10 @@ class MessageRow:
     tag: str | None = None
     normalized: bool = False
     truncated: bool = False
+    principal_kind: str = "owner"
+    principal_id: str = "owner"
+    workspace_id: str = ""
+    agent_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -131,6 +165,10 @@ class PendingRow:
     attempts: int
     compat: bool = False
     window_end_at: str | None = None
+    principal_kind: str = "owner"
+    principal_id: str = "owner"
+    workspace_id: str = ""
+    agent_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -144,6 +182,10 @@ class FailedRow:
     failed_at: str
     attempts: int
     error: str
+    principal_kind: str = "owner"
+    principal_id: str = "owner"
+    workspace_id: str = ""
+    agent_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -193,9 +235,47 @@ class Store:
                 if name not in pending_columns:
                     self._db.execute(f"ALTER TABLE pending ADD COLUMN {name} {decl}")
             self._db.execute("UPDATE pending SET window_end_at=due_at WHERE window_end_at IS NULL")
-            self._db.execute(IDEM_INDEX)
-            self._db.execute(TAG_INDEX)
-            self._db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                provenance_columns = {"principal_kind": "TEXT NOT NULL DEFAULT 'owner'",
+                                      "principal_id": "TEXT NOT NULL DEFAULT 'owner'",
+                                      "workspace_id": "TEXT NOT NULL DEFAULT ''",
+                                      "agent_id": "TEXT NOT NULL DEFAULT ''"}
+                for table in ("messages", "pending", "failed_pending", "idem_aliases", "suppressed_idem"):
+                    columns = {r["name"] for r in self._db.execute(f"PRAGMA table_info({table})")}
+                    for name, decl in provenance_columns.items():
+                        if name not in columns:
+                            self._db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+                unique_indexes = [r for r in self._db.execute("PRAGMA index_list(pending)") if r["unique"]]
+                legacy_unique = any([c["name"] for c in self._db.execute(f"PRAGMA index_info('{r['name']}')")]
+                                    == ["channel", "tag"] for r in unique_indexes)
+                if legacy_unique:
+                    pending_schema = SCHEMA.split("CREATE TABLE IF NOT EXISTS pending(", 1)[1].split(";", 1)[0]
+                    self._db.execute("CREATE TABLE pending_v6(" + pending_schema)
+                    cols = ("id,channel,tag,created_at,due_at,text,speech,voice,normalized,truncated,merged,"
+                            "attempts,compat,window_end_at,principal_kind,principal_id,workspace_id,agent_id")
+                    self._db.execute(f"INSERT INTO pending_v6({cols}) SELECT {cols} FROM pending")
+                    self._db.execute("DROP TABLE pending")
+                    self._db.execute("ALTER TABLE pending_v6 RENAME TO pending")
+                    self._db.execute("CREATE INDEX pending_due ON pending(due_at)")
+                for table, payload in (("idem_aliases", "message_id"), ("suppressed_idem", "result")):
+                    primary = [r["name"] for r in sorted(self._db.execute(f"PRAGMA table_info({table})"),
+                                                         key=lambda r: r["pk"]) if r["pk"]]
+                    if primary == ["idem_key"]:
+                        definition = SCHEMA.split(f"CREATE TABLE IF NOT EXISTS {table}(", 1)[1].split(";", 1)[0]
+                        self._db.execute(f"CREATE TABLE {table}_v6(" + definition)
+                        cols = f"idem_key,{payload},created_at,principal_kind,principal_id,workspace_id,agent_id"
+                        self._db.execute(f"INSERT INTO {table}_v6({cols}) SELECT {cols} FROM {table}")
+                        self._db.execute(f"DROP TABLE {table}")
+                        self._db.execute(f"ALTER TABLE {table}_v6 RENAME TO {table}")
+                self._db.execute("DROP INDEX IF EXISTS messages_idem")
+                self._db.execute(IDEM_INDEX)
+                self._db.execute(TAG_INDEX)
+                self._db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+                self._db.commit()
+            except BaseException:
+                self._db.rollback()
+                raise
 
     def close(self) -> None:
         with self._lock:
@@ -205,43 +285,82 @@ class Store:
 
     def add_message(self, *, id: str, created_at: str, channel: str, type: str, speech: str | None, key: str,
                     bytes: int, text_chars: int | None, idem_key: str | None = None, tag: str | None = None,
-                    normalized: bool = False, truncated: bool = False) -> None:
+                    normalized: bool = False, truncated: bool = False, principal: Principal = OWNER) -> None:
         with self._lock:
             if idem_key is not None:  # an expired use of the same key gives way to this one
-                self._db.execute("UPDATE messages SET idem_key=NULL WHERE idem_key=?", (idem_key,))
+                self._db.execute("UPDATE messages SET idem_key=NULL WHERE idem_key=?"
+                                 " AND principal_kind=? AND principal_id=? AND workspace_id=?",
+                                 (idem_key, *provenance(principal)))
             self._db.execute(
                 "INSERT INTO messages(id, created_at, channel, type, speech, key, bytes, text_chars, idem_key, tag,"
-                " normalized, truncated) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                " normalized, truncated, principal_kind, principal_id, workspace_id, agent_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (id, created_at, channel, type, speech, key, bytes, text_chars, idem_key, tag, int(normalized),
-                 int(truncated)),
+                 int(truncated), *provenance(principal), principal.agent_id or ""),
             )
 
-    def get_by_idem(self, idem_key: str, not_before: str) -> MessageRow | None:
+    def get_by_idem(self, idem_key: str, not_before: str, *, principal: Principal = OWNER) -> MessageRow | None:
         """The message first sent with this Idempotency-Key hash, if it was created at or after `not_before`."""
         with self._lock:
-            row = self._db.execute("SELECT rowid, * FROM messages WHERE idem_key=? AND created_at >= ?",
-                                   (idem_key, not_before)).fetchone()
+            row = self._db.execute("SELECT rowid, * FROM messages WHERE idem_key=? AND created_at >= ?"
+                                   " AND principal_kind=? AND principal_id=? AND workspace_id=?",
+                                   (idem_key, not_before, *provenance(principal))).fetchone()
         return self._message(row)
+
+    def owner_idempotency_exists(self, digest: str) -> bool:
+        """Detect a retained ambiguous owner key without returning owner message data."""
+        with self._lock:
+            for table in ("messages", "idem_aliases", "suppressed_idem"):
+                row = self._db.execute(
+                    f"SELECT 1 FROM {table} WHERE idem_key=?"
+                    " AND principal_kind=? AND principal_id=? AND workspace_id=? LIMIT 1",
+                    (digest, *provenance(OWNER)),
+                ).fetchone()
+                if row is not None:
+                    return True
+        return False
 
     def _message(self, row: sqlite3.Row | None) -> MessageRow | None:
         if row is None:
             return None
         return MessageRow(row["rowid"], row["id"], row["created_at"], row["channel"], row["type"], row["speech"],
                           row["key"], row["bytes"], row["text_chars"], row["tag"], bool(row["normalized"]),
-                          bool(row["truncated"]))
+                          bool(row["truncated"]), row["principal_kind"], row["principal_id"], row["workspace_id"], row["agent_id"])
 
-    def get_message(self, message_id: str) -> MessageRow | None:
+    def get_message(self, message_id: str, *, principal: Principal | None = None,
+                    allowed_channels: list[str] | None = None) -> MessageRow | None:
+        where, args = [], []
+        if message_id != "latest":
+            where.append("id=?")
+            args.append(message_id)
+        else:
+            where.append("channel != 'replies'")
+        if principal is not None:
+            where.append("principal_kind=? AND principal_id=? AND workspace_id=?")
+            args.extend(provenance(principal))
+        if allowed_channels is not None:
+            if not allowed_channels:
+                return None
+            where.append("channel IN (" + ",".join("?" for _ in allowed_channels) + ")")
+            args.extend(allowed_channels)
+        sql = "SELECT rowid, * FROM messages" + (" WHERE " + " AND ".join(where) if where else "")
+        sql += " ORDER BY created_at DESC, rowid DESC LIMIT 1"
         with self._lock:
-            if message_id == "latest":
-                row = self._db.execute("SELECT rowid, * FROM messages ORDER BY created_at DESC, rowid DESC LIMIT 1").fetchone()
-            else:
-                row = self._db.execute("SELECT rowid, * FROM messages WHERE id=?", (message_id,)).fetchone()
+            row = self._db.execute(sql, args).fetchone()
         return self._message(row)
 
     def list_messages(self, *, channel: str | None, limit: int, since_created: str | None = None,
-                      since_rowid: int | None = None) -> list[MessageRow]:
+                      since_rowid: int | None = None, principal: Principal | None = None,
+                      allowed_channels: list[str] | None = None) -> list[MessageRow]:
         """Newest first; with a `since` bound, oldest first after that bound (exclusive)."""
-        where, args = [], []
+        where, args = ["channel != 'replies'"], []
+        if principal is not None:
+            where.append("principal_kind=? AND principal_id=? AND workspace_id=?")
+            args.extend(provenance(principal))
+        if allowed_channels is not None:
+            if not allowed_channels:
+                return []
+            where.append("channel IN (" + ",".join("?" for _ in allowed_channels) + ")")
+            args.extend(allowed_channels)
         if channel:
             where.append("channel=?")
             args.append(channel)
@@ -269,12 +388,13 @@ class Store:
             row = self._db.execute("SELECT MAX(created_at) AS t FROM messages").fetchone()
         return row["t"] if row else None
 
-    def latest_tagged(self, channel: str, tag: str, not_before: str) -> MessageRow | None:
+    def latest_tagged(self, channel: str, tag: str, not_before: str, *, principal: Principal = OWNER) -> MessageRow | None:
         """The newest message written to `channel` under `tag` at or after `not_before` (the cooldown check)."""
         with self._lock:
             row = self._db.execute(
                 "SELECT rowid, * FROM messages WHERE channel=? AND tag=? AND created_at >= ?"
-                " ORDER BY created_at DESC, rowid DESC LIMIT 1", (channel, tag, not_before)).fetchone()
+                " AND principal_kind=? AND principal_id=? AND workspace_id=?"
+                " ORDER BY created_at DESC, rowid DESC LIMIT 1", (channel, tag, not_before, *provenance(principal))).fetchone()
         return self._message(row)
 
     # The watchdog. Correlation is by key: only a beacon for a message's own key reports on it, so a receipt for
@@ -318,34 +438,65 @@ class Store:
             return None
         return PendingRow(row["id"], row["channel"], row["tag"], row["created_at"], row["due_at"], row["text"],
                           row["speech"], row["voice"], bool(row["normalized"]), bool(row["truncated"]), row["merged"],
-                          row["attempts"], bool(row["compat"]), row["window_end_at"])
+                          row["attempts"], bool(row["compat"]), row["window_end_at"], row["principal_kind"],
+                          row["principal_id"], row["workspace_id"], row["agent_id"])
 
-    def get_pending(self, channel: str, tag: str) -> PendingRow | None:
+    def get_pending(self, channel: str, tag: str, *, principal: Principal = OWNER) -> PendingRow | None:
         with self._lock:
-            return self._pending(self._db.execute("SELECT * FROM pending WHERE channel=? AND tag=?",
-                                                  (channel, tag)).fetchone())
+            return self._pending(self._db.execute(
+                "SELECT * FROM pending WHERE channel=? AND tag=? AND principal_kind=? AND principal_id=? AND workspace_id=?",
+                (channel, tag, *provenance(principal))).fetchone())
+
+    def ambiguous_legacy_pending(self, channel: str, tag: str) -> bool:
+        """A pre-scope compat hold may be missing the alias of a request interrupted by a crash."""
+        with self._lock:
+            return self._db.execute(
+                "SELECT 1 FROM pending WHERE channel=? AND tag=?"
+                " AND principal_kind=? AND principal_id=? AND workspace_id=? LIMIT 1",
+                (channel, tag, *provenance(OWNER)),
+            ).fetchone() is not None
 
     def get_pending_by_id(self, message_id: str) -> PendingRow | None:
         with self._lock:
             return self._pending(self._db.execute("SELECT * FROM pending WHERE id=?", (message_id,)).fetchone())
 
-    def add_pending(self, row: PendingRow) -> None:
+    def _save_pending(self, sql: str, values: tuple, *, idem_key: str | None, message_id: str,
+                      alias_at: str | None, principal: Principal) -> None:
+        if idem_key and alias_at is None:
+            raise ValueError("alias timestamp required")
         with self._lock:
-            self._db.execute(
-                "INSERT INTO pending(id, channel, tag, created_at, due_at, text, speech, voice, normalized, truncated,"
-                " merged, attempts, compat, window_end_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (row.id, row.channel, row.tag, row.created_at, row.due_at, row.text, row.speech, row.voice,
-                 int(row.normalized), int(row.truncated), row.merged, row.attempts, int(row.compat),
-                 row.window_end_at or row.due_at))
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = self._db.execute(sql, values)
+                if idem_key:
+                    if cursor.rowcount != 1:
+                        raise sqlite3.IntegrityError("pending row disappeared")
+                    assert alias_at is not None
+                    self._insert_alias(idem_key, message_id, alias_at, principal=principal)
+                self._db.commit()
+            except BaseException:
+                self._db.rollback()
+                raise
+
+    def add_pending(self, row: PendingRow, *, idem_key: str | None = None) -> None:
+        self._save_pending(
+            "INSERT INTO pending(id, channel, tag, created_at, due_at, text, speech, voice, normalized, truncated,"
+            " merged, attempts, compat, window_end_at, principal_kind, principal_id, workspace_id, agent_id)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (row.id, row.channel, row.tag, row.created_at, row.due_at, row.text, row.speech, row.voice,
+             int(row.normalized), int(row.truncated), row.merged, row.attempts, int(row.compat),
+             row.window_end_at or row.due_at, row.principal_kind, row.principal_id, row.workspace_id, row.agent_id),
+            idem_key=idem_key, message_id=row.id, alias_at=row.created_at, principal=principal_for(row))
 
     def update_pending(self, message_id: str, *, text: str, speech: str, voice: str | None, normalized: bool,
-                       truncated: bool, compat: bool = False) -> None:
+                       truncated: bool, compat: bool = False, idem_key: str | None = None,
+                       alias_at: str | None = None, principal: Principal = OWNER) -> None:
         """Latest text wins; retain compat provenance if any merged send used the compat alarm gate."""
-        with self._lock:
-            self._db.execute(
-                "UPDATE pending SET text=?, speech=?, voice=?, normalized=?, truncated=?, compat=MAX(compat, ?), "
-                "merged=merged+1 WHERE id=?",
-                (text, speech, voice, int(normalized), int(truncated), int(compat), message_id))
+        self._save_pending(
+            "UPDATE pending SET text=?, speech=?, voice=?, normalized=?, truncated=?, compat=MAX(compat, ?), "
+            "merged=merged+1 WHERE id=?",
+            (text, speech, voice, int(normalized), int(truncated), int(compat), message_id),
+            idem_key=idem_key, message_id=message_id, alias_at=alias_at, principal=principal)
 
     def retry_pending(self, message_id: str, attempts: int, due_at: str) -> None:
         with self._lock:
@@ -364,8 +515,10 @@ class Store:
         """Give up on a held message: keep a record without its text (visible in its receipt and in status)."""
         with self._lock:
             self._db.execute(
-                "INSERT OR REPLACE INTO failed_pending(id, channel, tag, created_at, failed_at, attempts, error)"
-                " VALUES(?,?,?,?,?,?,?)", (row.id, row.channel, row.tag, row.created_at, failed_at, row.attempts, error))
+                "INSERT OR REPLACE INTO failed_pending(id, channel, tag, created_at, failed_at, attempts, error,"
+                " principal_kind, principal_id, workspace_id, agent_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (row.id, row.channel, row.tag, row.created_at, failed_at, row.attempts, error,
+                 row.principal_kind, row.principal_id, row.workspace_id, row.agent_id))
             self._db.execute("DELETE FROM pending WHERE id=?", (row.id,))
             try:
                 self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
@@ -377,7 +530,7 @@ class Store:
         if row is None:
             return None
         return FailedRow(row["id"], row["channel"], row["tag"], row["created_at"], row["failed_at"], row["attempts"],
-                         row["error"])
+                         row["error"], row["principal_kind"], row["principal_id"], row["workspace_id"], row["agent_id"])
 
     def get_failed(self, message_id: str) -> FailedRow | None:
         with self._lock:
@@ -415,26 +568,34 @@ class Store:
             (n,) = self._db.execute("SELECT COUNT(*) FROM pending").fetchone()
         return n
 
-    def save_suppressed(self, digest: str, at: str, result: dict) -> None:
+    def save_suppressed(self, digest: str, at: str, result: dict, *, principal: Principal = OWNER) -> None:
         with self._lock:
-            self._db.execute("INSERT OR REPLACE INTO suppressed_idem VALUES(?,?,?)", (digest, at, json.dumps(result)))
+            self._db.execute("INSERT OR REPLACE INTO suppressed_idem"
+                             "(idem_key,created_at,result,principal_kind,principal_id,workspace_id,agent_id) VALUES(?,?,?,?,?,?,?)",
+                             (digest, at, json.dumps(result), *provenance(principal), principal.agent_id or ""))
 
-    def get_suppressed(self, digest: str, cutoff: str) -> dict | None:
+    def get_suppressed(self, digest: str, cutoff: str, *, principal: Principal = OWNER) -> dict | None:
         with self._lock:
-            row = self._db.execute("SELECT result FROM suppressed_idem WHERE idem_key=? AND created_at>=?",
-                                   (digest, cutoff)).fetchone()
+            row = self._db.execute("SELECT result FROM suppressed_idem WHERE idem_key=? AND created_at>=?"
+                                   " AND principal_kind=? AND principal_id=? AND workspace_id=?",
+                                   (digest, cutoff, *provenance(principal))).fetchone()
         return json.loads(row["result"]) if row else None
 
-    def add_alias(self, idem_key: str, message_id: str, created_at: str) -> None:
-        with self._lock:
-            self._db.execute("INSERT OR REPLACE INTO idem_aliases(idem_key, message_id, created_at) VALUES(?,?,?)",
-                             (idem_key, message_id, created_at))
+    def _insert_alias(self, idem_key: str, message_id: str, created_at: str, *, principal: Principal) -> None:
+        self._db.execute("INSERT OR REPLACE INTO idem_aliases"
+                         "(idem_key,message_id,created_at,principal_kind,principal_id,workspace_id,agent_id) VALUES(?,?,?,?,?,?,?)",
+                         (idem_key, message_id, created_at, *provenance(principal), principal.agent_id or ""))
 
-    def get_alias(self, idem_key: str, not_before: str) -> str | None:
+    def add_alias(self, idem_key: str, message_id: str, created_at: str, *, principal: Principal = OWNER) -> None:
+        with self._lock:
+            self._insert_alias(idem_key, message_id, created_at, principal=principal)
+
+    def get_alias(self, idem_key: str, not_before: str, *, principal: Principal = OWNER) -> str | None:
         """The id of the message an Idempotency-Key hash was merged into by coalescing, if recent enough."""
         with self._lock:
-            row = self._db.execute("SELECT message_id FROM idem_aliases WHERE idem_key=? AND created_at >= ?",
-                                   (idem_key, not_before)).fetchone()
+            row = self._db.execute("SELECT message_id FROM idem_aliases WHERE idem_key=? AND created_at >= ?"
+                                   " AND principal_kind=? AND principal_id=? AND workspace_id=?",
+                                   (idem_key, not_before, *provenance(principal))).fetchone()
         return row["message_id"] if row else None
 
     # meta (small persisted state, e.g. the watchdog's) -----------------------------------------------------------
@@ -521,6 +682,11 @@ class Store:
             m = self._db.execute("DELETE FROM messages WHERE created_at < ?", (cutoff,)).rowcount
             b = self._db.execute("DELETE FROM beacons WHERE received_at < ?", (cutoff,)).rowcount
             self._db.execute("DELETE FROM suppressed_idem WHERE created_at < ?", (cutoff,))
-            self._db.execute("DELETE FROM idem_aliases WHERE created_at < ?", (cutoff,))
+            # An old coalesced request remains in flight while its pending row exists.
+            self._db.execute("DELETE FROM idem_aliases WHERE created_at < ? AND NOT EXISTS ("
+                             "SELECT 1 FROM pending p WHERE p.id=idem_aliases.message_id"
+                             " AND p.principal_kind=idem_aliases.principal_kind"
+                             " AND p.principal_id=idem_aliases.principal_id"
+                             " AND p.workspace_id=idem_aliases.workspace_id)", (cutoff,))
             self._db.execute("DELETE FROM failed_pending WHERE failed_at < ?", (cutoff,))
         return m, b
