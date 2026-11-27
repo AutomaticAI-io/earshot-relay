@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -22,6 +25,41 @@ FIXTURES = Path(__file__).parent / "fixtures"
 TOKEN = "t" * 40
 BEACON_TOKEN = "b" * 40
 BUCKET = "earshot-test"
+
+_PRIVATE_TMP: Path | None = None
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_configure(config):
+    """Run every test under a private temp root, not the system /tmp.
+
+    The relay's control store refuses a directory with any setuid/setgid/sticky
+    parent (`control._safe_directory`), and /tmp is sticky (1777) on Linux and
+    on GitHub runners. Under the default pytest basetemp every scoped-control test
+    failed with "unsafe control directory" (57 failed, 50 errors on main 928c64a)
+    although the code is right. A private root under the user's cache directory has
+    no sticky parent. Subprocesses inherit it through TMPDIR. An explicit --basetemp
+    still wins.
+    """
+    global _PRIVATE_TMP
+    if config.option.basetemp:
+        return
+    cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+    root = cache / "earshot-relay-tests"
+    _PRIVATE_TMP = root / f"run-{os.getpid()}"
+    for directory in (root, _PRIVATE_TMP):
+        # Explicit chmod: mkdir(mode=) is masked by the umask (002 leaves 775, which
+        # the control store rejects as group-writable).
+        directory.mkdir(parents=True, exist_ok=True)
+        directory.chmod(0o700)
+    config.option.basetemp = str(_PRIVATE_TMP / "pytest")
+    os.environ["TMPDIR"] = str(_PRIVATE_TMP)
+    tempfile.tempdir = str(_PRIVATE_TMP)
+
+
+def pytest_unconfigure(config):
+    if _PRIVATE_TMP is not None:
+        shutil.rmtree(_PRIVATE_TMP, ignore_errors=True)
 
 
 @pytest.fixture(scope="session")
