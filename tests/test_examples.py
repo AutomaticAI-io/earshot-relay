@@ -179,3 +179,43 @@ def test_curl_script(live_relay, s3_admin):
     assert p.returncode == 0, p.stderr
     assert '"status": "stored"' in p.stdout
     assert message_text(s3_admin, sent(live_relay)[0]) == "Build finished"
+
+
+# ---- Tasker task file ------------------------------------------------------------------------------------------
+
+TASKER = EX / "tasker" / "Earshot_Say.tsk.xml"
+
+
+def tasker_request(text: str, url: str, token: str) -> httpx.Request:
+    """Build the request Tasker's HTTP Request action (code 339) sends: plain %var substitution, no escaping."""
+    import xml.etree.ElementTree as ET
+
+    action = next(a for a in ET.parse(TASKER).getroot().iter("Action") if a.findtext("code") == "339")
+    args = {e.get("sr"): (e.text or e.get("val") or "") for e in action}
+    assert args["arg1"] == "1"  # POST
+
+    def sub(value: str) -> str:
+        return value.replace("%EARSHOT_URL", url).replace("%EARSHOT_TOKEN", token).replace("%par1", text)
+
+    headers = dict(line.split(":", 1) for line in sub(args["arg3"]).splitlines())
+    return httpx.Request("POST", sub(args["arg2"]), headers=headers, content=sub(args["arg5"]).encode())
+
+
+def test_tasker_task_file_holds_no_token():
+    body = TASKER.read_text()
+    assert "%EARSHOT_TOKEN" in body and "%EARSHOT_URL" in body
+    assert TOKEN not in body
+
+
+def test_tasker_task_sends_and_stores(live_relay, s3_admin):
+    with httpx.Client() as client:
+        r = client.send(tasker_request("Hello from Tasker.", live_relay, TOKEN))
+    assert r.status_code == 202, r.text
+    assert message_text(s3_admin, sent(live_relay)[0]) == "Hello from Tasker."
+
+
+def test_tasker_task_rejects_a_raw_quote_as_the_recipe_says(live_relay):
+    with httpx.Client() as client:
+        r = client.send(tasker_request('say "hi"', live_relay, TOKEN))
+    assert r.status_code == 400
+    assert sent(live_relay) == []
