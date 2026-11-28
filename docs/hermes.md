@@ -135,6 +135,7 @@ remain Untested.
 | Ink TUI → current hook | **Tested** 2026-11-27 | Byte-equal stored text, S24 `finished` 15:53:13.024 UTC. [Ledger](#2026-11-27-current-hook-verification-required-delivery-chains-complete) |
 | Bounded cron → hook exclusion | **Tested** 2026-11-27 | Real `cron` payload produced zero hook objects. Not wall-clock scheduling. [Ledger](#2026-11-27-current-hook-verification-required-delivery-chains-complete) |
 | Isolated profile → `hermes mcp test earshot` | **Tested** 2026-11-27 | Authenticated HTTP MCP against a local relay and disposable MinIO bucket discovered `say`, `receipt`, `recent`, `status` with alarm disabled; skill install and removal exercised in a disposable profile. No phone playback. [EARS-49 verification](verification/ears-49.md) |
+| SMS → either path | **Blocked, not run** 2026-11-28 | No Hermes SMS gateway could be given a working number: the only available gateway number (Telnyx, local US) was carrier-rejected for outbound A2P SMS without 10DLC registration — a real probe message was refused by the destination carrier (Verizon) with "Not 10DLC registered" — and the personal Twilio vault item holds a scope-limited API key with no usable number. Registration fees were outside the approved spend. Full evidence lives in the private Earshot repo (`docs/verification/ears-75.md`, owner-readable only). |
 | Desktop → hook | **Untested** | No packaged app or build dependencies; no platform value guessed. |
 
 ## What this is not

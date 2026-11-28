@@ -25,6 +25,7 @@
 | Current Ink TUI hook | **Tested** | Actual `tui` / `EARS48 TUI current hook 20261127.`, byte-equal stored text; `msg_abfcacd371e648afaf6e25d16f2548b1`, key `phone/abfcacd371e648afaf6e25d16f2548b1.say`, S24 `finished` November 27 **15:53:13.024Z**. |
 | Current bounded cron hook exclusion | **Tested** | Repeat-1 external job `c9f4c20ac288` completed direct execution `b22572e61fb04b5cb0cb93476ea1daf1`, actual `cron` payload, **3 → 3** indexed objects and zero new hook objects over **8 seconds**; removed afterward. Not wall-clock scheduling. |
 | Desktop | **Untested** | No packaged app/build dependencies; no platform guessed or install performed. |
+| SMS (Twilio) | **Blocked, not run** 2026-11-28 | No Hermes SMS gateway could be given a working number: the only available gateway number (Telnyx, local US) is carrier-rejected for outbound A2P SMS without 10DLC registration (real probe: Verizon answered `40010 "Not 10DLC registered"`), and the personal Twilio vault item holds a scope-limited API key with no usable number. Registration fees were outside the approved spend. Full evidence lives in the private Earshot repo (`docs/verification/ears-75.md`, owner-readable only). |
 
 The following rows are **historical** and do not establish current corrected-hook results:
 
